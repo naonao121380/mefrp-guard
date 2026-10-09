@@ -34,6 +34,10 @@ mefrp 的节点会不定期变更（下线、维护、被禁用）。手工处�
 
 > 「没判成故障」包括**探测不适用**（udp）这种情况 —— 探不了 ≠ 地址不对，
 > DNS 照常同步。详见下文「DNS 同步」。
+>
+> DNS 那一步是**幂等且便宜**的：内容已经对得上就什么都不写、也不产生事件；真要去问
+> Cloudflare 时复用连接池（不再每个请求重新握手），传输层失败还会退避重试 2 次，
+> 抖一下只记 `warn`，不会把日志染红。
 
 ### 三层健康判定
 
@@ -170,6 +174,28 @@ WireGuard 的握手包）。那属于业务侧的事，不是这个工具该做�
 （`resolve_zone`），结果落库，之后不再重复问。记录内容已经对得上就**什么都不写**
 （不产生事件、不产生噪音）—— 所以「每轮巡检都调一次」是安全的。
 
+### ⚠️ DNS 记录名必须**全局**唯一（隧道名不是）
+
+这条规则和隧道名正好相反，别搞混：
+
+| | 唯一性范围 | 为什么 |
+|---|---|---|
+| **隧道名**（`proxy_name`） | **一台 frps 内** | mefrp 的一台 = 整个账号；外部节点的一台 = 那个 `manual_node`。各运营商命名空间互不相干，**跨运营商重名完全合法**。查重一律 `find_tunnel_by_proxy(name, manual_node_id=...)`。 |
+| **DNS 记录名** | **全局** | 它不是谁的命名空间，而是 Cloudflare 上一个实实在在的资源。 |
+
+两条 enabled 的隧道填同一个记录名会这样：两边都在健康路径上**每 20 秒**同步一次，
+一个把记录改成节点 A 的地址、另一个改成节点 B 的，**互相覆盖、无限抖动**；而事件
+日志里只有一行行「DNS 已更新」，完全看不出是在打架。
+
+所以这里是**硬拒绝**（`409` + `code: dns_name_taken` + 占用者的 id/名字/hint），
+**没有 overwrite 开关** —— 它不像「同一台 frps 上同名」那种还能说谁先谁后，
+这种情况没有任何合理的语义。比对时大小写和首尾空格都归一。
+
+三处写入路径都查：`POST /api/tunnels`、`PATCH /api/tunnels/{id}`（带 `exclude_id=自己`，
+否则改别的字段时把记录名原样带上会把自己判成冲突）、`POST /api/orphans/{id}/adopt`。
+**导入外部节点时是例外**：撞名只放弃那一条的记录名，隧道照建，结果放在响应的
+`dns_clash` 里单独报（混进 `skipped` 是错的 —— 那些隧道**是纳管了的**）。
+
 ### 踩过的坑
 
 用户报过「手动添加的隧道好像没有自动进行 cf dns 解析」。查下来**是代码的问题**，
@@ -197,6 +223,27 @@ WireGuard 的握手包）。那属于业务侧的事，不是这个工具该做�
   ⚠️ 测试里的假 CF 也得带上 `token` 属性，否则会以 `AttributeError` 炸而不是「跳过 DNS」。
 - **CF 的 httpx 异常必须带上类型名** —— 超时类异常 `str()` 常常是空串，只拼 `{exc}` 的话
   事件日志里只剩一句「请求 Cloudflare 失败：」，完全看不出是超时、连不上还是 TLS 出错。
+- **★ 每次请求都新建连接池 = 反复重新握手** —— `_request` 原来是
+  `async with httpx.AsyncClient(...)`，**每个请求新建一个**。而 `_sync_dns` 的写路径上要打
+  **4 个请求**（自己 `list_records` 一次 + `upsert` 内部又查两次 + `PUT` 一次），也就是
+  4 次全新的 DNS 解析 + TCP + TLS 握手，彼此不复用；巡检每 20 秒一轮，握手次数直接把
+  「握手中途超时」的概率放大了。现在客户端**懒建并复用一个连接池**（一次握手撑很多轮），
+  写路径也降到 2 个请求（把刚查到的 `DnsRecord` 通过 `upsert(existing=...)` 传下去，
+  别让它再自查两遍）。⚠️ 复用的代价是**必须有人关它**：`reload_clients()` 换客户端时
+  走 `_close_client_soon()`（同步方法没法 await，把 `aclose()` 丢给当前事件循环）。
+  另外连接池**不能跨事件循环复用** —— 测试里每个用例一次 `asyncio.run()`（一个新循环），
+  所以 `_http()` 会比 `self._loop is not loop`，不同就重建。
+- **★ 传输层失败要重试，而且要能分类** —— 原来零重试，网络抖一下整条同步就失败。
+  现在只对 `httpx.TransportError`（连不上 / 超时 / 连接被重置 / 代理挂了）退避重试 2 次；
+  HTTP 状态错误**不重试**（401/403/5xx 是请求本身的问题，再打十次也一样）。
+  重试耗尽后抛的 `CloudflareError` 带 `transient=True`，调用方据此决定记 warn 还是 error。
+- **★ 瞬时失败不能一律记 error** —— 巡检每 20 秒一轮，每轮都同步一次 DNS。抖一下失败、
+  下一轮立刻就好，而日志里留下的是**红色「更新 DNS 失败」** —— 用户会以为 DNS 功能坏了
+  （他确实这么报过）。现在连续 `< DNS_FAIL_ESCALATE`（3）次只记 `warn`，到阈值才升
+  `error`，成功一次就清零（**清零很重要**：否则抖动会攒起来，隔几分钟突然升级成 error，
+  变成另一种误报）。`force`（用户明确点的动作）不看阈值，第一次就如实记 `error`。
+  阈值刻意**不复用** `fail_threshold` —— 那个管的是「连续探测失败几次才触发切换」，
+  捆在一起以后调其中一个必然误伤另一个。
 
 ### 相关的巡检坑：mefrp 挂了不该连累外部节点
 
@@ -509,8 +556,9 @@ mefrp-guard/
 │       ├── index.html  主单页 UI（自包含，无外部依赖）
 │       ├── favicon.svg 站点图标（`/favicon.svg`，不需登录即可取）
 │       └── favicon.ico 老浏览器 / Safari / webview 的回落图标（`/favicon.ico`）
-├── tests/              九个测试文件（鉴权 / 纯逻辑 / 外部节点逻辑 / API / 外部节点 API /
-│                       标签 / 作用域 / 故障转移 / 多容器挂接），共 909 条断言
+├── tests/              十个测试文件（鉴权 / 纯逻辑 / CF 客户端 / 外部节点逻辑 / API /
+│                       外部节点 API / 标签 / 作用域 / 故障转移 / 多容器挂接），
+│                       共 958 条断言
 ├── run_local.sh        本地试跑脚本（不依赖 Docker，用沙箱 frpc 配置）
 ├── Dockerfile
 ├── docker-compose.yml
@@ -648,7 +696,14 @@ Dockerfile 里加 `COPY wheels /wheels`，安装那行换成
 
 - CF Token 权限是不是 `Zone.DNS:Edit`、记录所在的 zone 在不在授权范围内；
 - 节点地址是 IP 就写 A 记录，是域名就写 CNAME —— 程序按节点地址自动判断；
-- 如果事件里写「拿不到节点地址」，见上文「已知限制」第二条。
+- 如果事件里写「拿不到节点地址」，见上文「已知限制」第二条；
+- **记录名是不是被别的隧道占着** —— 两条隧道共用一个记录名会被拒绝（见上文
+  「DNS 记录名必须全局唯一」），编辑时会 409，导入时会出现在 `dns_clash` 里。
+
+⚠️ **事件里出现红色的「更新 DNS 失败」不代表功能坏了**：传输层抖动（超时 / 连不上）
+现在只记 `warn`，连续 3 次才升 `error`，而且客户端会自动重试 2 次、复用连接池 ——
+所以偶尔一条 `warn` 是正常的，下一轮就自己好了。真正需要你去动手的是那些
+**反复出现的 `error`**（多半是 token 权限 / zone 找不到 / 记录名撞车）。
 
 导入 / 探测 / 切换之后都会**当场**在弹窗里回报 DNS 的结果（成功 / 找不到 zone /
 token 没权限），不必去翻事件日志。判据与设计取舍见上文「DNS 同步」。
@@ -692,23 +747,25 @@ PYTHONPATH=$PWD/.devdeps PY=$PY ./tests/run_all.sh
 > ⚠️ `run_all.sh` **自己不设 `PYTHONPATH`** —— 不带上的话会在第一个需要依赖的文件上
 > 报 `No module named 'fastapi'`。
 
-九个文件，共 **909 条断言**（59 + 141 + 114 + 188 + 164 + 30 + 47 + 73 + 93）：
+十个文件，共 **958 条断言**（59 + 141 + 22 + 122 + 188 + 183 + 30 + 47 + 73 + 93）：
 
 | 文件 | 覆盖 | 需要第三方库 |
 |---|---|---|
 | `tests/test_auth.py` | **密码哈希（随机盐/迭代数/异常输入安全降级）、默认密码识别、会话令牌、登录防爆破、来源 IP 解析** | 否 |
 | `tests/test_logic.py` | frpc TOML 合并与跨节点校验、**单引号字面量解析**、配置备份/恢复/路径穿越、SQLite 持久化与字段白名单、Node/Proxy 字段解析、`pick_node` 择优调度、**节点偏好的有序语义与归一化**、**`probe_plan` 探测适用性** | 否 |
-| `tests/test_manual_node.py` | **frpc 配置解析（TOML / INI）、`patch_server` 文本级改写的保真与合法性、外部节点数据层 CRUD、1.0.0 老库补列迁移、引擎对外部隧道的分支（含「不适用探测」的三态与 UDP 的 DNS 同步）** | 否 |
+| `tests/test_cfclient.py` | **Cloudflare 客户端的 httpx 交互**：传输层退避重试、重试耗尽后 `transient=True` 与异常类型名、非传输层错误不重试、**连接池复用（3 个请求只建 1 个）与跨事件循环重建**、`upsert(existing=…)` 省掉两次自查、没配 token 一个请求都不发 | httpx |
+| `tests/test_manual_node.py` | **frpc 配置解析（TOML / INI）、`patch_server` 文本级改写的保真与合法性、外部节点数据层 CRUD、1.0.0 老库补列迁移、引擎对外部隧道的分支（含「不适用探测」的三态、UDP 的 DNS 同步、瞬时失败 warn→error 的升级与清零）** | 否 |
 | `tests/test_api.py` | FastAPI 全端点：**登录页/会话 Cookie/登出作废/改密码/CSRF/防爆破/只读设置保护**、鉴权、CRUD、密钥打码、错误码、枚举字段校验、引擎生命周期、**frpc 实例 CRUD 与挂接 API**、**节点偏好预览（含路由遮蔽回归）** | fastapi / httpx / pydantic |
-| `tests/test_manual_api.py` | 外部节点全部 HTTP 端点：导入 / 更新 / 删除 / 改连 / 探测、token 不回明文、**「地址已导入过」的 409 契约与「覆盖重建空节点」**、**导入时顺手同步 DNS 与 udp 隧道的探测端点**、删掉最后一条隧道自动清理空节点 | fastapi / httpx / pydantic |
+| `tests/test_manual_api.py` | 外部节点全部 HTTP 端点：导入 / 更新 / 删除 / 改连 / 探测、token 不回明文、**「地址已导入过」的 409 契约与「覆盖重建空节点」**、**导入时顺手同步 DNS 与 udp 隧道的探测端点**、**DNS 记录名查重的 409 契约（含编辑自己 / 导入时只放弃那一个字段）**、删掉最后一条隧道自动清理空节点 | fastapi / httpx / pydantic |
 | `tests/test_tags.py` | 隧道标签：默认打 `mefrp`、归一化与截断、`?tag=` 筛选（**空串 = 筛未打标的**）、`/api/tags` 计数与排序、显式清空、**老库只回填一次** | fastapi / httpx / pydantic |
 | `tests/test_scope.py` | **隧道名的唯一性作用域**：同名隧道跨运营商并存、展示名重名不报错、mefrp 作用域内仍唯一、`/api/orphans` 与 `probe` 按作用域分流、**老库整表重建去掉 UNIQUE** | fastapi / httpx / pydantic |
 | `tests/test_failover.py` | 完整故障转移流水线（mefrp / CF / Gotify / Docker 全部打桩），含**节点地址取址路径**与 **UDP 跳过探测** | fastapi / httpx / pydantic |
 | `tests/test_frpc_multi.py` | **多容器挂接：不自动播种、只认显式挂接、未挂接拒绝切换、按容器重建、成组切换、跨容器隔离、失败回滚、自动发现** | 否 |
 
-`test_auth` / `test_logic` / `test_failover` / `test_frpc_multi` 用 `sys.modules` 注入假的
-`httpx`，`test_manual_node` 则压根不依赖 —— 这五个在**没装任何依赖**的环境里也能跑。
-其余四个需要 fastapi 等依赖（装到 `.devdeps` 即可，不污染环境）。
+`test_auth` / `test_logic` / `test_failover` / `test_frpc_multi` / `test_manual_node`
+用 `sys.modules` 注入假的 `httpx`（或在桩里补齐 `TransportError` 等属性），在
+**没装任何依赖**的环境里也能跑。其余五个需要依赖（装到 `.devdeps` 即可，不污染环境）。
+⚠️ `test_cfclient` 反过来 —— 它要验的**就是** httpx 交互本身，所以**必须用真的 httpx**。
 
 `test_failover.py` 里最关键的几条用例（都是踩过的坑）：
 
@@ -750,6 +807,10 @@ PYTHONPATH=$PWD/.devdeps PY=$PY ./tests/run_all.sh
 - **★ 老库整表重建**：`name` / `proxy_name` 上的 UNIQUE 都去掉，数据、主键、标签原样保留，
   重建后能插同名；新表 DDL **从 `sqlite_master` 读出来再摘约束**（手写 DDL 会因可空性 /
   默认值不一致而让 `INSERT ... SELECT` 失败）
+- **★ DNS 记录名的唯一性**：两条隧道共用同一个记录名会被硬拒（409 / `dns_name_taken`），
+  大小写与首尾空格都归一；`PATCH` 自己时带 `exclude_id`（否则改别的字段会被自己判成冲突）；
+  导入外部节点时是例外 —— **只放弃那一条的记录名，隧道照建**，结果放 `dns_clash`
+  （混进 `skipped` 是错的：那些隧道**是纳管了的**）
 - **★ 标签只在「刚加出这一列」的那一次回填** —— 用户手动清空后重启**不能**被打回 `mefrp`
 - **`?tag=` 的空串语义**：筛的是「未打标签的」，不是「不过滤」
 - **PATCH 不带 `tag` 字段时不能动标签**（要能区分「没传」和「传了空串」）

@@ -1164,6 +1164,12 @@ async function saveManual(){
       if((r.skipped||[]).length) msg += `\n\n跳过 ${r.skipped.length} 条：\n`
         + r.skipped.map(s=>`  · ${s.name}（${s.why}）`).join('\n');
       if(r.switched) msg += `\n\n${_switchSummary(r.switched)}`;
+      // DNS 记录名撞车：**隧道是纳管了的**，只是没给它填记录名。必须当场说
+      // —— 否则用户以为记录名填上了，转头去怀疑「怎么没解析」。
+      if((r.dns_clash||[]).length) msg += `\n\n⚠️ 这几条没填 DNS 记录名（记录名不能两条共用）：\n`
+        + r.dns_clash.map(c=>`  · ${c.name}：想填 ${c.record_name}，`
+            + `但已归隧道「${c.existing_name}」#${c.existing_id} 管\n`
+            + `     → 到「隧道」页编辑它，换个前缀`).join('\n');
       if((r.warnings||[]).length) msg += `\n\n解析提示：${r.warnings.join('；')}`;
       // 导入时后端顺手把 DNS 纠了一遍。有结果（成功或失败）就当场说 ——
       // 「填了记录名却什么都没发生」正是用户会怀疑「没解析」的地方。

@@ -138,6 +138,19 @@ async def tcp_probe(host: str, port: int, timeout: float = 4.0) -> tuple[bool, s
 # 端到端探测模式，与 settings.DEFAULT_SETTINGS["probe_mode"] 的取值一致。
 PROBE_MODES = ("auto", "tcp", "none")
 
+# 传输层（瞬时）DNS 失败连续多少次才升成 error。
+#
+# ⚠️ 为什么要这个数：巡检每 20 秒一轮，每轮都会顺手同步一次 DNS。网络抖一下
+#    （尤其本机还挂着 `http_proxy=127.0.0.1:51140` 这样的本地代理时）就会失败
+#    一次，而下一轮立刻又好了。原来失败一律记 `error` —— 事件日志里就出现
+#    一条条红色的「更新 DNS 失败」，看起来像 DNS 功能坏了，实际上 90% 的轮次
+#    都是成功的（成功且记录已对时是静默的）。用户就是这么报的「好像没自动解析」。
+#    所以：低于这个数只记 warn，连续到数了才升 error。
+#
+# 刻意**不复用** `fail_threshold`：那个管的是「连续探测失败几次才触发切换」，
+# 把两个语义捆在一起，以后调其中一个必然误伤另一个。
+DNS_FAIL_ESCALATE = 3
+
 
 def probe_plan(proxy_type: str, mode: str) -> tuple[bool, str]:
     """决定这条隧道要不要做 TCP 端到端探测。返回 (是否探测, 不探测的原因)。
@@ -176,6 +189,25 @@ def scope_key(manual_node_id: Any) -> int | None:
     跨作用域比较是没有意义的（各运营商命名空间互不相干）。
     """
     return int(manual_node_id) if manual_node_id else None
+
+
+def _close_client_soon(client: Any) -> None:
+    """把被替换掉的 CF 客户端的连接池关掉。
+
+    `reload_clients` 是**同步**方法（启动、保存设置、切节点等多处调用），
+    没法 await，所以把关闭动作丢给当前事件循环去跑。
+
+    · 没有运行中的循环（启动早期、纯同步的测试）→ 直接返回，连接池随对象
+      一起被回收，不值得为它引入一次同步阻塞；
+    · 客户端没有 `aclose`（测试里注入的假客户端）→ 跳过。
+    """
+    if client is None or not hasattr(client, "aclose"):
+        return
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    loop.create_task(client.aclose())
 
 
 class GuardEngine:
@@ -219,6 +251,11 @@ class GuardEngine:
         # 端到端探测是两件事：这个说明「节点本身还在不在」。
         self.manual_probe: dict[int, tuple[float, bool, str]] = {}
 
+        # 每条隧道**连续**几次 DNS 同步失败（tunnel_id -> 次数）。只用于决定
+        # 这条失败该记 warn 还是 error，成功一次就清零。内存态即可 —— 重启
+        # 之后从头数没有副作用（最多是第一轮多记一条 warn）。
+        self.dns_fail_streak: dict[int, int] = {}
+
         self.last_error: str = ""
         self.tick_count: int = 0
         self.last_tick_at: float = 0.0
@@ -234,7 +271,12 @@ class GuardEngine:
             base=str(s.get("mefrp_base") or ""),
             user_agent=str(s.get("user_agent") or ""),
         )
+        # ⚠️ 换掉 CF 客户端之前先把旧的连接池关掉。CloudflareClient 现在会**复用**
+        #    一个 httpx.AsyncClient（一次握手撑很多轮），不再用完即弃 —— 好处是
+        #    握手次数大幅下降，代价是必须有人负责关它，否则改一次设置就漏一个池子。
+        old_cf = self.cf
         self.cf = CloudflareClient(token=str(s.get("cf_api_token") or ""))
+        _close_client_soon(old_cf)
         self.notifier.configure(
             str(s.get("gotify_url") or ""), str(s.get("gotify_token") or "")
         )
@@ -1969,6 +2011,7 @@ class GuardEngine:
         节点地址直接由调用方给出（就是外部节点的 serverAddr）。
         不传 `host` 时走原来的路：从 mefrp 反推节点地址。
         """
+        tid = int(tunnel["id"])
         record_name = (tunnel.get("dns_record_name") or "").strip()
         if not record_name:
             return ""
@@ -2036,6 +2079,7 @@ class GuardEngine:
                     and target.content == host:
                 if not tunnel.get("dns_record_id"):
                     store.update_tunnel(tunnel["id"], {"dns_record_id": target.record_id})
+                self.dns_fail_streak.pop(tid, None)
                 return ""
 
             proxied = bool(tunnel.get("dns_proxied"))
@@ -2046,6 +2090,9 @@ class GuardEngine:
                 content=host,
                 proxied=proxied,
                 record_id=tunnel.get("dns_record_id"),
+                # ⚠️ 把上面刚查到的记录交出去，别让 upsert 再查两遍 —— 写路径上
+                #    那 4 个请求（4 次全新 TLS 握手）就是这么省成 2 个的。
+                existing=target,
             )
             store.update_tunnel(tunnel["id"], {
                 "dns_zone_id": zone_id,
@@ -2054,10 +2101,23 @@ class GuardEngine:
             msg = f"{record_name} → {want_type} {host}"
             store.add_event("success", "dns", f"DNS 已更新：{msg}",
                             tunnel_id=tunnel["id"])
+            self.dns_fail_streak.pop(tid, None)
             return msg
         except CloudflareError as exc:
             msg = f"更新 DNS 失败：{exc}"
-            store.add_event("error", "dns", msg, tunnel_id=tunnel["id"])
+            n = self.dns_fail_streak.get(tid, 0) + 1
+            self.dns_fail_streak[tid] = n
+            # 传输层瞬时失败先记 warn，连续到 DNS_FAIL_ESCALATE 次才升 error。
+            # 用户明确点的动作（force：导入 / 立即探测 / 切换后同步）不看这个 ——
+            # 那是他站在页面前等着要结果，必须如实报。
+            if exc.transient and not force and n < DNS_FAIL_ESCALATE:
+                store.add_event(
+                    "warn", "dns",
+                    f"{msg}（连续第 {n} 次，多半是瞬时网络问题，下一轮会自动重试）",
+                    tunnel_id=tid,
+                )
+            else:
+                store.add_event("error", "dns", msg, tunnel_id=tid)
             return msg
 
     # ------------------------------------------------------------------

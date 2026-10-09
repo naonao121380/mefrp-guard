@@ -30,6 +30,10 @@ class _DummyClient:
 
 _stub.AsyncClient = _DummyClient
 _stub.HTTPError = type("HTTPError", (Exception,), {})
+# ⚠️ cloudflare.py 在**模块级**就取了 `httpx.TransportError` 去拼「值得重试的
+#    异常」那个元组 —— 桩里少这个属性的话，import 就炸，而报的是一句跟本文件
+#    毫无关系的 AttributeError。
+_stub.TransportError = type("TransportError", (_stub.HTTPError,), {})
 sys.modules.setdefault("httpx", _stub)
 
 _TMP = tempfile.mkdtemp(prefix="mg-logic-")

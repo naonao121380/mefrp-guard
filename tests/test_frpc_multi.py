@@ -17,6 +17,10 @@ class _D:
     async def __aexit__(self, *a): return False
 stub.AsyncClient = _D
 stub.HTTPError = type("HTTPError", (Exception,), {})
+# ⚠️ cloudflare.py 在**模块级**就取了 `httpx.TransportError` 去拼「值得重试的
+#    异常」那个元组，桩里少这个属性的话，一 import 就 AttributeError ——
+#    报的还是一句跟本文件毫无关系的错，很难查。
+stub.TransportError = type("TransportError", (stub.HTTPError,), {})
 sys.modules["httpx"] = stub
 
 TMP = tempfile.mkdtemp(prefix="mg-multi-")

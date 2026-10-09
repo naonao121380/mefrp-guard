@@ -549,6 +549,41 @@ def find_tunnel_by_proxy(proxy_name: str, *,
     return dict(row) if row else None
 
 
+def find_tunnel_by_dns_name(record_name: str, *,
+                            exclude_id: int | None = None) -> dict[str, Any] | None:
+    """按 DNS 记录名找**别的**隧道。
+
+    ⚠️ 和隧道名不一样，DNS 记录名必须**全局唯一**。隧道名的唯一性范围是
+    「一台 frps 内」（见 find_tunnel_by_proxy），但 DNS 记录名不是谁的命名
+    空间，它是 Cloudflare 上一个实实在在的资源 —— 两条隧道填同一个名字会
+    发生这种事：
+
+        两边都在健康路径上每轮同步一次（默认 20 秒）
+        → 一个把记录改成节点 A 的地址，另一个改成节点 B 的地址
+        → 互相覆盖、无限抖动；日志里只有一行行「DNS 已更新」，
+          完全看不出是在打架，而解析结果每 20 秒翻一次面。
+
+    所以这个冲突要**硬拒绝**，没有 overwrite 开关 —— 它不像「同一台 frps 上
+    同名」，那种情况还能说谁先谁后，这种情况没有任何合理的语义。
+
+    比对时大小写/首尾空格都归一（DNS 记录名不区分大小写）。
+    `exclude_id` 用于「编辑自己」的场景，否则会把自己判成冲突。
+    """
+    name = (record_name or "").strip().lower()
+    if not name:
+        return None
+    sql = ("SELECT * FROM tunnels"
+           " WHERE dns_record_name IS NOT NULL"
+           "   AND lower(trim(dns_record_name)) = ?")
+    params: list[Any] = [name]
+    if exclude_id is not None:
+        sql += " AND id <> ?"
+        params.append(int(exclude_id))
+    with _LOCK:
+        row = _db().execute(sql, tuple(params)).fetchone()
+    return dict(row) if row else None
+
+
 def create_tunnel(data: dict[str, Any]) -> int:
     now = int(time.time())
     cols = [f for f in TUNNEL_FIELDS if f in data]

@@ -8,7 +8,9 @@ class _D:
     def __init__(self,*a,**k): pass
     async def __aenter__(self): return self
     async def __aexit__(self,*a): return False
-stub.AsyncClient=_D; stub.HTTPError=type("HTTPError",(Exception,),{}); sys.modules["httpx"]=stub
+stub.AsyncClient=_D; stub.HTTPError=type("HTTPError",(Exception,),{})
+# cloudflare.py 模块级就要 `httpx.TransportError`，桩里没有会直接 import 失败。
+stub.TransportError=type("TransportError",(stub.HTTPError,),{}); sys.modules["httpx"]=stub
 
 tmp = tempfile.mkdtemp(prefix="mg-e2e-")
 cfg = os.path.join(tmp, "frpc.toml")

@@ -682,6 +682,95 @@ _n3 = len([e for e in store.list_events(limit=200) if e["kind"] == "dns"])
 check("★ 用户明确要求时（force）才记事件", _n3 == _n2 + 1, (_n2, _n3))
 eng.cf = _cft                              # 还原成能用的假客户端
 
+print("  --- ★ 瞬时 DNS 失败：先记 warn，连续才升 error ---")
+# 巡检每 20 秒一轮，每轮都顺手同步一次 DNS。网络抖一下（本机还挂着
+# `http_proxy=127.0.0.1:51140` 这种本地代理时更是必中）就会失败一次，下一轮立刻
+# 又好了。原来失败**一律记 error** —— 事件日志里就出现一条条红色的「更新 DNS
+# 失败」，看起来像 DNS 功能坏了，而实际上绝大多数轮次都是成功的（成功且记录
+# 已经对了时是静默的）。用户就是这么报的「好像没自动解析」。
+# 所以：传输层瞬时失败先记 warn，连续到 DNS_FAIL_ESCALATE 次才升 error；
+# 用户明确点的动作（force：导入 / 立即探测 / 切换后同步）不看这个，如实报。
+from app.cloudflare import CloudflareError           # noqa: E402
+from app.engine import DNS_FAIL_ESCALATE             # noqa: E402
+
+
+class FlakyCF:
+    """按开关抛**传输层瞬时**错的假 CF。
+
+    `fail=False` 时正常走完 —— 用来验「成功一次就把连续计数清零」。
+    抛出来的形状和 cloudflare.py 重试耗尽后抛的那条一致（带 transient=True）。
+    """
+
+    def __init__(self) -> None:
+        self.token = "fake-cf-token"
+        self.fail = True
+        self.upserts: list[dict] = []
+
+    async def resolve_zone(self, name: str):
+        from app.cloudflare import Zone
+        return Zone(zone_id="ZFL", name="example.com")
+
+    async def list_records(self, zone_id: str, name: str | None = None):
+        if self.fail:
+            raise CloudflareError(
+                "请求 Cloudflare 失败（已重试 2 次）：ConnectTimeout: ",
+                transient=True)
+        return []
+
+    async def upsert(self, **kw):
+        from app.cloudflare import DnsRecord
+        self.upserts.append(kw)
+        return DnsRecord("RFL", kw["zone_id"], kw["name"], kw["record_type"],
+                         kw["content"], False)
+
+
+store.set_setting("auto_dns_sync", True)
+_fl = store.create_tunnel({
+    "name": "会抖的隧道", "proxy_name": "flaky-dns", "proxy_type": "udp",
+    "local_ip": "127.0.0.1", "local_port": 5000, "current_remote_port": 5020,
+    "manual_node_id": mid, "enabled": 1, "auto_failover": 0,
+    "dns_record_name": "flaky.example.com",
+})
+_cffl = FlakyCF()
+eng.cf = _cffl
+
+
+def _newest_dns() -> dict:
+    """最新一条 dns 事件（list_events 是 id DESC，所以 [0] 就是最新的）。"""
+    return [e for e in store.list_events(limit=50) if e["kind"] == "dns"][0]
+
+
+for _i in range(1, DNS_FAIL_ESCALATE + 1):
+    asyncio.run(eng._sync_dns(store.get_tunnel(_fl), None, host="127.0.0.1"))
+    _e = _newest_dns()
+    _want = "warn" if _i < DNS_FAIL_ESCALATE else "error"
+    check(f"★ 连续第 {_i} 次瞬时失败记 {_want}",
+          _e["level"] == _want, (_i, _e["level"], _e["message"]))
+
+asyncio.run(eng._sync_dns(store.get_tunnel(_fl), None, host="127.0.0.1"))
+check("★ 到阈值之后继续失败仍然是 error（不会又退回 warn）",
+      _newest_dns()["level"] == "error", _newest_dns())
+check("★ warn 的文案说清了「多半是瞬时问题、会自动重试」",
+      "瞬时" in _newest_dns()["message"] or "重试" in _newest_dns()["message"],
+      _newest_dns()["message"])
+
+# 成功一次就把连续计数清零 —— 否则抖动会「攒」起来，隔几分钟突然升级成 error，
+# 那就成了另一种形式的误报。
+_cffl.fail = False
+asyncio.run(eng._sync_dns(store.get_tunnel(_fl), None, host="127.0.0.1"))
+check("恢复后记录同步成功（走了 upsert）", len(_cffl.upserts) == 1, _cffl.upserts)
+_cffl.fail = True
+asyncio.run(eng._sync_dns(store.get_tunnel(_fl), None, host="127.0.0.1"))
+check("★ 成功一次就把连续计数清零（抖动不会攒成 error）",
+      _newest_dns()["level"] == "warn", _newest_dns())
+
+# force = 用户明确点的动作，不看阈值，第一次就如实记 error。
+asyncio.run(eng._sync_dns(store.get_tunnel(_fl), None, force=True,
+                          host="127.0.0.1"))
+check("★ force（导入 / 立即探测）时第一次就如实记 error",
+      _newest_dns()["level"] == "error", _newest_dns())
+eng.cf = _cft
+
 print("  --- 节点不存在 / 没有远程端口时如实报错 ---")
 ghost = store.create_tunnel({
     "name": "孤儿隧道", "proxy_name": "orphan-tun", "proxy_type": "tcp",

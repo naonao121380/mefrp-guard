@@ -620,6 +620,108 @@ remotePort = 26050
     check("★ 也不谎报 DNS 结果", (r.json().get("dns") or []) == [],
           r.json().get("dns"))
 
+    # ------------------------------------------------------------------
+    print("[22] ★ DNS 记录名必须全局唯一（两条隧道共用会互相覆盖）")
+    # 背景：**隧道名**只在「一台 frps 内」唯一，跨运营商重名完全合法（所以查重
+    # 走的是 find_tunnel_by_proxy 那套按作用域的逻辑）。但 **DNS 记录名**不是
+    # 谁的命名空间 —— 它是 Cloudflare 上一个实实在在的资源。两条隧道填同一个
+    # 名字的话，两边都在健康路径上每轮同步一次（默认 20 秒），一个写节点 A 的
+    # 地址、一个写节点 B 的，互相覆盖、无限抖动；而日志里只有一行行「DNS 已
+    # 更新」，完全看不出是在打架。所以这里是**硬拒绝**，没有 overwrite 开关。
+
+    r = c.post("/api/tunnels", headers=AUTH, json={
+        "name": "占用者", "proxy_name": "dns-owner", "local_port": 6001,
+        "dns_record_name": "dup.example.com"})
+    check("先建一条占住 dup.example.com", r.status_code == 200, r.text[:300])
+    owner_id = r.json()["id"]
+
+    r = c.post("/api/tunnels", headers=AUTH, json={
+        "name": "想抢的", "proxy_name": "dns-thief", "local_port": 6002,
+        "dns_record_name": "dup.example.com"})
+    check("★ 建隧道时撞记录名 -> 409", r.status_code == 409, r.text[:300])
+    d22a = r.json().get("detail") or {}
+    check("★ detail 带 code", d22a.get("code") == "dns_name_taken", d22a)
+    check("★ detail 带 existing_id / existing_name（前端才能给出下一步）",
+          d22a.get("existing_id") == owner_id
+          and d22a.get("existing_name") == "占用者", d22a)
+    check("★ detail 带 hint 说清为什么不能共用", bool(d22a.get("hint")), d22a)
+    check("★ 撞车时隧道根本没被建出来",
+          all(t["proxy_name"] != "dns-thief"
+              for t in c.get("/api/tunnels", headers=AUTH).json()))
+
+    # 大小写 / 首尾空格都要归一 —— DNS 记录名本身不区分大小写。
+    r = c.post("/api/tunnels", headers=AUTH, json={
+        "name": "大小写", "proxy_name": "dns-case", "local_port": 6003,
+        "dns_record_name": "  DUP.Example.COM  "})
+    check("★ 大小写 / 空格不同也算撞车 -> 409", r.status_code == 409, r.text[:300])
+
+    r = c.post("/api/tunnels", headers=AUTH, json={
+        "name": "另一个", "proxy_name": "dns-other", "local_port": 6004,
+        "dns_record_name": "other.example.com"})
+    check("换个名字就能建 -> 200", r.status_code == 200, r.text[:300])
+    other_id = r.json()["id"]
+
+    # ★ 编辑自己：记录名原样带上不能把自己判成冲突，否则连保存都保存不了。
+    r = c.patch(f"/api/tunnels/{owner_id}", headers=AUTH,
+                json={"local_port": 6011, "dns_record_name": "dup.example.com"})
+    check("★ 编辑自己、记录名原样带上 -> 200（不能把自己判成冲突）",
+          r.status_code == 200, r.text[:300])
+
+    r = c.patch(f"/api/tunnels/{other_id}", headers=AUTH,
+                json={"dns_record_name": "dup.example.com"})
+    check("★ 编辑别人去抢 -> 409", r.status_code == 409, r.text[:300])
+    check("★ 409 之后那条的记录名没被改掉",
+          next(t for t in c.get("/api/tunnels", headers=AUTH).json()
+               if t["id"] == other_id)["dns_record_name"] == "other.example.com")
+
+    # 清空 = 用户明确不管这条的 DNS，永远放行；放出来之后别人就能用。
+    r = c.patch(f"/api/tunnels/{owner_id}", headers=AUTH,
+                json={"dns_record_name": ""})
+    check("清空记录名 -> 200（空名不参与查重）", r.status_code == 200, r.text[:300])
+    r = c.post("/api/tunnels", headers=AUTH, json={
+        "name": "接手", "proxy_name": "dns-takeover", "local_port": 6005,
+        "dns_record_name": "dup.example.com"})
+    check("★ 前一条把名字放出来之后，别人就能接手 -> 200",
+          r.status_code == 200, r.text[:300])
+
+    # ---- 导入外部节点时撞车：隧道照建，只是不填记录名 ----
+    # ⚠️ 整份导入失败太重了：用户粘的是 frpc 配置，记录名只是顺带填的，很可能
+    #    只是复制粘贴时忘了改前缀。所以这里**只放弃这一个字段**，并如实报出来。
+    CONF22 = '''serverAddr = "203.0.113.95"
+serverPort = 7000
+
+[[proxies]]
+name = "c22-web"
+type = "tcp"
+localIP = "127.0.0.1"
+localPort = 5100
+remotePort = 26060
+'''
+    cf22 = FakeCF()
+    ENG.cf = cf22
+    r = c.post("/api/manual-nodes", headers=AUTH, json={
+        "text": CONF22,
+        "proxies": [{"name": "c22-web", "adopt": True,
+                     "dns_record_name": "dup.example.com"}]})
+    check("导入 200（记录名撞车不该让整份导入失败）",
+          r.status_code == 200, r.text[:300])
+    d22 = r.json()
+    check("★ 隧道照建（纳管成功）", d22.get("adopted") == ["c22-web"],
+          d22.get("adopted"))
+    check("★ 撞车条目进 dns_clash 而不是 skipped（它不是「没纳管」）",
+          len(d22.get("dns_clash") or []) == 1
+          and not (d22.get("skipped") or []), d22.get("dns_clash"))
+    check("★ dns_clash 说清了被谁占了",
+          bool(d22.get("dns_clash"))
+          and d22["dns_clash"][0]["existing_name"] == "接手",
+          d22.get("dns_clash"))
+    tun22 = next(t for t in c.get("/api/tunnels", headers=AUTH).json()
+                 if t["proxy_name"] == "c22-web")
+    check("★ 记录名没落库（而不是落了个会被别人覆盖的）",
+          tun22["dns_record_name"] == "", tun22["dns_record_name"])
+    check("★ 也没去 Cloudflare 写（没记录名就不该问）",
+          cf22.upserts == [], cf22.upserts)
+
 print()
 print(f"==> PASS {PASS} / FAIL {FAIL}")
 sys.exit(1 if FAIL else 0)

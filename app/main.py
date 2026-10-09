@@ -738,6 +738,9 @@ async def create_tunnel(payload: TunnelIn, _: None = Auth) -> dict[str, Any]:
     #    展示名（name）**不查重**：它不是唯一键，重名是允许的。
     if store.find_tunnel_by_proxy(payload.proxy_name):
         raise HTTPException(400, f"proxy_name「{payload.proxy_name}」已被占用")
+    # ⚠️ DNS 记录名是**全局**唯一（不像 proxy_name 只在 mefrp 作用域内）。
+    #    这里不查的话，两条隧道会每 20 秒对着同一条记录互相覆盖。
+    _claim_dns_name(payload.dns_record_name)
     data = payload.model_dump()
     data["enabled"] = int(data["enabled"])
     data["auto_failover"] = int(data["auto_failover"])
@@ -776,6 +779,11 @@ async def patch_tunnel(tunnel_id: int, payload: TunnelPatch,
         if iid is not None and store.get_frpc_instance(int(iid)) is None:
             raise HTTPException(404, f"frpc 实例 {iid} 不存在")
         data["frpc_instance_id"] = int(iid) if iid else None
+
+    # ⚠️ 改记录名也要查重，而且必须 `exclude_id=自己` —— 否则用户只是改个别的
+    #    字段、记录名原样带上，就会把自己判成冲突，连保存都保存不了。
+    if "dns_record_name" in data:
+        _claim_dns_name(data["dns_record_name"], exclude_id=tunnel_id)
 
     # ⚠️ manual_node_id 只允许「解绑」（传 null）。想绑到外部节点必须走
     #    /api/manual-nodes/{id}/switch —— 那条路会**改写配置文件并重启容器**。
@@ -858,6 +866,7 @@ async def adopt_orphan(proxy_id: int, payload: OrphanAdoptIn,
     # 查重限定在 mefrp 作用域 —— 别家 frps 上有同名隧道不影响这条能不能纳管。
     if store.find_tunnel_by_proxy(proxy.proxy_name):
         raise HTTPException(400, f"隧道「{proxy.proxy_name}」已经纳管过了")
+    _claim_dns_name(payload.dns_record_name)
 
     # 展示名不再做「重名就加后缀」的处理：它不是唯一键，重名是允许的，
     # 硬改名字只会让人认不出这条隧道原本叫什么。
@@ -1127,6 +1136,43 @@ def _node_conflict(node: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _dns_name_conflict(record_name: str, *,
+                       exclude_id: int | None = None) -> dict[str, Any] | None:
+    """DNS 记录名撞车就返回一份可操作的结构，没撞返回 None。
+
+    ⚠️ 为什么这必须是**硬拒绝**、而且没有 overwrite 开关：两条隧道共用一个
+    DNS 记录名不是「谁先谁后」的问题，是它们会一直互相覆盖 —— 两边都在健康
+    路径上每轮同步一次（默认 20 秒），一个写节点 A 的地址、一个写节点 B 的，
+    解析结果每 20 秒翻一次面，而日志里只有一行行「DNS 已更新」，看不出在打架。
+    （隧道名重名是另一回事：那个只在「一台 frps 内」唯一，跨运营商重名合法，
+      所以走的是 find_tunnel_by_proxy 那套按作用域查的逻辑。）
+    """
+    name = (record_name or "").strip()
+    if not name:
+        return None
+    other = store.find_tunnel_by_dns_name(name, exclude_id=exclude_id)
+    if other is None:
+        return None
+    return {
+        "code": "dns_name_taken",
+        "message": f"DNS 记录「{name}」已经归隧道「{other['name']}」"
+                   f"（#{other['id']}）管了。",
+        "existing_id": int(other["id"]),
+        "existing_name": str(other["name"]),
+        "record_name": name,
+        "hint": "两条隧道用同一个记录名会每轮互相覆盖（默认 20 秒一次），"
+                "必须各用各的名字 —— 比如给这条换个前缀。",
+    }
+
+
+def _claim_dns_name(record_name: str, *,
+                    exclude_id: int | None = None) -> None:
+    """查重，撞了就抛 409（带结构化 detail）。"""
+    conflict = _dns_name_conflict(record_name, exclude_id=exclude_id)
+    if conflict is not None:
+        raise HTTPException(409, conflict)
+
+
 @app.post("/api/manual-nodes/parse")
 async def manual_nodes_parse(payload: ManualParseIn,
                              _: None = Auth) -> dict[str, Any]:
@@ -1244,6 +1290,9 @@ async def manual_node_create(payload: ManualNodeIn,
     specs = {p.name: p for p in parsed.proxies}
     adopted: list[str] = []
     skipped: list[dict[str, str]] = []
+    # DNS 记录名撞车的条目。⚠️ 和 skipped 分开记：这些隧道**是纳管了的**，
+    # 只是没给它填记录名 —— 混进 skipped 会让前端报「没纳管」，那是假话。
+    dns_clash: list[dict[str, str]] = []
     # 刚建出来的隧道行。下一步要拿它们逐个同步 DNS，所以这里必须留住整行，
     # 不能只留名字 —— dns_record_name / dns_zone_id 都在行里。
     created: list[dict[str, Any]] = []
@@ -1264,6 +1313,20 @@ async def manual_node_create(payload: ManualNodeIn,
 
         # 展示名直接用隧道本名。⚠️ **不做跨作用域改名** —— 展示名不是唯一键，
         # 不同 frps 上重名是正常的，改成 `xxx-7` 反而让人看不出它原本叫什么。
+        #
+        # ⚠️ DNS 记录名撞车时**只放弃这一个字段**，隧道照建。整份导入失败太重了：
+        #    用户粘的是 frpc 配置，记录名只是顺带填的，很可能只是复制粘贴时忘了
+        #    改前缀。所以这里如实报出来（dns_clash），让他回头去「编辑隧道」改。
+        rec_name = item.dns_record_name.strip()
+        clash = _dns_name_conflict(rec_name)
+        if clash is not None:
+            dns_clash.append({
+                "name": spec.name,
+                "record_name": rec_name,
+                "existing_id": str(clash["existing_id"]),
+                "existing_name": str(clash["existing_name"]),
+            })
+            rec_name = ""
         store.create_tunnel({
             "name": spec.name,
             "proxy_name": spec.name,
@@ -1276,7 +1339,7 @@ async def manual_node_create(payload: ManualNodeIn,
             # ⚠️ 外部节点的隧道**一律关掉自动切换** —— 没有 API，切不了。
             #    留着这个开关只会让用户以为它会自愈。
             "auto_failover": 0,
-            "dns_record_name": item.dns_record_name.strip(),
+            "dns_record_name": rec_name,
             "frpc_instance_id": payload.frpc_instance_id,
             # 这次纳管的隧道统一打上用户填的标签（留空 = 不打）。
             "tag": _norm_tag(payload.tag),
@@ -1315,6 +1378,10 @@ async def manual_node_create(payload: ManualNodeIn,
     ]
     if skipped:
         detail.append("跳过：" + "；".join(f"{s['name']}（{s['why']}）" for s in skipped))
+    if dns_clash:
+        detail.append("DNS 记录名撞车（这几条没填记录名，隧道本身已纳管）：" + "；".join(
+            f"{c['name']} 想填 {c['record_name']}，但已被 "
+            f"「{c['existing_name']}」#{c['existing_id']} 占用" for c in dns_clash))
     if parsed.warnings:
         detail.append("解析提示：" + "；".join(parsed.warnings))
     if dns_msgs:
@@ -1343,6 +1410,9 @@ async def manual_node_create(payload: ManualNodeIn,
         "format": parsed.fmt,
         "adopted": adopted,
         "skipped": skipped,
+        # DNS 记录名撞车的条目。前端要当场说出来 —— 否则用户会以为记录名填上了，
+        # 然后去怀疑「怎么没解析」。
+        "dns_clash": dns_clash,
         "warnings": parsed.warnings,
         "switched": switched,
         # 导入时顺手做的 DNS 同步结果（每条一行）。前端把它显示在成功弹窗里
