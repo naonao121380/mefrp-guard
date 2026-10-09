@@ -56,6 +56,27 @@ section.on{display:block}
 .pill.warn{background:var(--amber-bg);color:#FAC775}
 .pill.idle{background:var(--surface2);color:var(--muted)}
 .pill.info{background:var(--blue-bg);color:#B5D4F4}
+/* 「外部节点」徽标：刻意用紫色区分于 mefrp 纳管节点 —— 两者的能力边界完全不同
+   （外部节点没有 API，永远不会自动切换），在卡片里必须一眼能分辨。 */
+.pill.manual{background:#2E2A4A;color:#C9C4F5}
+/* 标签：用户自己分的组，跟状态、来源都无关，所以用中性色 —— 不抢红/绿/黄/紫
+   那几种「有含义」的颜色，否则一眼扫过去分不清哪个是标签哪个是状态。 */
+.pill.tag{background:var(--surface2);color:var(--muted);border:1px solid var(--border);font-family:var(--mono)}
+/* 标签筛选条：一排可点的胶囊，「全部 / 各标签 / 未打标签」。 */
+.tagbar{display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-top:12px}
+.tagbar .tb{background:var(--surface);border:1px solid var(--border);color:var(--muted);
+  border-radius:20px;padding:4px 12px;font-size:12px;cursor:pointer;font-family:inherit}
+.tagbar .tb:hover{border-color:var(--muted);color:var(--text)}
+.tagbar .tb.on{background:var(--blue-bg);border-color:var(--blue);color:#B5D4F4}
+.tagbar .tb b{font-weight:500;font-family:var(--mono);margin-left:5px;opacity:.85}
+.tagbar .tbl{color:var(--dim);font-size:12px;margin-right:2px}
+/* 节点表格的「操作」列：按钮多，必须允许换行且不撑破表格。
+   td 默认 min-width:auto，长按钮文字会把整列顶宽，把前面的列挤到看不清。 */
+td.ops{white-space:normal}
+td.ops .actions{margin-top:0;gap:5px}
+/* 表格里的控件：全局 input{width:100%} 会把勾选框撑成一整格，必须收回来。 */
+td input[type=checkbox]{width:auto;margin:0}
+td input.mi-dns{width:auto;min-width:132px;font-size:11px;padding:4px 7px}
 button.act{background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:5px 12px;border-radius:7px;font-size:12px;cursor:pointer;font-family:inherit}
 button.act:hover{border-color:var(--muted)}
 button.act.pri{background:var(--blue-bg);border-color:var(--blue);color:#B5D4F4}
@@ -137,8 +158,10 @@ dialog h3{margin-top:0;color:var(--text);font-size:15px}
 
   <section id="tunnels">
     <div class="flex"><h2 style="margin:0">受管隧道</h2><div class="sp"></div>
+      <button class="act" onclick="openManualImport()">从 frpc 配置导入</button>
       <button class="act pri" onclick="openTunnelDialog()">新增隧道</button>
       <button class="act" onclick="loadTunnels()">刷新</button></div>
+    <div id="tagBar" class="tagbar"></div>
     <div id="tunnelManage" style="margin-top:14px"></div>
 
     <h2>mefrp 上未纳管的隧道</h2>
@@ -147,11 +170,18 @@ dialog h3{margin-top:0;color:var(--text);font-size:15px}
   </section>
 
   <section id="nodes">
-    <div class="flex"><h2 style="margin:0">节点</h2><div class="sp"></div>
+    <div class="flex"><h2 style="margin:0">节点</h2>
+      <span class="pill info">mefrp</span>
+      <div class="sp"></div>
       <span class="muted" id="groupInfo"></span>
       <button class="act" onclick="refreshNodes()">重新拉取</button></div>
     <p class="muted" id="pickRule"></p>
     <div id="nodeList" style="margin-top:12px"></div>
+    <p class="muted" style="margin-top:14px">这一页是 <b>mefrp</b> 纳管的节点。
+      <b>外部节点</b>（自建 frps 或别的 frp 服务商）不在这里常驻 —— 它们是隧道的附属信息，
+      在「隧道」页点「从 frpc 配置导入」粘贴一份配置就能用，用完删掉隧道即可。</p>
+    <p class="muted">以后如果接了别家<b>有开放 API</b> 的 frp 服务商，这里会再加一个子页签
+      （一家一个）；现在只有 mefrp 一家，所以没有子页签。</p>
   </section>
 
   <section id="frpc">
@@ -260,7 +290,7 @@ dialog h3{margin-top:0;color:var(--text);font-size:15px}
   <input type="hidden" id="f_id">
   <div class="row">
     <div><label>显示名</label><input id="f_name" placeholder="例如 NAS 面板"></div>
-    <div><label>mefrp 隧道名（proxyName）</label><input id="f_proxy_name" placeholder="例如 nas-panel"></div>
+    <div><label>隧道名（proxyName）</label><input id="f_proxy_name" placeholder="例如 nas-panel"></div>
   </div>
   <div class="row3">
     <div><label>类型</label><select id="f_proxy_type"><option value="tcp">TCP</option><option value="udp">UDP</option><option value="http">HTTP</option><option value="https">HTTPS</option></select></div>
@@ -271,8 +301,10 @@ dialog h3{margin-top:0;color:var(--text);font-size:15px}
     <div><label>期望远程端口（留空自动分配）</label><input id="f_desired_remote_port" type="number" min="1" max="65535"></div>
     <div><label>锁定节点（留空 = 自动择优）</label><select id="f_pin_node_id"><option value="">自动</option></select></div>
   </div>
-  <label>挂接的 frpc 容器</label>
-  <select id="f_frpc_instance_id"><option value="0">（不挂接）</option></select>
+  <div class="row">
+    <div><label>标签（用来分组筛选，留空 = 不打标签）</label><input id="f_tag" placeholder="例如 mefrp / 公司frps / 临时"></div>
+    <div><label>挂接的 frpc 容器</label><select id="f_frpc_instance_id"><option value="0">（不挂接）</option></select></div>
+  </div>
   <div class="note">模型是<b>一条隧道 : 一个 frpc 容器</b>。没挂接的隧道<b>不会被写进任何 frpc 配置</b>，
     也就没人帮它改配置、重启容器 —— 必须显式指定，程序不会替你猜。</div>
   <label>关联的 Cloudflare 记录名（留空 = 不管理 DNS）</label>
@@ -282,6 +314,7 @@ dialog h3{margin-top:0;color:var(--text);font-size:15px}
   <textarea id="f_downstream_note" style="min-height:70px" placeholder="例如：Lucky 反代规则 nas 的后端要改成 节点IP:端口"></textarea>
   <div class="chk"><input type="checkbox" id="f_enabled" checked><label for="f_enabled" style="margin:0">启用</label></div>
   <div class="chk"><input type="checkbox" id="f_auto_failover" checked><label for="f_auto_failover" style="margin:0">允许这条隧道自动切换</label></div>
+  <div id="f_manual_note"></div>
   <div class="note">保存后，如果 mefrp 上还没有同名的隧道，程序会<b>自动在你的账号上创建一条</b>；如果已存在同名隧道，则会直接接管它。</div>
   <div class="flex" style="margin-top:18px"><div class="sp"></div>
     <button class="act" onclick="document.getElementById('tunDlg').close()">取消</button>
@@ -328,9 +361,78 @@ dialog h3{margin-top:0;color:var(--text);font-size:15px}
     <button class="act pri" onclick="saveFrpc()">保存</button></div>
 </dialog>
 
+<!-- ===== 外部节点：从 frpc 配置导入隧道 =====
+     入口在**隧道页**，不在节点页 —— 这类节点（自建 frps、别的 frp 服务商）是
+     一次性的，用完就丢，没必要在节点列表里常驻、也没必要单独起名字管理。
+     两步式：先「解析预览」确认解析结果对得上，再「导入」。
+     这一步不能省 —— frpc 的配置格式跨版本差别很大（TOML/INI、键名写法、
+     老式插件段），直接保存的话，用户是拿一份可能解析错的配置去改自己
+     线上跑的 frpc.toml，风险太高。 -->
+<dialog id="mniDlg" style="max-width:780px">
+  <h3 id="mniTitle">从 frpc 配置导入隧道</h3>
+  <input type="hidden" id="mi_id">
+  <label>粘贴 frpc 配置全文（TOML 或 INI 都行，默认自动识别）</label>
+  <textarea id="mi_text" style="min-height:190px" placeholder="[common]&#10;server_addr = 1.2.3.4&#10;server_port = 7000&#10;token = 你的token&#10;&#10;[nas-ssh]&#10;type = tcp&#10;local_port = 22&#10;remote_port = 16022"></textarea>
+  <div class="row">
+    <div><label>配置格式</label><select id="mi_format">
+      <option value="">自动识别（推荐）</option>
+      <option value="toml">TOML —— frpc 0.52 及以后</option>
+      <option value="ini">INI —— frpc 0.52 之前</option>
+    </select></div>
+    <div><label>这些隧道由哪个 frpc 实例承载</label><select id="mi_instance_id"></select></div>
+  </div>
+  <!-- 只在「新建导入」时出现 —— 更新节点配置那条路不碰隧道，也就用不上标签。 -->
+  <div id="mi_tag_row">
+    <label>给这次纳管的隧道打标签（留空 = 不打标签）</label>
+    <input id="mi_tag" placeholder="例如 公司frps / 临时 / 香港">
+    <div class="muted" style="margin-top:5px">标签只用来分组筛选，不参与任何自愈逻辑。mefrp 纳管的隧道
+      会自动打 <code>mefrp</code>；外部节点的隧道留空，你想叫什么就叫什么。</div>
+  </div>
+  <div class="flex" style="margin-top:10px"><div class="sp"></div>
+    <button class="act pri" onclick="parseManual()">解析预览</button></div>
+  <div id="mi_preview"></div>
+  <div id="mi_hint"></div>
+  <div class="flex" style="margin-top:14px"><div class="sp"></div>
+    <button class="act" onclick="document.getElementById('mniDlg').close()">取消</button>
+    <button class="act pri" id="mi_save" onclick="saveManual()" disabled>导入</button></div>
+</dialog>
+
+<!-- ===== 外部节点：改连（实例级） =====
+     ⚠️ 这里是**实例级**动作，不是「隧道换节点」。一条隧道没法单独换 frps ——
+        一个 frpc 进程只能连一个 serverAddr，隧道是被实例带着走的。
+        所以入口在 frpc 卡片上，一次换的是「这个实例连哪台 frps」，
+        它承载的隧道跟着一起过去（隧道定义一个字不动）。 -->
+<dialog id="mnsDlg" style="max-width:640px">
+  <h3>把这个 frpc 实例改连到外部节点</h3>
+  <p class="muted" id="ms_info"></p>
+  <label>目标外部节点</label>
+  <select id="ms_node_id"></select>
+  <label>要改连的 frpc 实例</label>
+  <select id="ms_instance_id"></select>
+  <label>改连后是否重启 frpc</label>
+  <select id="ms_restart">
+    <option value="">按设置来（实例的重启方式 + 全局「配置变化后自动重启」）</option>
+    <option value="1">强制重启</option>
+    <option value="0">不重启，只写配置</option>
+  </select>
+  <p class="muted">做的事：改写这个实例配置里的<b>服务端段</b>（地址 / 端口 / 鉴权）
+    → 按上面的选择决定是否重启它的容器 → 重新解析相关隧道的 DNS。
+    <b>隧道定义一个字都不动</b> —— 换的只是「哪台 frps 来接」。</p>
+  <div class="note">为什么是<b>实例级</b>而不是隧道级：一个 frpc 进程只能连一个 serverAddr，
+    所以「哪台 frps 来接」这件事只在这个实例身上说得通。它承载的隧道会一起过去；
+    其它实例连的是各自配置里的地址，完全不受影响。</div>
+  <div class="flex" style="margin-top:14px"><div class="sp"></div>
+    <button class="act" onclick="document.getElementById('mnsDlg').close()">取消</button>
+    <button class="act pri" onclick="doManualSwitch()">确认改连</button></div>
+</dialog>
+
 <script>
 const $ = id => document.getElementById(id);
 let OVERVIEW = null, TUNNELS = [], NODES = [], SETTINGS = null, TICK = null;
+// TAGS = 所有在用的标签（带条数）；TAG_FILTER 三态：null = 全部，
+// '' = 只看没打标签的，其它字符串 = 只看这个标签。
+let TAGS = [], TAG_FILTER = null;
+const _tagOf = t => String((t && t.tag) || '').trim();
 
 async function api(path, opts){
   const r = await fetch(path, Object.assign(
@@ -343,7 +445,17 @@ async function api(path, opts){
     location.replace('/login?next=' + encodeURIComponent(location.pathname + location.search));
     throw new Error('未登录，正在跳转登录页…');
   }
-  if(!r.ok) throw new Error((j && (j.detail || j.error)) || ('HTTP '+r.status));
+  if(!r.ok){
+    // detail 可能是字符串，也可能是**结构化对象**（比如「地址已导入过」要带上
+    // existing_id 才能给出下一步按钮）。别把对象直接丢进 Error —— 那会变成
+    // "[object Object]"，所以取它的 message，并把原始 detail 挂在 error 上。
+    const d = (j && (j.detail !== undefined ? j.detail : j.error));
+    const msg = (d && typeof d === 'object') ? (d.message || JSON.stringify(d))
+                                             : (d || ('HTTP '+r.status));
+    const err = new Error(msg);
+    err.status = r.status; err.detail = d;
+    throw err;
+  }
   return j;
 }
 const esc = s => String(s==null?'':s).replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -361,7 +473,7 @@ document.querySelectorAll('nav button').forEach(b=>{
     document.querySelectorAll('nav button').forEach(x=>x.classList.remove('on'));
     document.querySelectorAll('section').forEach(x=>x.classList.remove('on'));
     b.classList.add('on'); $(b.dataset.tab).classList.add('on');
-    if(b.dataset.tab==='nodes') loadNodes();
+    if(b.dataset.tab==='nodes'){ loadNodes(); loadManualNodes(); }
     if(b.dataset.tab==='frpc') loadFrpc();
     if(b.dataset.tab==='events') loadEvents();
     if(b.dataset.tab==='settings') loadSettings();
@@ -396,6 +508,8 @@ async function loadOverview(){
   $('statCards').innerHTML = stats.map(([l,n,c])=>
     `<div class="card"><div class="n" style="color:${c||'var(--text)'}">${n}</div><div class="l">${l}</div></div>`).join('')
     + `<div class="card"><div class="n" style="color:${f.status==='running'?'var(--teal)':'var(--red)'}">${esc(f.status||'不可用')}</div><div class="l">frpc ${fCount>1?`${fCount} 个实例`:'容器'} ${esc(f.name||'')}</div></div>`
+    // 外部节点不单独占一张卡 —— 它不是一个需要用户管理的「节点清单」，
+    // 而是隧道的附属信息，隧道卡片上已经标得很清楚了。
     // 未挂接 frpc 容器的隧道不会被写进任何 frpc 配置 —— 必须在总览就看得见，
     // 不能只在 frpc 页提示
     + (fUnbound ? `<div class="card"><div class="n" style="color:var(--amber)">${fUnbound}</div><div class="l">隧道未挂接 frpc</div></div>` : '');
@@ -415,10 +529,28 @@ async function loadOverview(){
 }
 
 function renderTunnels(list, target){
-  if(!list.length){ $(target).innerHTML = '<p class="muted">还没有受管隧道。去「隧道」页新增一条。</p>'; return; }
+  if(!list.length){
+    // 筛选筛空了和「一条隧道都没有」是两回事，提示必须分开 —— 否则用户
+    // 看着「还没有受管隧道」会以为自己的隧道丢了。
+    $(target).innerHTML = (target==='tunnelManage' && TAG_FILTER !== null)
+      ? `<p class="muted">没有符合当前标签（${TAG_FILTER===''?'未打标签':esc(TAG_FILTER)}）的隧道。
+         <button class="act" style="margin-left:6px" onclick="setTagFilter(null)">看全部</button></p>`
+      : '<p class="muted">还没有受管隧道。去「隧道」页新增一条。</p>';
+    return;
+  }
   $(target).innerHTML = list.map(t=>{
+    // 外部节点托管的隧道没有 mefrp proxy 可查（它压根不在 mefrp 上），
+    // 所以判定只剩端到端探测这一条 —— 不能沿用「proxy 存在与否」那套，
+    // 否则会一路落到默认分支、被标成「未纳管」。
+    const isManual = t.node_source === 'manual';
     let cls='idle', label='未纳管';
     if(!t.enabled){ cls='idle'; label='已停用'; }
+    else if(isManual){
+      if(t.probe_ok===false){ cls='bad'; label='异常'; }
+      else if(t.probe_ok===true){ cls='ok'; label='健康'; }
+      else if(t.probe_skipped){ cls='ok'; label='在线 · 不探测'; }
+      else { cls='warn'; label='待探测'; }
+    }
     else if(t.proxy_found && !t.proxy_online){ cls='bad'; label='异常'; }
     else if(t.probe_ok===false){ cls='bad'; label='异常'; }
     else if(t.proxy_found && t.probe_ok===true){ cls='ok'; label='健康'; }
@@ -426,12 +558,21 @@ function renderTunnels(list, target){
     // 不能画成红色，否则用户会以为服务有问题。
     else if(t.proxy_found && t.probe_skipped){ cls='ok'; label='在线 · 不探测'; }
     else if(t.proxy_found){ cls='warn'; label='待探测'; }
-    const note = t.last_error ? `<div class="muted" style="margin-top:8px;color:var(--red)">${esc(t.last_error)}</div>` : '';
+    // last_error 默认画成红色「异常」。但有一种情况它**不是**异常：
+    // 端到端探测不适用（udp 隧道）时，老版本会把「无法探测：…」写进 last_error，
+    // 前端就把它渲染成红色的故障 —— 而那条隧道其实好端端跑着。
+    // 新版本已经不再这么写了（原因改走 probe_cache，由下面的 ⓘ 显示），
+    // 这里再兜一道，免得升级后第一次刷新时闪一下红。
+    const note = t.last_error
+      ? (t.probe_skipped
+          ? `<div class="muted" style="margin-top:8px">ⓘ ${esc(t.last_error)}</div>`
+          : `<div class="muted" style="margin-top:8px;color:var(--red)">${esc(t.last_error)}</div>`)
+      : '';
     const pnote = (t.probe_skipped && t.probe_reason) ? `<div class="muted" style="margin-top:8px">ⓘ ${esc(t.probe_reason)}</div>` : '';
     const probeTxt = t.probe_skipped ? '不适用' : (t.probe_ok===true ? '通过' : (t.probe_ok===false ? '失败' : '—'));
     return `<div class="tun ${cls}">
       <div class="head">
-        <div><div class="name">${esc(t.name)} <span class="pill ${cls==='ok'?'ok':cls==='bad'?'bad':cls==='warn'?'warn':'idle'}">${label}</span></div>
+        <div><div class="name">${esc(t.name)} <span class="pill ${cls==='ok'?'ok':cls==='bad'?'bad':cls==='warn'?'warn':'idle'}">${label}</span>${isManual?` <span class="pill manual">外部节点${t.node_name?` · ${esc(t.node_name)}`:''}</span>`:''}${_tagOf(t)?` <span class="pill tag">${esc(_tagOf(t))}</span>`:''}</div>
         <div class="meta">proxyName <code>${esc(t.proxy_name)}</code> · 本地 ${esc(t.local_ip)}:${t.local_port} · ${esc(t.proxy_type).toUpperCase()}</div></div>
       </div>
       <div class="kv">
@@ -449,21 +590,75 @@ function renderTunnels(list, target){
       </div>${note}${pnote}
       <div class="actions">
         <button class="act" onclick="probeNow(${t.id})">立即探测</button>
-        <button class="act pri" onclick="failover(${t.id})">手动切换</button>
+        ${isManual
+          // ⚠️ 外部节点隧道**没有「切换节点」这个动作**，这是刻意的：
+          //    mefrp 的「切换」= 删掉旧节点上的 proxy、在新节点建一个同名 proxy，
+          //    那是**服务端**的事。外部节点没有 API，这条隧道在别的 frps 上
+          //    压根不存在 —— 把 serverAddr 改过去只会让它彻底不能用。
+          //    「换节点」的正确形态就是「重新粘一份新节点的配置」，那本质上
+          //    是更新服务端要素，所以这里只留一个入口。
+          ? `<button class="act pri" onclick="openManualImport(${t.manual_node_id||0})">更新节点配置</button>`
+          : `<button class="act pri" onclick="failover(${t.id})">手动切换</button>`}
         <button class="act" onclick="bindTunnel(${t.id})">挂接 frpc</button>
         <button class="act" onclick="editTunnel(${t.id})">编辑</button>
         ${t.needs_downstream_review?`<button class="act" onclick="clearReview(${t.id})">下游已处理</button>`:''}
         <button class="act danger" onclick="delTunnel(${t.id})">删除</button>
-      </div></div>`;
+      </div>${isManual?'<div class="muted" style="margin-top:8px">ⓘ 这条隧道跑在<b>外部节点</b>上，<b>不会自动切换</b>。节点挂了会报警，但要不要换、换到哪，得你点。</div>':''}</div>`;
   }).join('');
+}
+
+// ---------- 隧道标签 ----------
+// 标签只是隧道上的一个自由字段，不参与任何自愈逻辑。所以筛选**全在前端做** ——
+// 数据本来就在手上（loadTunnels 一次拿全量），再为筛选多跑一趟接口没有意义。
+async function loadTags(){
+  try{ TAGS = await api('/api/tags'); }catch(e){ TAGS = []; }
+  return TAGS;
+}
+
+function applyTagFilter(list){
+  if(TAG_FILTER === null) return list;
+  return list.filter(t => _tagOf(t) === TAG_FILTER);
+}
+
+function renderTagBar(){
+  const bar = $('tagBar'); if(!bar) return;
+  // 选中的标签没了（比如最后一条带它的隧道被删了）→ 退回「全部」。
+  // 不这么做的话筛选条上没有任何高亮项，而列表却是空的，看着像出了故障。
+  if(TAG_FILTER !== null && TAG_FILTER !== ''
+     && !TAGS.some(x => x.tag === TAG_FILTER)) TAG_FILTER = null;
+  let untagged = 0;
+  TUNNELS.forEach(t => { if(!_tagOf(t)) untagged++; });
+  // ⚠️ 标签名走 TAGS[i].tag 而不是把它插进 onclick 字符串 —— 标签是用户随便填的，
+  //    里面可能有引号，拼进 HTML 属性里会把 onclick 拆坏。索引是安全的。
+  const parts = [`<span class="tbl">标签</span>`,
+    `<button class="tb${TAG_FILTER===null?' on':''}" onclick="setTagFilter(null)">全部<b>${TUNNELS.length}</b></button>`];
+  TAGS.forEach((x,i)=>{
+    parts.push(`<button class="tb${TAG_FILTER===x.tag?' on':''}" `
+      + `onclick="setTagFilter(TAGS[${i}].tag)">${esc(x.tag)}<b>${x.count}</b></button>`);
+  });
+  if(untagged){
+    parts.push(`<button class="tb${TAG_FILTER===''?' on':''}" `
+      + `onclick="setTagFilter('')">未打标签<b>${untagged}</b></button>`);
+  }
+  bar.innerHTML = parts.join('');
+}
+
+function setTagFilter(v){
+  TAG_FILTER = v;
+  renderTagBar();
+  renderTunnels(applyTagFilter(OVERVIEW ? OVERVIEW.tunnels : TUNNELS), 'tunnelManage');
 }
 
 // ---------- 隧道 ----------
 async function loadTunnels(){
   TUNNELS = await api('/api/tunnels');
   if(!OVERVIEW) { try{ OVERVIEW = await api('/api/overview'); }catch(e){} }
-  renderTunnels(OVERVIEW ? OVERVIEW.tunnels : TUNNELS, 'tunnelManage');
-  const managed = new Set(TUNNELS.map(t=>t.proxy_name));
+  await loadTags(); renderTagBar();
+  renderTunnels(applyTagFilter(OVERVIEW ? OVERVIEW.tunnels : TUNNELS), 'tunnelManage');
+  // ⚠️ 只拿 **mefrp 作用域**的隧道来比对。外部节点的隧道跟 mefrp 的 proxy 列表
+  //    不是一回事 —— 一起算进来的话，「别家 frps 上恰好同名的隧道」会把一条
+  //    真·未纳管的 mefrp 隧道藏掉，用户永远看不到它。
+  const managed = new Set(TUNNELS.filter(t=>!t.manual_node_id).map(t=>t.proxy_name));
   try{
     const raw = await api('/api/orphans');
     const orphans = (raw||[]).filter(p=>!managed.has(p.proxy_name));
@@ -497,8 +692,13 @@ async function openTunnelDialog(){
   $('tunDlgTitle').textContent='新增隧道'; $('f_id').value='';
   ['f_name','f_proxy_name','f_local_port','f_desired_remote_port','f_dns_record_name','f_downstream_note']
     .forEach(i=>$(i).value='');
+  // 这个对话框建的都是 mefrp 隧道，后端默认就打 'mefrp'。这里**显式填出来**，
+  // 让用户看见「它会被打上什么标签」，而不是保存完才发现 —— 想换直接改就是。
+  $('f_tag').value='mefrp';
   $('f_local_ip').value='127.0.0.1'; $('f_proxy_type').value='tcp';
   $('f_dns_proxied').checked=false; $('f_enabled').checked=true; $('f_auto_failover').checked=true;
+  $('f_auto_failover').disabled=false; $('f_manual_note').innerHTML='';
+  $('f_pin_node_id').disabled=false;
   $('f_frpc_instance_id').value='0';
   $('f_proxy_name').disabled=false;
   fillNodeSelect(); $('tunDlg').showModal();
@@ -507,7 +707,10 @@ async function openTunnelDialog(){
 async function editTunnel(id){
   await ensureNodes();
   await fillFrpcSelect();
-  const t = TUNNELS.find(x=>x.id===id); if(!t) return;
+  const t = TUNNELS.find(x=>x.id===id) || (OVERVIEW ? OVERVIEW.tunnels.find(x=>x.id===id) : null);
+  if(!t) return;
+  const ov = OVERVIEW ? (OVERVIEW.tunnels||[]).find(x=>x.id===id) : null;
+  const isManual = !!(t.manual_node_id) || !!(ov && ov.node_source==='manual');
   $('tunDlgTitle').textContent='编辑隧道';
   $('f_id').value=t.id; $('f_name').value=t.name; $('f_proxy_name').value=t.proxy_name;
   $('f_proxy_name').disabled=true;
@@ -515,7 +718,21 @@ async function editTunnel(id){
   $('f_desired_remote_port').value=t.desired_remote_port||'';
   $('f_dns_record_name').value=t.dns_record_name||''; $('f_dns_proxied').checked=!!t.dns_proxied;
   $('f_downstream_note').value=t.downstream_note||'';
-  $('f_enabled').checked=!!t.enabled; $('f_auto_failover').checked=!!t.auto_failover;
+  $('f_tag').value = t.tag || '';
+  $('f_enabled').checked=!!t.enabled;
+  // 外部节点上的隧道自动切换恒为关，且开关不可点 —— 让用户能点但点了没用，
+  // 比直接禁用更糟（他会以为是自己没点对）。
+  $('f_auto_failover').checked = isManual ? false : !!t.auto_failover;
+  $('f_auto_failover').disabled = isManual;
+  // 「锁定节点」是 mefrp 侧的择优开关，外部节点上不存在这个概念。
+  $('f_pin_node_id').disabled = isManual;
+  $('f_manual_note').innerHTML = isManual
+    ? `<div class="note">这条隧道跑在<b>外部节点</b>上，自动切换是关掉的、也开不了 ——
+        这类节点没有 API，程序没法在它上面建隧道或删隧道。
+        <b>换节点不是这条隧道能单独做的事</b>：一个 frpc 进程只能连一台 frps，
+        隧道是被实例带着走的，所以换节点得去「frpc」页换那个实例连的节点，
+        或者点这条卡片上的「更新节点配置」重新粘一份新节点的配置。</div>`
+    : '';
   fillNodeSelect(); $('f_pin_node_id').value=t.pin_node_id||'';
   $('f_frpc_instance_id').value = t.frpc_instance_id || '0';
   $('tunDlg').showModal();
@@ -533,6 +750,7 @@ async function saveTunnel(){
     dns_proxied:$('f_dns_proxied').checked,
     downstream_note:$('f_downstream_note').value.trim(),
     enabled:$('f_enabled').checked, auto_failover:$('f_auto_failover').checked,
+    tag:$('f_tag').value.trim(),
     // 0 表示解绑 —— 后端把 0/null 都当作「不绑定」
     frpc_instance_id: (parseInt($('f_frpc_instance_id').value,10)||0) || null,
   };
@@ -552,11 +770,16 @@ async function delTunnel(id){
 
 async function probeNow(id){
   try{ const r = await api(`/api/tunnels/${id}/probe`,{method:'POST'});
+    let m;
     if(r.skipped){
-      alert(`ⓘ 不适用\n目标：${r.target}\n类型：${(r.proxy_type||'').toUpperCase()}\n原因：${r.reason}`);
+      m = `ⓘ 不适用\n目标：${r.target}\n类型：${(r.proxy_type||'').toUpperCase()}\n原因：${r.reason}`;
     } else {
-      alert(r.ok?`✅ 可达\n目标：${r.target}\n节点：${r.node}`:`❌ 不可达\n目标：${r.target}\n原因：${r.reason}`);
+      m = r.ok?`✅ 可达\n目标：${r.target}\n节点：${r.node}`:`❌ 不可达\n目标：${r.target}\n原因：${r.reason}`;
     }
+    // 探测和 DNS 是两件事，但用户点这个按钮的意图是「让这条隧道现在就是对的」。
+    // 后端顺手同步了一次 DNS，结果在这里如实说出来。
+    if(r.dns) m += `\n\nDNS：${r.dns}`;
+    alert(m);
     loadOverview();
   }catch(e){ alert('探测失败：'+e.message); }
 }
@@ -664,6 +887,377 @@ async function setPref(id, excluded){
   await api(`/api/nodes/${id}/pref`,{method:'POST',body:JSON.stringify({excluded:!!excluded})}); loadNodes();
 }
 
+// ---------- 外部节点（手工节点）----------
+// 从一份 frpc 配置里读出来的 frps 节点：自建 frps、别的 frp 服务商。
+//
+// ⚠️ 它**不是**一等实体 —— 不常驻节点列表、不需要起名、不需要单独管理。
+//    这类节点多半是一次性的（去服务商官网拉一份配置，用完就丢），所以
+//    它的生命周期**跟着隧道走**：入口在隧道页的「从 frpc 配置导入」，
+//    隧道删光之后后端会自动把没人引用的节点记录清掉。
+//
+// 唯一的例外是「切换」：一个 frpc 进程只能连一个 serverAddr，所以切换是
+// **实例级**的动作，得在 frpc 页或隧道卡片上做。这也是这里保留一份节点
+// 列表（MANUAL）的唯一用途 —— 给切换对话框填下拉框，不往页面上画。
+let MANUAL = null, MI_PARSED = null, MS_NODE = null;
+// 「地址已导入过、且那个节点是空的」时，用户确认过要清掉重建 —— 只有这种情况
+// 才允许覆盖，所以做成一次性的显式标记，每次开对话框都清掉。
+let MI_OVERWRITE = false;
+
+async function loadManualNodes(){
+  try{ MANUAL = await api('/api/manual-nodes'); }
+  catch(e){ MANUAL = {nodes:[]}; }
+  return MANUAL;
+}
+
+// 这个节点现在被哪条隧道用着 —— 隧道卡片上要显示，也用来给「更新节点配置」
+// 定位到具体是哪个节点。
+function manualNodeById(id){
+  return ((MANUAL&&MANUAL.nodes)||[]).find(n=>n.id===id) || null;
+}
+
+// ---- 导入 / 更新 ----
+// nodeId 给了 = 「更新这个外部节点的配置」（从隧道卡片进来，重新粘一份）；
+// 不给 = 「新建」。
+async function openManualImport(nodeId){
+  // 「更新节点配置」那条路是从隧道卡片进来的，nodeId 是隧道上带的 ——
+  // 如果这时还没拉过节点列表，得先拉一次，否则 manualNodeById 返回 null，
+  // 整个对话框会退化成「新建」，用户点「更新」却建出一个新节点。
+  if(nodeId && !MANUAL){ await loadManualNodes(); }
+  const n = nodeId ? manualNodeById(nodeId) : null;
+  $('mniTitle').textContent = n ? `更新外部节点配置 · ${n.name}` : '从 frpc 配置导入隧道';
+  $('mi_id').value = n ? n.id : '';
+  $('mi_format').value = '';
+  $('mi_preview').innerHTML = '';
+  $('mi_save').disabled = true;
+  $('mi_save').textContent = n ? '更新' : '导入';
+  MI_PARSED = null;
+  MI_OVERWRITE = false;
+
+  if(!FRPC){ try{ FRPC = await api('/api/frpc'); }catch(e){ FRPC = {instances:[]}; } }
+  const insts = (FRPC && FRPC.instances) || [];
+  $('mi_instance_id').innerHTML = '<option value="0">（先不挂接，之后再挂）</option>'
+    + insts.map(i=>`<option value="${i.id}">${esc(i.name)}</option>`).join('');
+
+  if(n){
+    try{
+      const full = await api('/api/manual-nodes/' + n.id);
+      $('mi_text').value = full.config_text || '';
+    }catch(e){ $('mi_text').value = ''; }
+    const first = (n.instances && n.instances[0] && n.instances[0].id) || 0;
+    $('mi_instance_id').value = String(first);
+    // 更新模式只改服务端要素，不碰隧道，所以标签这一栏没有意义 —— 收起来。
+    $('mi_tag_row').style.display = 'none';
+    $('mi_hint').innerHTML = `<div class="note">这个节点现在被 <b>${n.tunnel_count}</b> 条隧道用着，
+      由 <b>${n.instance_count}</b> 个 frpc 实例承载。改完点「更新」后，如果<b>服务端地址 / 端口 / 鉴权</b>
+      变了，程序会立刻把改动<b>传导</b>到那些实例 —— 改写它们的配置文件，并按各自的设置决定
+      是否重启容器、是否重新解析 DNS。</div>`;
+  }else{
+    $('mi_text').value = '';
+    $('mi_instance_id').value = '0';
+    $('mi_tag').value = '';
+    $('mi_tag_row').style.display = '';
+    $('mi_hint').innerHTML = `<div class="note">导入只是把这份配置<b>记下来</b>并纳管你勾选的隧道，
+      <b>不会</b>去动任何一台 frpc 机器上的文件。只有在上面选了承载实例、并且真的需要换服务端时，
+      才会去改写那份 frpc 配置。</div>`;
+  }
+  $('mniDlg').showModal();
+}
+
+async function parseManual(){
+  const text = $('mi_text').value;
+  if(!text.trim()){ alert('先把配置粘进来'); return; }
+  try{
+    const p = await api('/api/manual-nodes/parse',{method:'POST',body:JSON.stringify({
+      text, format: $('mi_format').value || null,
+      // 更新模式要带上正在编辑的节点 id：后端才知道该在哪个作用域里判「已纳管」，
+      // 也才不会把「撞到我自己」报成地址重复。
+      node_id: parseInt($('mi_id').value,10) || null})});
+    MI_PARSED = p;
+    // 重新解析 = 换了一份配置，之前那次「确认覆盖」就不算数了。
+    MI_OVERWRITE = false;
+    renderManualPreview(p);
+    $('mi_save').disabled = false;
+  }catch(e){
+    MI_PARSED = null; $('mi_save').disabled = true;
+    $('mi_preview').innerHTML =
+      `<div class="note bad" style="margin-top:16px">解析失败：${esc(e.message)}</div>`;
+  }
+}
+
+// ---- 「这个地址已经导入过了」的两条出路 ----
+// 以前这里只有一句「请直接编辑那个节点」，但**空节点在页面上是够不着的**：
+// 节点不进节点页，隧道卡片按隧道渲染，零隧道就没有卡片 → 没有任何入口能到达它。
+// 用户既改不了也删不掉，重新导入永久被堵。这两个按钮就是补上那个入口。
+async function miOpenExisting(id){
+  $('mniDlg').close();
+  await loadManualNodes();
+  if(!manualNodeById(id)){ alert('那个节点已经不在了（可能刚被删掉）。直接重新导入即可。'); return; }
+  openManualImport(id);
+}
+
+function miOverwrite(){
+  const d = MI_PARSED && MI_PARSED.duplicate;
+  if(!d) return;
+  if(!confirm(`清掉这个空节点，按当前这份配置重建？\n\n`
+      + `要删的节点：${d.existing_name}\n`
+      + `它名下：${d.tunnel_count} 条隧道、${d.instance_count} 个 frpc 实例\n\n`
+      + `它是空的，所以删掉不会丢任何东西。`)) return;
+  MI_OVERWRITE = true;
+  renderManualPreview(MI_PARSED);
+  $('mi_save').disabled = false;
+}
+
+function miOverwriteUndo(){
+  MI_OVERWRITE = false;
+  renderManualPreview(MI_PARSED);
+}
+
+function renderManualPreview(p){
+  const editing = !!$('mi_id').value;
+  // 更新模式下解析出来的地址如果是**别的**节点，后端也会回 duplicate ——
+  // 那是真冲突，要提醒；「撞到自己」后端已经滤掉了，所以这里不用再判 editing。
+  const d = p.duplicate;
+  const busy = d ? (d.tunnel_count + d.instance_count) : 0;
+  let dup = '';
+  if(d && MI_OVERWRITE){
+    dup = `<div class="note">已确认：导入时会先删掉空节点「${esc(d.existing_name)}」再重建。
+      <button class="act" style="margin-left:8px" onclick="miOverwriteUndo()">撤销</button></div>`;
+  }else if(d){
+    dup = `<div class="note bad">
+      <b>这个地址已经导入过了</b> —— 节点「${esc(d.existing_name)}」
+      （${d.tunnel_count} 条隧道、${d.instance_count} 个 frpc 实例）。
+      <div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap">
+        <button class="act" onclick="miOpenExisting(${d.existing_id})">打开这个节点的配置</button>
+        ${busy ? '' : `<button class="act pri" onclick="miOverwrite()">清掉它并重新导入</button>`}
+      </div>
+      <div class="muted" style="margin-top:8px">${busy
+        ? '它名下还有东西，所以不能覆盖重建 —— 那会连带删掉它们。要改配置就点上面那个按钮（只改服务端要素，不动隧道）；确实要推倒重来，先在隧道页删掉那几条隧道。'
+        : '它名下什么都没有（隧道 0、实例 0），是之前导入留下的残留记录，页面上没有入口能到达它 —— 所以给你这个「清掉重建」的按钮。'}</div>
+    </div>`;
+  }
+  const warn = (p.warnings||[]).length
+    ? `<div class="note">解析提示：${p.warnings.map(esc).join('；')}</div>` : '';
+  const taken = new Set(p.taken_names||[]);
+
+  const head = editing
+    ? '<tr><th>状态</th><th>名字</th><th>类型</th><th>本地</th><th>远程端口</th><th colspan="2"></th></tr>'
+    : '<tr><th></th><th>名字</th><th>类型</th><th>本地</th><th>远程端口</th><th>DNS 记录名</th><th>启用</th></tr>';
+
+  const rows = (p.proxies||[]).map((x,i)=>{
+    if(editing){
+      // 更新模式下这里**只管服务端要素**。纳管 / 取消纳管是隧道页的事 ——
+      // 在一份配置的预览里放勾选框，会让人以为「没勾的会被删掉」。
+      return `<tr>
+        <td>${taken.has(x.name) ? '<span class="pill ok">已纳管</span>'
+                                : '<span class="pill idle">未纳管</span>'}</td>
+        <td class="mono">${esc(x.name)}${x.plugin?' <span class="pill idle">插件段</span>':''}</td>
+        <td class="mono">${esc((x.proxy_type||'').toUpperCase())}</td>
+        <td class="mono">${esc(x.local_ip)}:${x.local_port||'—'}</td>
+        <td class="mono">${x.remote_port||'—'}</td>
+        <td colspan="2"></td>
+      </tr>`;
+    }
+    // 默认不勾的两种情况：
+    //   · 名字在**这个作用域里**已经纳管过了 —— 勾了后端也会跳过，不如先说清楚。
+    //     ⚠️ 新建时这个集合必然是空的：新节点就是一台新 frps，那个命名空间里
+    //     什么都没有。以前拿 mefrp 作用域去查，于是「mefrp 上有一条同名的」
+    //     会把一条其实能正常导入的隧道标成不可选 —— 这正是用户报的那个 bug。
+    //   · 插件段（老 frpc 用 plugin 实现的功能段），它的语义和普通隧道不同。
+    const off = taken.has(x.name) || x.plugin;
+    const why = taken.has(x.name) ? '这个节点上已有同名隧道' : (x.plugin ? '插件段' : '');
+    return `<tr>
+      <td><input type="checkbox" class="mi-adopt" data-idx="${i}"${off?'':' checked'}></td>
+      <td class="mono">${esc(x.name)}${why?`<div class="muted" style="font-size:11px">${esc(why)}</div>`:''}</td>
+      <td class="mono">${esc((x.proxy_type||'').toUpperCase())}</td>
+      <td class="mono">${esc(x.local_ip)}:${x.local_port||'—'}</td>
+      <td class="mono">${x.remote_port||'—'}</td>
+      <td><input class="mi-dns" data-idx="${i}" placeholder="留空 = 不管"></td>
+      <td><input type="checkbox" class="mi-on" data-idx="${i}"${off?'':' checked'}></td>
+    </tr>`;
+  }).join('');
+
+  const tail = editing
+    ? '<p class="muted">这里只列出配置里有什么，方便你核对 —— <b>不会</b>因为这里没勾就删掉已纳管的隧道。</p>'
+    : `<p class="muted">纳管只是把隧道<b>记进本程序</b>并开始探测它，<b>不会</b>去改任何机器上的文件。
+       DNS 记录名填了才会在同步时更新 —— 填 Cloudflare 里的那条记录名，例如 nas.example.com。</p>`;
+
+  $('mi_preview').innerHTML = `
+    <div style="margin-top:18px"></div>${dup}${warn}
+    <div class="kv" style="margin-top:0">
+      <div><span>服务端</span><b>${esc(p.server_addr)}:${p.server_port}</b></div>
+      <div><span>格式</span><b>${esc((p.format||'').toUpperCase())}</b></div>
+      <div><span>鉴权</span><b>${esc(p.auth_method)}${p.has_token?'（含 token）':''}</b></div>
+      <div><span>隧道</span><b>${p.proxy_count} 条</b></div>
+    </div>
+    ${p.proxy_count ? `<h3>配置里的隧道${editing?'':'（勾选要纳管的）'}</h3>
+      <table><thead>${head}</thead><tbody>${rows}</tbody></table>${tail}`
+      : '<p class="muted">这份配置里没有可纳管的隧道（可能只有服务端段）。</p>'}`;
+}
+
+function _miCollect(){
+  return (MI_PARSED.proxies||[]).map((x,i)=>{
+    const q = s => document.querySelector(`${s}[data-idx="${i}"]`);
+    const ad = q('.mi-adopt'), on = q('.mi-on'), dn = q('.mi-dns');
+    return {
+      name: x.name,
+      adopt: !!(ad && ad.checked),
+      enabled: !!(on && on.checked),
+      dns_record_name: (dn && dn.value || '').trim(),
+    };
+  });
+}
+
+// 切换结果的单行 / 摘要渲染。导入、更新、手动切换三处都要用，所以提出来。
+function _switchLine(x){
+  return `  · ${x.instance || ('#'+(x.instance_id ?? '?'))} —— `
+    + (x.ok ? `配置${x.changed?'已改写':'无变化'}，重启${x.restart_ok?'成功':'未完成'}`
+              + (x.restart_note?`（${x.restart_note}）`:'')
+            : `失败：${x.error}`);
+}
+function _switchSummary(s){
+  if(!s) return '';
+  if(!s.ok) return `⚠️ 承载实例没能切过去：${s.error || ''}`;
+  return `实例「${s.instance}」已切到 ${s.endpoint}：配置${s.changed?'已改写':'无变化'}，`
+    + `重启${s.restart_ok?'成功':'未完成'}${s.restart_note?`（${s.restart_note}）`:''}`
+    + (s.node_probe_ok ? '' : `\n⚠️ 节点控制端口探不通：${s.node_probe_reason||''}`);
+}
+
+async function saveManual(){
+  if(!MI_PARSED){ alert('请先点「解析预览」'); return; }
+  const editing = $('mi_id').value;
+  const iid = parseInt($('mi_instance_id').value,10) || 0;
+  const text = $('mi_text').value;
+  const fmt = $('mi_format').value || null;
+  const ep = `${MI_PARSED.server_addr}:${MI_PARSED.server_port}`;
+  const proxies = _miCollect();
+  const adoptN = proxies.filter(p=>p.adopt).length;
+
+  // 地址撞车先在前端拦一道，直接说清楚下一步该点哪儿 —— 而不是等接口回 409
+  // 再让用户猜。后端仍然会独立判一次（API 直接调也得是安全的）。
+  const dc = MI_PARSED.duplicate;
+  if(dc && !editing && !MI_OVERWRITE){
+    alert(`这个地址已经导入过了 —— 节点「${dc.existing_name}」\n`
+      + `（${dc.tunnel_count} 条隧道、${dc.instance_count} 个 frpc 实例）\n\n`
+      + (dc.tunnel_count + dc.instance_count
+          ? '要改它的配置，点上面的「打开这个节点的配置」—— 只改服务端要素，不动隧道。'
+          : '它名下什么都没有，点上面的「清掉它并重新导入」就能覆盖。'));
+    return;
+  }
+
+  if(!editing){
+    if(!confirm(`导入这份配置？\n\n服务端：${ep}\n纳管隧道：${adoptN} 条`
+        + (iid?`\n承载实例：${frpcName(iid)}`:'')
+        + `\n\n导入只是把配置记下来，不会去改任何机器上的 frpc 文件。`
+        + (iid?`\n选了承载实例，所以会顺手把这个实例的 frpc 配置改到 ${ep}。`:''))) return;
+  }else if(!confirm(`用这份配置更新外部节点？\n\n新服务端：${ep}\n\n`
+      + `如果地址 / 端口 / 鉴权变了，会立刻改写承载实例的 frpc 配置文件`
+      + `（并按各自设置决定是否重启、是否重新解析 DNS）。`)) return;
+
+  try{
+    let msg;
+    if(!editing){
+      const r = await api('/api/manual-nodes',{method:'POST',body:JSON.stringify({
+        text, format:fmt, proxies, frpc_instance_id: iid || null,
+        tag: $('mi_tag').value.trim(), overwrite: MI_OVERWRITE})});
+      msg = `✅ 已导入 ${r.endpoint}\n纳管隧道：${r.adopted.length?r.adopted.join('、'):'无'}`;
+      if(r.overwritten) msg += `\n\n（先清掉了残留的空节点「${r.overwritten}」）`;
+      if((r.skipped||[]).length) msg += `\n\n跳过 ${r.skipped.length} 条：\n`
+        + r.skipped.map(s=>`  · ${s.name}（${s.why}）`).join('\n');
+      if(r.switched) msg += `\n\n${_switchSummary(r.switched)}`;
+      if((r.warnings||[]).length) msg += `\n\n解析提示：${r.warnings.join('；')}`;
+      // 导入时后端顺手把 DNS 纠了一遍。有结果（成功或失败）就当场说 ——
+      // 「填了记录名却什么都没发生」正是用户会怀疑「没解析」的地方。
+      if((r.dns||[]).length) msg += `\n\nDNS：\n  ${r.dns.join('\n  ')}`;
+    }else{
+      const r = await api('/api/manual-nodes/'+editing,{method:'PATCH',
+        body:JSON.stringify({text, format:fmt})});
+      msg = r.server_changed
+        ? `✅ 已更新配置（${r.node.endpoint}）\n\n服务端要素变了，已传导到 ${r.switched.length} 个实例：\n`
+          + (r.switched.length ? r.switched.map(_switchLine).join('\n')
+                               : '  （没有实例绑在这个节点上）')
+        : `✅ 已更新配置（${r.node.endpoint}）\n\n服务端要素没变，没有额外动作。`;
+    }
+    alert(msg);
+    $('mniDlg').close();
+    await loadManualNodes(); loadOverview(); loadTunnels(); loadFrpc();
+  }catch(e){ alert((editing?'更新':'导入')+'失败：'+e.message); }
+}
+
+// ---- 切换 ----
+// 切换是**实例级**的动作：一个 frpc 进程只能连一个 serverAddr，所以换外部
+// 节点只能整个实例一起换。nodeId 为 null 时由用户在对话框里选。
+async function openManualSwitch(nodeId, instanceId){
+  if(!MANUAL){ try{ await loadManualNodes(); }catch(e){} }
+  const nodes = ((MANUAL&&MANUAL.nodes)||[]).filter(n=>n.enabled);
+  if(!nodes.length){
+    alert('现在没有可用的外部节点。\n\n这类节点是隧道的附属信息 —— 到「隧道」页'
+        + '点「从 frpc 配置导入」，粘一份配置进来就有了。'); return;
+  }
+  if(!FRPC){ try{ FRPC = await api('/api/frpc'); }catch(e){ FRPC = {instances:[]}; } }
+  const insts = (FRPC.instances)||[];
+  if(!insts.length){
+    alert('还没有 frpc 实例。\n\n切换的对象是「一个 frpc 实例」，'
+        + '请先到「frpc」页新增一个。'); return;
+  }
+  $('ms_node_id').innerHTML = nodes.map(n=>
+    `<option value="${n.id}">${esc(n.endpoint)} · ${n.tunnel_count} 条隧道</option>`).join('');
+  $('ms_instance_id').innerHTML = insts.map(i=>
+    `<option value="${i.id}">${esc(i.name)}${i.manual_node_id?'（当前：外部节点）':''}</option>`).join('');
+  MS_NODE = nodeId ? parseInt(nodeId,10) : null;
+  if(!MS_NODE && instanceId){
+    // 从 frpc 页或隧道卡片进来时只带了实例 —— 用这个实例当前绑的节点做默认值。
+    // 隧道卡片上那条路尤其需要：隧道若是「实例绑了外部节点、隧道自己没标」
+    // 的中间态，它的 manual_node_id 是空的，光看隧道推不出目标节点。
+    const cur = insts.find(x=>x.id===parseInt(instanceId,10));
+    if(cur && cur.manual_node_id) MS_NODE = parseInt(cur.manual_node_id,10);
+  }
+  if(MS_NODE && nodes.some(n=>n.id===MS_NODE)) $('ms_node_id').value = String(MS_NODE);
+  else if(MS_NODE) MS_NODE = null;   // 节点已被删掉或停用 —— 退回让用户自己选
+  if(instanceId) $('ms_instance_id').value = String(instanceId);
+  $('ms_restart').value = '';
+  $('ms_node_id').onchange = renderSwitchInfo;
+  $('ms_instance_id').onchange = renderSwitchInfo;
+  renderSwitchInfo();
+  $('mnsDlg').showModal();
+}
+
+function renderSwitchInfo(){
+  const nid = parseInt($('ms_node_id').value,10);
+  const iid = parseInt($('ms_instance_id').value,10);
+  const n = ((MANUAL&&MANUAL.nodes)||[]).find(x=>x.id===nid);
+  const i = ((FRPC&&FRPC.instances)||[]).find(x=>x.id===iid);
+  if(!n || !i){ $('ms_info').innerHTML = ''; return; }
+  $('ms_info').innerHTML = `把实例 <b>${esc(i.name)}</b> 切到 <b>${esc(n.endpoint)}</b>。
+    这个实例承载 <b>${(i.tunnels||[]).length}</b> 条隧道，
+    配置文件是 <code>${esc(i.config_path)}</code>。`;
+}
+
+async function doManualSwitch(){
+  const nid = parseInt($('ms_node_id').value,10);
+  const iid = parseInt($('ms_instance_id').value,10);
+  const raw = $('ms_restart').value;
+  const restart = raw==='' ? null : (raw==='1');
+  if(!nid || !iid){ alert('请选择目标节点和要切换的实例'); return; }
+  $('mnsDlg').close();
+  try{
+    const r = await api(`/api/manual-nodes/${nid}/switch`,{method:'POST',
+      body:JSON.stringify({instance_id:iid, restart})});
+    let msg = `✅ 已切换\n\n实例：${r.instance}\n新节点：${r.node}（${r.endpoint}）\n`
+      + `配置：${r.changed?('已改写'+(r.backup?`（备份 ${r.backup}）`:'')):'无变化'}\n`
+      + `重启：${r.restart_ok?'成功':'未完成'}${r.restart_note?`（${r.restart_note}）`:''}\n`
+      + `节点探测：${r.node_probe_ok?'可达':'不可达'}`
+      + (r.node_probe_ok?'':`（${r.node_probe_reason||''}）`) + `\n`
+      + `受影响隧道：${(r.tunnels||[]).length} 条`;
+    if((r.tunnels_missing||[]).length){
+      msg += `\n\n⚠️ 新配置里找不到这些隧道，它们在新节点上不会生效：\n  `
+        + r.tunnels_missing.join('、');
+    }
+    if((r.dns||[]).length) msg += `\n\nDNS：\n  ${r.dns.join('\n  ')}`;
+    alert(msg);
+    await loadManualNodes(); loadOverview(); loadFrpc(); loadTunnels(); loadEvents();
+  }catch(e){ alert('切换失败：'+e.message); }
+}
+
 // ---------- frpc 实例 ----------
 // 一个 frpc 进程只能连一个 serverAddr（= 一个 mefrp 节点），所以同一个实例
 // 承载的隧道必须落在同一个节点上。故障转移因此是「整组搬」，不是「单条搬」。
@@ -709,6 +1303,8 @@ function frpcCard(i){
   const c = i.container_state || {}, s = i.config_summary || {};
   const tuns = i.tunnels || [];
   const running = c.status === 'running';
+  // 外部节点托管的实例：它的 serverAddr 是「手动切换」写进去的，引擎不再改写它。
+  const isManual = i.node_source === 'manual';
   const col = !c.available ? 'var(--red)'
             : (running ? 'var(--teal)'
             : (c.restart_mode==='none' ? 'var(--muted)' : 'var(--red)'));
@@ -717,6 +1313,7 @@ function frpcCard(i){
     <div class="head">
       <div><div class="name">${esc(i.name)}
         ${i.enabled?'':'<span class="pill idle">已停用</span>'}
+        ${isManual?'<span class="pill manual">外部节点</span>':''}
         ${sel?'<span class="pill ok">正在查看</span>':''}</div>
         <div class="meta">配置 <code>${esc(i.config_path)}</code>${i.note?` · ${esc(i.note)}`:''}</div></div>
     </div>
@@ -724,12 +1321,14 @@ function frpcCard(i){
       <div><span>容器</span><b style="color:${col}">${esc(c.name||'—')} · ${esc(c.status||'不可用')}</b></div>
       <div><span>重启方式</span><b>${c.restart_mode==='none'?'不自动重启':'Docker 重启'}</b></div>
       <div><span>承载隧道</span><b>${tuns.length} 条</b></div>
-      <div><span>当前连的节点</span><b>${esc(s.server_addr||'—')}${s.server_port?':'+esc(s.server_port):''}</b></div>
+      <div><span>当前连的节点</span><b>${isManual?`<span class="pill manual">手工</span> `:''}${esc(s.server_addr||'—')}${s.server_port?':'+esc(s.server_port):''}</b></div>
       <div><span>配置文件</span><b>${i.config_exists?'已生成':'不存在（还没写过）'}</b></div>
       <div><span>备份</span><b>${i.backup_count} 份</b></div>
     </div>
     ${c.error?`<div class="muted" style="margin-top:8px;color:var(--red)">${esc(c.error)}</div>`:''}
     ${i.config_read_error?`<div class="muted" style="margin-top:8px;color:var(--red)">${esc(i.config_read_error)}</div>`:''}
+    ${isManual?`<div class="muted" style="margin-top:8px">ⓘ 这个实例连的是<b>外部节点</b> ${esc(i.manual_node_endpoint||'—')}。
+      「仅重建」不会改写它 —— 服务端要素由「手动切换」负责。它的隧道<b>不会自动切换</b>。</div>`:''}
     <div class="meta" style="margin-top:10px">${tuns.length
       ? '承载：' + tuns.map(t=>`<code>${esc(t.name)}</code>`).join(' ')
       : '<span style="color:var(--amber)">还没有隧道挂接这个容器</span>'}</div>
@@ -738,6 +1337,7 @@ function frpcCard(i){
       <button class="act" onclick="rebuildFrpcOne(${i.id},false)">仅重建</button>
       <button class="act pri" onclick="rebuildFrpcOne(${i.id},true)">重建并重启</button>
       <button class="act" onclick="restartFrpcOne(${i.id})">只重启容器</button>
+      <button class="act" onclick="openManualSwitch(null,${i.id})">改连外部节点</button>
       <button class="act" onclick="loadFrpcLogsOne(${i.id})">容器日志</button>
       <button class="act" onclick="openFrpcDialog(${i.id})">编辑</button>
       <button class="act danger" onclick="delFrpc(${i.id})">删除</button>
@@ -767,7 +1367,13 @@ async function rebuildFrpcOne(id, restart){
   const nm = frpcName(id);
   try{
     const r = await api(`/api/frpc/${id}/rebuild?restart=${restart}`,{method:'POST'});
-    if(!r.changed){ alert(`「${nm}」配置无变化。`); }
+    if(r.summary && r.summary.manual){
+      // 说「配置无变化」会让人以为引擎检查过配置、而且是对的 —— 实际上它
+      // 压根没碰。实话实说。
+      alert(`「${nm}」连的是外部节点，引擎不改写它的配置。\n\n${r.summary.note||''}\n\n`
+          + `要改它的服务端要素，点上面那个「切到外部节点」。`);
+    }
+    else if(!r.changed){ alert(`「${nm}」配置无变化。`); }
     else if(r.restarted){ alert(`✅ 「${nm}」配置已更新并重启。`); }
     else { alert(`「${nm}」配置已更新，但没有重启。\n${r.note||'（未开启自动重启）'}`); }
     await loadFrpc(); if(FRPC_SEL===id) selectFrpc(id);

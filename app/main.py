@@ -18,7 +18,7 @@ from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from pydantic import BaseModel, Field
 
-from . import auth, frpc, store
+from . import auth, frpc, frpcparse, store
 from .cloudflare import CloudflareClient, CloudflareError
 from .engine import engine, probe_plan, tcp_probe
 from .mefrp import MefrpClient, MefrpError
@@ -51,7 +51,7 @@ async def lifespan(_app: FastAPI):
         store.add_event("info", "system", "mefrp-guard 停止")
 
 
-app = FastAPI(title="mefrp-guard", version="1.0.0", lifespan=lifespan,
+app = FastAPI(title="mefrp-guard", version="1.0.1", lifespan=lifespan,
               docs_url=None, redoc_url=None)
 
 
@@ -377,6 +377,8 @@ class TunnelIn(BaseModel):
     dns_proxied: bool = False
     downstream_note: str = ""
     frpc_instance_id: int | None = None
+    # 自由标签。留空 = 走默认（mefrp 隧道默认 'mefrp'，见 create_tunnel）。
+    tag: str = ""
 
 
 class TunnelPatch(BaseModel):
@@ -392,9 +394,16 @@ class TunnelPatch(BaseModel):
     dns_proxied: bool | None = None
     downstream_note: str | None = None
     needs_downstream_review: bool | None = None
+    # ⚠️ 标签要能显式清空（改成空串）。走 exclude_none 的话传 "" 会被当成
+    #    「没提这个字段」丢掉，所以看 model_fields_set 判断，见 patch_tunnel。
+    tag: str | None = None
     # ⚠️ 这个字段要能显式置空（解绑），所以不能走 exclude_none 的老路 ——
     # 见 patch_tunnel 里对 model_fields_set 的处理。
     frpc_instance_id: int | None = None
+    # ⚠️ 同理：这个字段存在的**唯一目的**是让「传非空值」能被识别出来并拒绝，
+    #    见 patch_tunnel。没有它的话 Pydantic 会把未知字段直接丢掉，
+    #    那道防护就成了死代码。
+    manual_node_id: int | None = None
 
 
 class FrpcIn(BaseModel):
@@ -413,6 +422,9 @@ class FrpcPatch(BaseModel):
     restart_mode: str | None = Field(None, pattern="^(docker|none)$")
     enabled: bool | None = None
     note: str | None = None
+    # ⚠️ 只接受 null（解绑回 mefrp API 模式）。绑定要改写配置文件 + 重启容器，
+    #    必须走 /api/manual-nodes/{id}/switch，见 frpc_patch 里的说明。
+    manual_node_id: int | None = None
 
 
 class BindIn(BaseModel):
@@ -444,6 +456,82 @@ class OrphanAdoptIn(BaseModel):
 
 class SettingsIn(BaseModel):
     model_config = {"extra": "allow"}
+
+
+class ManualParseIn(BaseModel):
+    """只解析、不落库。给导入对话框做即时预览。"""
+    text: str = Field(..., min_length=1)
+    format: str | None = Field(None, pattern="^(toml|ini)$")
+    # 更新模式下要传正在编辑的节点 id。两个作用：
+    #   · `taken_names` 才知道该在**哪个作用域**里判「已纳管」——隧道名只在
+    #     同一台 frps 内唯一，拿 mefrp 作用域去判外部节点的隧道是错的；
+    #   · `duplicate` 才不会把「你正在编辑的这个节点自己」报成地址重复。
+    node_id: int | None = None
+
+
+class ManualProxyIn(BaseModel):
+    """用户在导入对话框里勾选的一条隧道。"""
+    name: str = Field(..., min_length=1, max_length=64)
+    adopt: bool = True
+    dns_record_name: str = ""
+    enabled: bool = True
+
+
+class ManualNodeIn(BaseModel):
+    name: str = Field("", max_length=64)
+    text: str = Field(..., min_length=1)
+    format: str | None = Field(None, pattern="^(toml|ini)$")
+    note: str = ""
+    enabled: bool = True
+    # 勾选的隧道。**没列出来的就是不纳管** —— 前端会把解析结果全列出来，
+    # 用户取消勾选的项会带 adopt=false 或者干脆不出现。
+    proxies: list[ManualProxyIn] = Field(default_factory=list)
+    # 导入时直接把这些隧道挂到这个 frpc 实例上，并把它切到本节点。
+    # 一个 frpc 进程只能连一个 serverAddr，所以「隧道由谁承载」和
+    # 「谁来连这个节点」是同一件事，一次问清楚比让用户回头再挂一次强。
+    frpc_instance_id: int | None = None
+    # 给这次纳管的隧道打同一个标签（留空 = 不打）。外部节点的隧道不自动打标
+    # —— 它是用户自己从服务商那儿拿来的，叫什么叫用户说了算。
+    tag: str = ""
+    # 「这个地址已经导入过了」时，是否允许**清掉那个空节点再重建**。
+    #
+    # ⚠️ 默认 False，而且只对「零隧道 + 零实例」的残留节点生效。刻意做成显式开关：
+    #    静默沿用旧记录是绝对不行的 —— 旧配置里的 proxies 可能和新配置不同，
+    #    沿用会让旧隧道留在「没有任何人知道」的状态（幽灵隧道）。
+    #    至于还有隧道挂着的节点，重建就等于删隧道，那属于 `DELETE /api/manual-nodes`
+    #    的职责（它会报出删了几条），不该由「导入」顺手干。
+    overwrite: bool = False
+
+
+class ManualNodePatch(BaseModel):
+    name: str | None = Field(None, min_length=1, max_length=64)
+    server_addr: str | None = Field(None, min_length=1)
+    server_port: int | None = Field(None, ge=1, le=65535)
+    auth_method: str | None = Field(None, pattern="^(token|user|none)$")
+    auth_token: str | None = None
+    auth_user: str | None = None
+    note: str | None = None
+    enabled: bool | None = None
+    # 「重新粘一份配置」这条路：给了 text 就由后端自己解析出服务端要素、
+    # 格式和原文，前端不必把字段拆开传。这比让用户逐个改地址/端口/token
+    # 更贴近实际 —— 外部节点是一次性的，用户手上有的就是一段配置。
+    text: str | None = Field(None, min_length=1)
+    format: str | None = Field(None, pattern="^(toml|ini)$")
+
+
+class ManualSwitchIn(BaseModel):
+    instance_id: int
+    # None = 按设置来（实例的 restart_mode + 全局 auto_restart_frpc）
+    restart: bool | None = None
+
+
+# 标签归一化：去首尾空白、把内部连续空白折成一个空格、截到 32 字符。
+# 不强制小写 —— 用户可能想用「公司frps」这种带中文/大写的标签。
+# 筛选是精确匹配，所以「同一个标签」必须归一化后完全一致，否则
+# '  mefrp ' 和 'mefrp' 会被当成两个标签。
+def _norm_tag(value: Any) -> str:
+    text = " ".join(str(value or "").split())
+    return text[:32]
 
 
 # ---------------------------------------------------------------------------
@@ -509,19 +597,31 @@ async def overview(_: None = Auth) -> dict[str, Any]:
 
     items = []
     for t in tunnels:
-        proxy = engine.proxies.get(t["proxy_name"])
+        # ⚠️ 用 manual_node_for（两个来源都看），不是 manual_node_of_tunnel。
+        #    后者只看隧道自己标的 manual_node_id，会漏掉「实例已经切到外部节点、
+        #    但隧道还没标」的中间态 —— 那种隧道在页面上会被当成 mefrp 隧道，
+        #    然后拿去跟 mefrp 的 proxy 列表比对，判出一个不存在的假故障。
+        mn = engine.manual_node_for(t)
+        # 外部节点上的隧道**不查 mefrp 的 proxy** —— 它压根不在那边，查了只会
+        # 得到一个「隧道在 mefrp 上不存在」的假故障。
+        proxy = engine.proxies.get(t["proxy_name"]) if mn is None else None
         node = engine.nodes.get(t["current_node_id"]) if t["current_node_id"] else None
         cached = engine.probe_cache.get(t["id"])
         # 节点地址走缓存解析器：非管理员账号下 node.hostname 恒为空串，
         # 真实地址来自 proxy_list 的 nodes 子数组或官方配置里的 serverAddr。
-        addr = engine.node_address_cached(t["current_node_id"])
+        # 外部节点不用反推 —— serverAddr 就在库里。
+        addr = (str(mn["server_addr"]) if mn
+                else engine.node_address_cached(t["current_node_id"]))
         inst = engine.frpc_for_tunnel(t)
         items.append({
             **t,
+            "node_source": "manual" if mn else "api",
+            "manual_node_id": int(mn["id"]) if mn else None,
+            "manual_node_name": mn["name"] if mn else "",
             "proxy_found": proxy is not None,
             "proxy_online": bool(proxy and proxy.is_online),
             "proxy_remote_port": proxy.remote_port if proxy else None,
-            "node_name": node.name if node else "",
+            "node_name": mn["name"] if mn else (node.name if node else ""),
             "node_hostname": addr,
             "address_known": bool(addr),
             # 公网访问入口，例如 203.0.113.10:41234
@@ -555,6 +655,11 @@ async def overview(_: None = Auth) -> dict[str, Any]:
             "node_total": len(engine.nodes),
             "node_online": sum(1 for n in engine.nodes.values() if n.usable),
             "address_known": len(engine.node_hostname_cache),
+            # 外部节点与 mefrp 节点**同级**展示，但分开计数 —— 页面上要能一眼
+            # 看出「哪些是 API 管的、哪些是我手工贴进去的」。
+            "manual_node_total": len(store.list_manual_nodes()),
+            "manual_node_enabled": sum(
+                1 for n in store.list_manual_nodes() if n["enabled"]),
         },
         "tunnels": items,
         "frpc": {
@@ -575,8 +680,20 @@ async def overview(_: None = Auth) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 @app.get("/api/tunnels")
-async def list_tunnels(_: None = Auth) -> list[dict[str, Any]]:
-    return store.list_tunnels()
+async def list_tunnels(tag: str | None = None,
+                       _: None = Auth) -> list[dict[str, Any]]:
+    """列出受管隧道。
+
+    `?tag=` 按标签筛选；`?tag=`（空串）筛「没打标签的」。不传 = 全量。
+    ⚠️ 这里要能区分「不传」和「传空串」，所以默认值是 None 而不是 ""。
+    """
+    return store.list_tunnels(tag=(_norm_tag(tag) if tag is not None else None))
+
+
+@app.get("/api/tags")
+async def list_tags(_: None = Auth) -> list[dict[str, Any]]:
+    """所有在用的隧道标签 + 各自条数。给隧道页的筛选条用。"""
+    return store.list_tags()
 
 
 @app.get("/api/orphans")
@@ -586,7 +703,11 @@ async def list_orphans(_: None = Auth) -> list[dict[str, Any]]:
     用途：手工在 mefrp 网页上建过的隧道，可以通过这里「纳管」进来，
     不必先在页面里新建一条再手动填 proxyId。
     """
-    managed = {t["proxy_name"] for t in store.list_tunnels()}
+    # ⚠️ 只拿 **mefrp 作用域**的隧道来比对。外部节点的隧道跟 mefrp 的 proxy 列表
+    #    本来就不是一回事 —— 把它们一起算进来的话，「别家 frps 上恰好同名的隧道」
+    #    会把 mefrp 上一条**真·未纳管**的隧道藏掉，用户在页面上永远看不到它。
+    managed = {t["proxy_name"] for t in store.list_tunnels()
+               if not t.get("manual_node_id")}
     out: list[dict[str, Any]] = []
     for p in engine.proxies.values():
         if p.proxy_name in managed:
@@ -612,12 +733,19 @@ async def list_orphans(_: None = Auth) -> list[dict[str, Any]]:
 
 @app.post("/api/tunnels")
 async def create_tunnel(payload: TunnelIn, _: None = Auth) -> dict[str, Any]:
+    # ⚠️ 查重限定在 **mefrp 作用域**（默认值就是它）。别家 frps 上有同名隧道
+    #    不影响这里 —— 各运营商的命名空间互不相干。
+    #    展示名（name）**不查重**：它不是唯一键，重名是允许的。
     if store.find_tunnel_by_proxy(payload.proxy_name):
         raise HTTPException(400, f"proxy_name「{payload.proxy_name}」已被占用")
     data = payload.model_dump()
     data["enabled"] = int(data["enabled"])
     data["auto_failover"] = int(data["auto_failover"])
     data["dns_proxied"] = int(data["dns_proxied"])
+    # 这个端点建的都是 **mefrp** 隧道（外部节点的隧道只能从 frpc 配置导入），
+    # 所以没指定标签时默认打上 'mefrp' —— 这样隧道页一进来就能按来源分组，
+    # 不用用户挨条去标。想改成别的标签直接传 tag 覆盖即可。
+    data["tag"] = _norm_tag(payload.tag) or "mefrp"
     tid = store.create_tunnel(data)
     store.add_event("info", "system", f"新增受管隧道「{payload.name}」", tunnel_id=tid)
     return {"ok": True, "id": tid}
@@ -633,6 +761,14 @@ async def patch_tunnel(tunnel_id: int, payload: TunnelPatch,
         if key in data:
             data[key] = int(bool(data[key]))
 
+    # ⚠️ 标签要能**显式清空**（改成空串）。`exclude_none` 只挡 None，空串会照传，
+    #    但归一化必须做 —— 否则 ' mefrp ' 和 'mefrp' 会变成两个标签。统一走
+    #    model_fields_set，语义和 frpc_instance_id 一致。
+    if "tag" in payload.model_fields_set:
+        data["tag"] = _norm_tag(payload.tag)
+    else:
+        data.pop("tag", None)
+
     # ⚠️ frpc_instance_id 要能「显式解绑」。走 exclude_none 的话传 null 会被丢掉，
     # 用户就永远解不了绑 —— 所以看 model_fields_set 判断「客户端到底提没提这个字段」。
     if "frpc_instance_id" in payload.model_fields_set:
@@ -640,6 +776,19 @@ async def patch_tunnel(tunnel_id: int, payload: TunnelPatch,
         if iid is not None and store.get_frpc_instance(int(iid)) is None:
             raise HTTPException(404, f"frpc 实例 {iid} 不存在")
         data["frpc_instance_id"] = int(iid) if iid else None
+
+    # ⚠️ manual_node_id 只允许「解绑」（传 null）。想绑到外部节点必须走
+    #    /api/manual-nodes/{id}/switch —— 那条路会**改写配置文件并重启容器**。
+    #    直接改这一列只会让库里说「隧道在节点 A」而配置文件里还写着 B，
+    #    两边对不上，而用户完全看不出来。
+    if "manual_node_id" in payload.model_fields_set:
+        want = payload.manual_node_id
+        if want:
+            raise HTTPException(
+                400,
+                "绑定外部节点请用「frpc」页的「切到外部节点」—— "
+                "那条路会同时改写配置文件并重启容器，直接改字段不会。")
+        data["manual_node_id"] = None
 
     store.update_tunnel(tunnel_id, data)
     return {"ok": True}
@@ -663,7 +812,27 @@ async def remove_tunnel(tunnel_id: int, delete_remote: bool = False,
 
     store.delete_tunnel(tunnel_id)
     store.add_event("info", "system", f"移除受管隧道「{tunnel['name']}」")
-    return {"ok": True}
+
+    # ---- 顺手清理没人用的外部节点 ----
+    # 外部节点（自建 frps / 别的 frp 服务商）是**跟着隧道走的一次性东西**：
+    # 它本来就不该在节点列表里常驻，所以隧道删光之后这条记录也没有存在的
+    # 意义了。不清理的话，用户每导一次配置就在库里留一条，越积越多，
+    # 而他在页面上根本看不见、也删不掉。
+    #
+    # ⚠️ 被 frpc 实例引用着的**不能删** —— 那个实例的配置文件里还写着这个
+    #    地址，删了节点记录之后实例的「当前连的节点」就无从解释了。
+    dropped_node = 0
+    nid = tunnel.get("manual_node_id")
+    if nid:
+        nid = int(nid)
+        still_used = (store.count_tunnels_of_manual_node(nid)
+                      + len(store.list_instances_of_manual_node(nid)))
+        if still_used == 0:
+            store.delete_manual_node(nid)
+            engine.manual_probe.pop(nid, None)
+            dropped_node = nid
+
+    return {"ok": True, "dropped_manual_node": dropped_node}
 
 
 @app.post("/api/tunnels/{tunnel_id}/failover")
@@ -686,12 +855,13 @@ async def adopt_orphan(proxy_id: int, payload: OrphanAdoptIn,
     if proxy is None:
         raise HTTPException(404, f"mefrp 上找不到 proxyId={proxy_id} 的隧道，先刷新一次")
 
+    # 查重限定在 mefrp 作用域 —— 别家 frps 上有同名隧道不影响这条能不能纳管。
     if store.find_tunnel_by_proxy(proxy.proxy_name):
         raise HTTPException(400, f"隧道「{proxy.proxy_name}」已经纳管过了")
 
+    # 展示名不再做「重名就加后缀」的处理：它不是唯一键，重名是允许的，
+    # 硬改名字只会让人认不出这条隧道原本叫什么。
     name = (payload.name or proxy.proxy_name).strip()[:64] or proxy.proxy_name
-    if any(t["name"] == name for t in store.list_tunnels()):
-        name = f"{name}-{proxy.proxy_id}"
 
     tid = store.create_tunnel({
         "name": name,
@@ -709,6 +879,8 @@ async def adopt_orphan(proxy_id: int, payload: OrphanAdoptIn,
         "dns_record_name": payload.dns_record_name.strip(),
         "dns_proxied": 0,
         "downstream_note": payload.downstream_note.strip(),
+        # 纳管的都是 mefrp 上的隧道 —— 默认标签就是它，方便按来源筛。
+        "tag": "mefrp",
     })
     store.add_event("success", "system",
                     f"已纳管 mefrp 隧道「{proxy.proxy_name}」（#{proxy.proxy_id}）",
@@ -731,7 +903,7 @@ async def adopt_proxy(tunnel_id: int, proxy_id: int, _: None = Auth) -> dict[str
     if other and other["id"] != tunnel_id:
         raise HTTPException(400, f"隧道「{proxy.proxy_name}」已绑定到另一条记录")
 
-    store.update_tunnel(tunnel_id, {
+    upd: dict[str, Any] = {
         "proxy_name": proxy.proxy_name,
         "proxy_type": proxy.proxy_type,
         "current_proxy_id": proxy.proxy_id,
@@ -739,11 +911,37 @@ async def adopt_proxy(tunnel_id: int, proxy_id: int, _: None = Auth) -> dict[str
         "current_remote_port": proxy.remote_port,
         "fail_streak": 0,
         "last_error": "",
-    })
+    }
+    # 只在这条记录还没标签时补 'mefrp'。已经有标签的话说明用户自己设过，
+    # 接管一条隧道不该顺手把人家分的组改掉。
+    if not _norm_tag((store.get_tunnel(tunnel_id) or {}).get("tag")):
+        upd["tag"] = "mefrp"
+    store.update_tunnel(tunnel_id, upd)
     store.add_event("success", "system",
                     f"已接管隧道「{proxy.proxy_name}」（#{proxy.proxy_id}）",
                     tunnel_id=tunnel_id)
     return {"ok": True}
+
+
+async def _sync_dns_after_probe(tunnel: dict[str, Any], mn: dict[str, Any] | None,
+                                host: str) -> str:
+    """探测之后顺手同步一次 DNS，返回给前端看的说明。
+
+    ⚠️ 为什么「立即探测」也要管 DNS：探测和 DNS 是**两件独立的事**，
+    但用户点这个按钮的意图是「让这条隧道现在就是对的」。只回一句「可达」、
+    域名却还指着旧地址，等于没修好。而且在这里同步一次，用户能**当场**在弹窗里
+    看到 DNS 的结果（成功 / 找不到 zone / token 没权限），不必去翻事件日志。
+
+    失败只回一句话，不抛 —— DNS 挂了不该把探测结果一起吞掉。
+    """
+    try:
+        return await engine._sync_dns(
+            tunnel,
+            None if mn is not None else engine.proxies.get(tunnel["proxy_name"]),
+            host=host,
+        )
+    except Exception as exc:  # noqa: BLE001 - 单条 DNS 失败不拖垮这次探测
+        return f"更新 DNS 异常：{exc}"
 
 
 @app.post("/api/tunnels/{tunnel_id}/probe")
@@ -751,23 +949,39 @@ async def probe_now(tunnel_id: int, _: None = Auth) -> dict[str, Any]:
     tunnel = store.get_tunnel(tunnel_id)
     if tunnel is None:
         raise HTTPException(404, "隧道不存在")
-    proxy = engine.proxies.get(tunnel["proxy_name"])
-    if proxy is None:
-        raise HTTPException(404, "mefrp 上找不到这条隧道，先刷新一次状态")
-    node = engine.nodes.get(proxy.node_id)
-    if node is None:
-        raise HTTPException(404, f"节点 {proxy.node_id} 不在列表中")
 
-    host = await engine.node_address(proxy.node_id)
-    if not host:
-        raise HTTPException(409, (
-            f"拿不到节点「{node.name}」的公网地址。"
-            "mefrp 对非管理员账号不返回节点地址（/auth/node/list 的 hostname 是空串），"
-            "只有在那个节点上建过隧道才能反推出来。"
-        ))
+    # ⚠️ 先按**作用域**分流。外部节点的隧道**不在 mefrp 上**，不能拿 proxy_name
+    #    去 mefrp 的 proxy 列表里查 —— 各运营商的命名空间互不相干，跨作用域按
+    #    名字找东西，轻则报一个莫名其妙的「mefrp 上找不到这条隧道」，重则
+    #    **查到一条同名的 mefrp proxy**，然后去探测一条完全不相干的隧道。
+    mn = engine.manual_node_for(tunnel)
+    if mn is not None:
+        host = str(mn["server_addr"] or "").strip()
+        node_name = str(mn["name"])
+        port = int(tunnel.get("current_remote_port") or 0)
+        if not port:
+            raise HTTPException(409, "这条隧道没有远程端口，无法探测"
+                                     "（导入配置时那一段没写 remotePort）")
+    else:
+        proxy = engine.proxies.get(tunnel["proxy_name"])
+        if proxy is None:
+            raise HTTPException(404, "mefrp 上找不到这条隧道，先刷新一次状态")
+        node = engine.nodes.get(proxy.node_id)
+        if node is None:
+            raise HTTPException(404, f"节点 {proxy.node_id} 不在列表中")
+
+        host = await engine.node_address(proxy.node_id)
+        if not host:
+            raise HTTPException(409, (
+                f"拿不到节点「{node.name}」的公网地址。"
+                "mefrp 对非管理员账号不返回节点地址（/auth/node/list 的 hostname 是空串），"
+                "只有在那个节点上建过隧道才能反推出来。"
+            ))
+        node_name = node.name
+        port = int(proxy.remote_port)
 
     timeout = float(store.get_setting("probe_timeout", 4) or 4)
-    target = f"{host}:{proxy.remote_port}"
+    target = f"{host}:{port}"
     ptype = tunnel.get("proxy_type", "tcp")
 
     # UDP 隧道不能做 TCP 探测 —— 直连会必然失败，返回「不可达」是在骗用户。
@@ -776,16 +990,27 @@ async def probe_now(tunnel_id: int, _: None = Auth) -> dict[str, Any]:
     do_probe, skip_why = probe_plan(ptype, mode)
     if not do_probe:
         engine.probe_cache[tunnel_id] = (time.time(), None, skip_why)
+        # ⚠️ 「不适用探测」不等于「地址不对」—— DNS 该同步还得同步。
+        #    这里原来直接 return，于是 **udp 隧道点「立即探测」永远不解析 DNS**，
+        #    而 udp 恰恰是外部节点上最常见的一类。_reconcile_manual 里的同款分支
+        #    已经修过了，这里必须跟上 —— 否则「点按钮」和「等引擎」两条路行为不一致，
+        #    用户点一次按钮反而更懵。
+        dns_msg = await _sync_dns_after_probe(tunnel, mn, host)
         return {
             "ok": None, "skipped": True, "reason": skip_why,
-            "target": target, "node": node.name, "proxy_type": ptype,
+            "target": target, "node": node_name, "proxy_type": ptype,
+            "dns": dns_msg,
         }
 
-    ok, why = await tcp_probe(host, proxy.remote_port, timeout)
+    ok, why = await tcp_probe(host, port, timeout)
     engine.probe_cache[tunnel_id] = (time.time(), ok, why)
+    # 探测通过 = 地址是对的，顺手把 DNS 纠到这条地址上（和引擎每轮做的事一致）。
+    # 探测失败时**不动 DNS** —— 地址并没有变，改它只会把一条本来对的记录改坏。
+    dns_msg = await _sync_dns_after_probe(tunnel, mn, host) if ok else ""
     return {
         "ok": ok, "skipped": False, "reason": why,
-        "target": target, "node": node.name, "proxy_type": ptype,
+        "target": target, "node": node_name, "proxy_type": ptype,
+        "dns": dns_msg,
     }
 
 
@@ -842,6 +1067,443 @@ async def set_node_pref(node_id: int, payload: NodePrefIn,
 
 
 # ---------------------------------------------------------------------------
+# 外部节点
+#
+# 由用户粘贴一份 frpc 配置导入，**与 mefrp 节点同级**：能绑 frpc 实例、能绑域名，
+# 唯独不支持自动切换 —— 没有 API 就没法在服务端建/删隧道，换节点只能靠人点。
+#
+# ⚠️ 路由注册顺序：所有**字面量**路径（/parse、/probe）必须排在 /{node_id} 之前。
+#    Starlette 按注册顺序匹配，否则 /api/manual-nodes/parse 会先去撞
+#    {node_id} 的 int 解析，直接 422。
+# ---------------------------------------------------------------------------
+
+def _manual_view(node: dict) -> dict[str, Any]:
+    """单个外部节点的对外视图（不含 token 明文）。"""
+    nid = int(node["id"])
+    insts = store.list_instances_of_manual_node(nid)
+    tunnels = store.list_tunnels_of_manual_node(nid)
+    cached = engine.manual_probe.get(nid)
+    return {
+        "id": nid,
+        "name": node["name"],
+        "server_addr": node["server_addr"],
+        "server_port": int(node["server_port"]),
+        "endpoint": f"{node['server_addr']}:{int(node['server_port'])}",
+        "auth_method": node["auth_method"],
+        # ⚠️ 只回「有没有」，不回明文 —— token 泄露给前端没有任何必要。
+        "has_token": bool(node.get("auth_token")),
+        "auth_user": node.get("auth_user") or "",
+        "config_format": node["config_format"],
+        "note": node.get("note") or "",
+        "enabled": bool(node["enabled"]),
+        "probe_ok": cached[1] if cached else None,
+        "probe_reason": cached[2] if cached else "",
+        "probe_at": int(cached[0]) if cached else 0,
+        "instances": [{"id": int(i["id"]), "name": i["name"],
+                       "config_path": i["config_path"]} for i in insts],
+        "instance_count": len(insts),
+        "tunnel_count": len(tunnels),
+    }
+
+
+def _node_conflict(node: dict[str, Any]) -> dict[str, Any]:
+    """把一个「地址撞车」的外部节点描述成**可操作**的结构。
+
+    ⚠️ 这里刻意带上 `existing_id` 和两个计数，而不是只回一句话。原因是一个踩过的坑：
+       原来只回「请直接编辑那个节点」，但一个**零隧道**的残留节点在页面上是够不着的
+       —— 节点不进节点页，隧道卡片是按隧道渲染的，没有隧道就没有卡片，也就没有任何
+       入口能到达它。用户既改不了也删不掉，重新导入**永久被堵**。这是死路，不是提示。
+       带上 id 之后前端才能给出「打开那个节点的更新对话框」这个真入口，
+       以及「它本来就是空的，清掉重建」这条出路。
+    """
+    nid = int(node["id"])
+    return {
+        "code": "node_addr_exists",
+        "message": f"这个地址已经导入过了（节点「{node['name']}」）。",
+        "existing_id": nid,
+        "existing_name": str(node["name"]),
+        "tunnel_count": store.count_tunnels_of_manual_node(nid),
+        "instance_count": len(store.list_instances_of_manual_node(nid)),
+    }
+
+
+@app.post("/api/manual-nodes/parse")
+async def manual_nodes_parse(payload: ManualParseIn,
+                             _: None = Auth) -> dict[str, Any]:
+    """解析一份 frpc 配置，**不落库**。给导入对话框做即时预览。"""
+    try:
+        parsed = frpcparse.parse(payload.text, payload.format)
+    except frpcparse.FrpcParseError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+    dup = store.find_manual_node_by_addr(parsed.server_addr, parsed.server_port)
+    # 更新模式下「撞到我自己」不是冲突 —— 前端不必再判一次 editing，判断收在后端。
+    if dup is not None and payload.node_id and int(dup["id"]) == int(payload.node_id):
+        dup = None
+
+    # 解析出来的隧道里，哪些名字**在这个作用域里**已经被纳管了。
+    # ⚠️ 新建时必然是空列表 —— 新节点就是一台新的 frps，那个命名空间里什么都没有。
+    #    以前这里拿 mefrp 作用域去查，于是「mefrp 上有一条同名的」会被报成
+    #    「已纳管」，把一条其实能正常导入的隧道标成不可选。
+    taken: list[str] = []
+    if payload.node_id:
+        taken = [p.name for p in parsed.proxies
+                 if store.find_tunnel_by_proxy(p.name,
+                                               manual_node_id=payload.node_id)]
+    return {
+        "ok": True,
+        **parsed.as_dict(),
+        "taken_names": taken,
+        # 撞车的那个节点（结构化），没撞就是 None。
+        "duplicate": _node_conflict(dup) if dup is not None else None,
+    }
+
+
+@app.post("/api/manual-nodes/probe")
+async def manual_nodes_probe_all(_: None = Auth) -> dict[str, Any]:
+    """把所有外部节点探一遍。"""
+    out = []
+    for n in store.list_manual_nodes():
+        r = await engine.probe_manual_node(int(n["id"]), force=True)
+        out.append({"id": int(n["id"]), "name": n["name"], **r})
+    return {"ok": True, "results": out}
+
+
+@app.get("/api/manual-nodes")
+async def manual_nodes_list(_: None = Auth) -> dict[str, Any]:
+    return {
+        "nodes": engine.manual_node_rows(),
+        "count": len(store.list_manual_nodes()),
+        "formats": list(frpcparse.FORMATS),
+    }
+
+
+@app.post("/api/manual-nodes")
+async def manual_node_create(payload: ManualNodeIn,
+                             _: None = Auth) -> dict[str, Any]:
+    """导入一个外部节点，并按勾选纳管它配置里的隧道。"""
+    try:
+        parsed = frpcparse.parse(payload.text, payload.format)
+    except frpcparse.FrpcParseError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+    dup = store.find_manual_node_by_addr(parsed.server_addr, parsed.server_port)
+    if dup is not None:
+        conflict = _node_conflict(dup)
+        # ---- 这条路是「出路」，不是「墙」 ----
+        # 原来这里只有一句 400「请直接编辑那个节点」，而那个节点很可能**够不着**
+        # （零隧道的残留节点没有任何 UI 入口）→ 用户被永久堵住。所以现在：
+        #   · 回结构化 detail（带 existing_id / 两个计数），前端据此给出下一步；
+        #   · 允许 overwrite 显式覆盖**空节点**（残留节点就是这么来的）。
+        if not payload.overwrite:
+            raise HTTPException(409, conflict)
+        busy = conflict["tunnel_count"] or conflict["instance_count"]
+        if busy:
+            # 有隧道/实例挂着的节点**不允许**从这里覆盖：那等于顺手删隧道，
+            # 而且删的是用户精心配过 dns 记录名、标签、挂接关系的那几条。
+            # 要删就走 DELETE /api/manual-nodes/{id}，它会明确报出删了几条。
+            raise HTTPException(409, {
+                **conflict,
+                "code": "node_in_use",
+                "message": (
+                    f"节点「{dup['name']}」上还挂着 "
+                    f"{conflict['tunnel_count']} 条隧道、"
+                    f"{conflict['instance_count']} 个 frpc 实例，不能覆盖重建 —— "
+                    "那会连带删掉它们。请改用「更新节点配置」"
+                    "（只改服务端要素、不动隧道），"
+                    "或者先在隧道页删掉那几条隧道再重新导入。"),
+            })
+        # 空节点：删掉重建。事件里留痕，免得「我的节点怎么没了」无从追溯。
+        store.delete_manual_node(int(dup["id"]))
+        engine.manual_probe.pop(int(dup["id"]), None)
+        store.add_event(
+            "warn", "node",
+            f"导入时覆盖了残留的空节点「{dup['name']}」"
+            f"（{dup['server_addr']}:{int(dup['server_port'])}，"
+            "零隧道零实例，已删除后按新配置重建）",
+        )
+
+    name = (payload.name or parsed.label).strip()[:64] or parsed.label
+    if store.get_manual_node_by_name(name):
+        raise HTTPException(400, f"外部节点名「{name}」已存在")
+
+    nid = store.create_manual_node({
+        "name": name,
+        "server_addr": parsed.server_addr,
+        "server_port": parsed.server_port,
+        "auth_method": parsed.auth_method,
+        "auth_token": parsed.auth_token,
+        "auth_user": parsed.auth_user,
+        "config_format": parsed.fmt,
+        "config_text": payload.text,
+        "note": payload.note.strip(),
+        "enabled": int(bool(payload.enabled)),
+    })
+
+    # ---- 纳管勾选的隧道 ----
+    specs = {p.name: p for p in parsed.proxies}
+    adopted: list[str] = []
+    skipped: list[dict[str, str]] = []
+    # 刚建出来的隧道行。下一步要拿它们逐个同步 DNS，所以这里必须留住整行，
+    # 不能只留名字 —— dns_record_name / dns_zone_id 都在行里。
+    created: list[dict[str, Any]] = []
+    for item in payload.proxies:
+        if not item.adopt:
+            continue
+        spec = specs.get(item.name)
+        if spec is None:
+            skipped.append({"name": item.name, "why": "配置里没有这一段"})
+            continue
+        # ⚠️ 只在**本节点这个作用域**里查重。拿全局查是错的 ——
+        #    mefrp 上有一条同名隧道，不代表这份配置里的隧道「已经纳管过了」，
+        #    它们是两台不同 frps 上的两条隧道，命名空间互不相干。
+        #    新导入时这里必然为空（节点刚建），保留这道检查是防重复调用。
+        if store.find_tunnel_by_proxy(spec.name, manual_node_id=nid):
+            skipped.append({"name": spec.name, "why": "这个节点上已有同名隧道"})
+            continue
+
+        # 展示名直接用隧道本名。⚠️ **不做跨作用域改名** —— 展示名不是唯一键，
+        # 不同 frps 上重名是正常的，改成 `xxx-7` 反而让人看不出它原本叫什么。
+        store.create_tunnel({
+            "name": spec.name,
+            "proxy_name": spec.name,
+            "proxy_type": spec.proxy_type,
+            "local_ip": spec.local_ip,
+            "local_port": spec.local_port or 1,
+            "current_remote_port": spec.remote_port or None,
+            "manual_node_id": nid,
+            "enabled": int(bool(item.enabled)),
+            # ⚠️ 外部节点的隧道**一律关掉自动切换** —— 没有 API，切不了。
+            #    留着这个开关只会让用户以为它会自愈。
+            "auto_failover": 0,
+            "dns_record_name": item.dns_record_name.strip(),
+            "frpc_instance_id": payload.frpc_instance_id,
+            # 这次纳管的隧道统一打上用户填的标签（留空 = 不打）。
+            "tag": _norm_tag(payload.tag),
+        })
+        adopted.append(spec.name)
+        row = store.find_tunnel_by_proxy(spec.name, manual_node_id=nid)
+        if row is not None:
+            created.append(row)
+
+    # ---- 顺手把 DNS 纠一遍 ----
+    # ⚠️ 导入时**立刻**同步，而不是等引擎下一轮（最长 20 秒）。三个理由：
+    #   · 用户粘完配置就站在页面前，什么都不发生他会以为「没生效」——这正是
+    #     「手动添加的隧道好像没有自动进行 cf dns 解析」这个疑问的来源；
+    #   · DNS 失败的原因（找不到 zone、token 没权限）必须**当场**说出来，否则
+    #     它只躺在事件日志里，用户根本不会去看；
+    #   · 导入 = 用户明确粘了一份配置并逐条填了记录名，意图是清楚的。
+    # 所以这里 force=True：不受「自动纠正漂移的 DNS」那个开关拦（那个开关管的是
+    # 引擎每轮的自动巡检，不是用户刚下达的指令）。失败不影响导入本身。
+    dns_msgs: list[str] = []
+    for t in created:
+        if not (t.get("dns_record_name") or "").strip():
+            continue
+        try:
+            msg = await engine._sync_dns(t, None, force=True,
+                                         host=parsed.server_addr)
+        except Exception as exc:  # noqa: BLE001 - 单条 DNS 失败不拖垮整次导入
+            msg = f"更新 DNS 异常：{exc}"
+        if msg:
+            dns_msgs.append(f"{t['name']}：{msg}")
+
+    detail = [
+        f"格式：{parsed.fmt}",
+        f"鉴权：{parsed.auth_method}",
+        f"配置里的隧道：{'、'.join(specs) or '（无）'}",
+        f"已纳管：{'、'.join(adopted) or '（无）'}",
+    ]
+    if skipped:
+        detail.append("跳过：" + "；".join(f"{s['name']}（{s['why']}）" for s in skipped))
+    if parsed.warnings:
+        detail.append("解析提示：" + "；".join(parsed.warnings))
+    if dns_msgs:
+        detail.append("DNS：" + "；".join(dns_msgs))
+
+    store.add_event(
+        "success", "node",
+        f"导入外部节点「{name}」（{parsed.server_addr}:{parsed.server_port}）"
+        + (f"，纳管 {len(adopted)} 条隧道" if adopted else "，未纳管隧道"),
+        detail="\n".join(detail),
+    )
+
+    # ---- 指定了承载实例就顺手切过去 ----
+    # 用户勾了「这些隧道由哪个实例承载」，那就必须把那个实例的配置文件改到
+    # 这个节点上，否则库里的绑定关系和机器上跑的东西对不上 —— 而用户完全看不出来。
+    switched: dict[str, Any] | None = None
+    if payload.frpc_instance_id:
+        switched = await engine.switch_instance_to_node(
+            int(payload.frpc_instance_id), nid)
+
+    return {
+        "ok": True,
+        "id": nid,
+        "name": name,
+        "endpoint": f"{parsed.server_addr}:{parsed.server_port}",
+        "format": parsed.fmt,
+        "adopted": adopted,
+        "skipped": skipped,
+        "warnings": parsed.warnings,
+        "switched": switched,
+        # 导入时顺手做的 DNS 同步结果（每条一行）。前端把它显示在成功弹窗里
+        # —— 失败原因（找不到 zone、token 没权限）必须当场说出来，否则用户
+        # 只会觉得「怎么没解析」，然后去翻日志。
+        "dns": dns_msgs,
+        # 覆盖重建时回被删掉的那个残留节点的名字，前端好把这件事说出口。
+        "overwritten": dup["name"] if (dup is not None and payload.overwrite) else "",
+        "node": _manual_view(store.get_manual_node(nid) or {}),
+    }
+
+
+@app.post("/api/manual-nodes/{node_id}/probe")
+async def manual_node_probe(node_id: int, _: None = Auth) -> dict[str, Any]:
+    if store.get_manual_node(node_id) is None:
+        raise HTTPException(404, "外部节点不存在")
+    return {"ok": True, **(await engine.probe_manual_node(node_id, force=True))}
+
+
+@app.post("/api/manual-nodes/{node_id}/switch")
+async def manual_node_switch(node_id: int, payload: ManualSwitchIn,
+                             _: None = Auth) -> dict[str, Any]:
+    """把某个 frpc 实例切到这个外部节点上。**外部节点唯一的切换方式。**"""
+    result = await engine.switch_instance_to_node(
+        int(payload.instance_id), int(node_id), restart=payload.restart)
+    if not result.get("ok"):
+        raise HTTPException(400, result.get("error") or "切换失败")
+    return result
+
+
+@app.get("/api/manual-nodes/{node_id}")
+async def manual_node_get(node_id: int, _: None = Auth) -> dict[str, Any]:
+    node = store.get_manual_node(node_id)
+    if node is None:
+        raise HTTPException(404, "外部节点不存在")
+    return {**_manual_view(node), "config_text": node.get("config_text") or ""}
+
+
+@app.patch("/api/manual-nodes/{node_id}")
+async def manual_node_patch(node_id: int, payload: ManualNodePatch,
+                            _: None = Auth) -> dict[str, Any]:
+    """改外部节点。
+
+    ⚠️ 改了**服务端要素**（地址 / 端口 / 鉴权）之后，必须把改动传导到绑定的实例上
+       —— 否则库里说「节点是 A」，实例配置文件里还写着 B，两边对不上，而用户
+       完全看不出来。传导直接复用切换那条路（改写 server 段 → 按设置重启 →
+       重新解析 DNS），所以「编辑节点」和「切换到此节点」的行为完全一致。
+    """
+    node = store.get_manual_node(node_id)
+    if node is None:
+        raise HTTPException(404, "外部节点不存在")
+
+    data = payload.model_dump(exclude_none=True)
+    data.pop("text", None)
+    data.pop("format", None)
+
+    # 「重新粘一份配置」这条路：后端自己解析，前端不必把字段拆开传。
+    # 这比让用户逐个改地址/端口/token 更贴近实际 —— 外部节点是一次性的，
+    # 用户手上有的就是服务商官网给的那一段配置。
+    if payload.text:
+        try:
+            parsed = frpcparse.parse(payload.text, payload.format)
+        except frpcparse.FrpcParseError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        if not parsed.server_addr:
+            raise HTTPException(400, "这份配置里没读到 serverAddr / server_addr")
+        data.update({
+            "server_addr": parsed.server_addr,
+            "server_port": parsed.server_port,
+            "auth_method": parsed.auth_method,
+            # ⚠️ 这里**要**原样覆盖 token：用户粘的是新配置，里面没有 token
+            #    就说明新的节点不需要 token，旧的必须清掉，不能留着。
+            "auth_token": parsed.auth_token,
+            "auth_user": parsed.auth_user,
+            "config_format": parsed.fmt,
+            "config_text": payload.text,
+        })
+
+    if "enabled" in data:
+        data["enabled"] = int(bool(data["enabled"]))
+    if "name" in data:
+        new_name = str(data["name"]).strip()[:64]
+        if not new_name:
+            raise HTTPException(400, "节点名不能为空")
+        other = store.get_manual_node_by_name(new_name)
+        if other is not None and int(other["id"]) != int(node_id):
+            raise HTTPException(400, f"外部节点名「{new_name}」已存在")
+        data["name"] = new_name
+
+    server_keys = ("server_addr", "server_port", "auth_method",
+                   "auth_token", "auth_user")
+    server_changed = any(k in data and data[k] != node.get(k) for k in server_keys)
+
+    if server_changed:
+        addr = str(data.get("server_addr", node["server_addr"])).strip()
+        port = int(data.get("server_port", node["server_port"]))
+        if not addr:
+            raise HTTPException(400, "服务端地址不能为空")
+        dup = store.find_manual_node_by_addr(addr, port)
+        if dup is not None and int(dup["id"]) != int(node_id):
+            raise HTTPException(409, {
+                **_node_conflict(dup),
+                "message": f"这个地址已被节点「{dup['name']}」占用。",
+            })
+
+    store.update_manual_node(node_id, data)
+    node = store.get_manual_node(node_id) or node
+
+    switched: list[dict[str, Any]] = []
+    if server_changed:
+        for inst in store.list_instances_of_manual_node(node_id):
+            switched.append(await engine.switch_instance_to_node(
+                int(inst["id"]), int(node_id)))
+
+    return {
+        "ok": True,
+        "server_changed": server_changed,
+        "switched": switched,
+        "node": _manual_view(node),
+    }
+
+
+@app.delete("/api/manual-nodes/{node_id}")
+async def manual_node_delete(node_id: int, keep_tunnels: bool = False,
+                             _: None = Auth) -> dict[str, Any]:
+    """删外部节点。
+
+    绑在上面的实例会被解绑（退回 mefrp API 模式），从它导入的隧道默认一起删掉
+    —— 那些隧道离开了这个节点就没有意义了（没有 API 能在别处重建它们）。
+    想留个记录就传 `keep_tunnels=true`，那样只解绑不删。
+    """
+    node = store.get_manual_node(node_id)
+    if node is None:
+        raise HTTPException(404, "外部节点不存在")
+
+    unbound = store.unbind_instances_of_manual_node(node_id)
+    tunnels = store.list_tunnels_of_manual_node(node_id)
+    removed = 0
+    if keep_tunnels:
+        store.unbind_tunnels_of_manual_node(node_id)
+    else:
+        for t in tunnels:
+            store.delete_tunnel(int(t["id"]))
+            engine.probe_cache.pop(int(t["id"]), None)
+            removed += 1
+
+    store.delete_manual_node(node_id)
+    engine.manual_probe.pop(int(node_id), None)
+
+    store.add_event(
+        "warn", "node",
+        f"删除外部节点「{node['name']}」"
+        f"（解绑 {unbound} 个 frpc 实例，"
+        + (f"移除 {removed} 条隧道" if removed else f"保留 {len(tunnels)} 条隧道记录")
+        + "）",
+    )
+    return {"ok": True, "unbound_instances": unbound, "removed_tunnels": removed,
+            "kept_tunnels": len(tunnels) - removed}
+
+
+# ---------------------------------------------------------------------------
 # frpc 实例
 #
 # ⚠️ 路由注册顺序有讲究：所有**字面量**路径（/api/frpc/map、/api/frpc/rebuild …）
@@ -881,10 +1543,19 @@ def _instance_view(inst: dict, *, with_config: bool = False) -> dict[str, Any]:
     state = {**state, "restart_mode": mode}
 
     tunnels = store.list_tunnels_of_frpc(iid)
+    # 这个实例是不是挂在外部节点上。挂上了就说明：配置文件由手动切换维护，
+    # 引擎不会自动改写它，也不会有自动切换 —— 页面上要如实标出来。
+    mn = store.get_manual_node(int(inst["manual_node_id"])) \
+        if inst.get("manual_node_id") else None
     out: dict[str, Any] = {
         **inst,
         "id": iid,
         "enabled": bool(inst["enabled"]),
+        "manual_node_id": int(mn["id"]) if mn else None,
+        "manual_node_name": mn["name"] if mn else "",
+        "manual_node_endpoint": (f"{mn['server_addr']}:{int(mn['server_port'])}"
+                                 if mn else ""),
+        "node_source": "manual" if mn else "api",
         "config_exists": path.exists(),
         "config_summary": summary,
         "config_read_error": read_error,
@@ -1109,6 +1780,19 @@ async def frpc_patch(instance_id: int, payload: FrpcPatch,
 
     if "enabled" in data:
         data["enabled"] = int(bool(data["enabled"]))
+
+    # ⚠️ manual_node_id 只允许「解绑」（传 null）。想绑到某个外部节点必须走
+    #    /api/manual-nodes/{id}/switch —— 那条路会**改写配置文件并重启容器**。
+    #    直接改这一列只会让库里说「实例在节点 A」而配置文件里还写着 B，
+    #    两边对不上，用户完全看不出来。
+    if "manual_node_id" in payload.model_fields_set:
+        want = payload.manual_node_id
+        if want:
+            raise HTTPException(
+                400,
+                "绑定外部节点请用「frpc」页的「切到外部节点」—— "
+                "那条路会同时改写配置文件并重启容器，直接改字段不会。")
+        data["manual_node_id"] = None
 
     store.update_frpc_instance(instance_id, data)
     engine.reload_dockers()

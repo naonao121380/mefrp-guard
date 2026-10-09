@@ -26,7 +26,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from . import frpc, store
+from . import frpc, frpcparse, store
 from .cloudflare import CloudflareClient, CloudflareError
 from .mefrp import MefrpApiError, MefrpClient, MefrpError, Node, Proxy
 from .notifier import Notifier
@@ -168,6 +168,16 @@ def probe_plan(proxy_type: str, mode: str) -> tuple[bool, str]:
     return True, ""
 
 
+def scope_key(manual_node_id: Any) -> int | None:
+    """把「这台东西跑在哪台 frps 上」归一成一个可比较的值。
+
+    None = mefrp（走 API 的那一家），int = 某个外部节点。
+    隧道和 frpc 实例都用它 —— **隧道名只在同一台 frps 内唯一**，
+    跨作用域比较是没有意义的（各运营商命名空间互不相干）。
+    """
+    return int(manual_node_id) if manual_node_id else None
+
+
 class GuardEngine:
     def __init__(self):
         self.client: MefrpClient | None = None
@@ -203,6 +213,11 @@ class GuardEngine:
         # None 表示「协议不适用探测，已跳过」—— 和「探测失败」是两回事。
         self.probe_cache: dict[int, tuple[float, bool | None, str]] = {}
         self.node_cooldown: dict[int, float] = {}
+
+        # 外部节点的可达性缓存：node_id -> (时间戳, 是否可达, 说明)。
+        # 探的是 frps 的**控制端口**（serverAddr:serverPort），和隧道的
+        # 端到端探测是两件事：这个说明「节点本身还在不在」。
+        self.manual_probe: dict[int, tuple[float, bool, str]] = {}
 
         self.last_error: str = ""
         self.tick_count: int = 0
@@ -311,7 +326,13 @@ class GuardEngine:
             if t.get("frpc_instance_id"):
                 continue
             pn = str(t["proxy_name"] or "").strip()
-            hits = [i for i in instances if pn and pn in names.get(int(i["id"]), set())]
+            # ⚠️ 只在**同一个 frps 作用域**里匹配。隧道名只在「一台 frps 内」唯一，
+            #    跨运营商重名是常态 —— 不做作用域过滤的话，一条 mefrp 隧道会被
+            #    推荐绑到「别家 frps 上恰好同名」的那个实例上，而两者毫无关系。
+            tscope = scope_key(t.get("manual_node_id"))
+            hits = [i for i in instances
+                    if pn and pn in names.get(int(i["id"]), set())
+                    and scope_key(i.get("manual_node_id")) == tscope]
             base = {"tunnel_id": int(t["id"]), "tunnel_name": t["name"],
                     "proxy_name": pn}
             if len(hits) == 1:
@@ -378,6 +399,122 @@ class GuardEngine:
         if not any(int(t["id"]) == int(tunnel["id"]) for t in out):
             out.append(tunnel)
         return out
+
+    # ------------------------------------------------------------------
+    # 外部节点
+    # ------------------------------------------------------------------
+    #
+    # 外部节点 = 用户粘一份 frpc 配置导入的、**没有 API** 的 frp 节点（自建 frps、
+    # 别的 frp 服务商）。它和 mefrp 节点在列表里同级，能绑 frpc 实例、能绑域名，
+    # 但引擎**绝不**对它做自动切换 —— 原因见 _reconcile_manual。
+
+    def manual_node_of_tunnel(self, tunnel: dict) -> dict | None:
+        """这条隧道跑在哪个外部节点上。没有则 None（= 走 mefrp API）。"""
+        nid = tunnel.get("manual_node_id")
+        if not nid:
+            return None
+        return store.get_manual_node(int(nid))
+
+    def manual_node_of_instance(self, instance: dict | None) -> dict | None:
+        if not instance:
+            return None
+        nid = instance.get("manual_node_id")
+        if not nid:
+            return None
+        return store.get_manual_node(int(nid))
+
+    def manual_node_for(self, tunnel: dict) -> dict | None:
+        """这条隧道**实际**跑在哪个外部节点上。
+
+        ⚠️ 两个来源都要看，缺一不可：
+
+        * 隧道自己标的 `manual_node_id` —— 导入配置时勾选纳管的隧道带这个。
+        * 它挂接的实例绑的节点 —— 用户先把实例指到外部节点、再挂隧道的中间态。
+
+        只用前者的话，那个中间态的隧道会被 `_reconcile_manual` 判成
+        「挂接的外部节点已不存在」并记一条假错误 —— 而它其实好端端跑着。
+        """
+        return (self.manual_node_of_tunnel(tunnel)
+                or self.manual_node_of_instance(self.frpc_for_tunnel(tunnel)))
+
+    def tunnel_is_manual(self, tunnel: dict) -> bool:
+        """这条隧道是不是外部节点托管。
+
+        ⚠️ 判据要**两个都看**：
+
+        * 隧道自己的 `manual_node_id` —— 导入配置时勾选纳管的隧道会带这个。
+        * 它挂接的实例绑了外部节点 —— 用户可能先把实例指到外部节点，再挂隧道。
+
+        只看前者会漏掉「实例已被外部节点接管、但隧道还没标」的中间状态；
+        只看后者则会让「导入进来还没挂接」的隧道走错分支，拿去跟 mefrp 的
+        proxy 列表比对，然后被判成「隧道在 mefrp 上不存在」。
+        """
+        if tunnel.get("manual_node_id"):
+            return True
+        inst = self.frpc_for_tunnel(tunnel)
+        return bool(inst and inst.get("manual_node_id"))
+
+    async def probe_manual_node(self, node_id: int, *, force: bool = False) -> dict:
+        """探外部节点的**控制端口**（serverAddr:serverPort）。
+
+        和隧道的端到端探测是两件事：这个回答的是「节点本身还在不在」。
+        带缓存，避免 UI 每刷一次就打一次连接。
+        """
+        node = store.get_manual_node(int(node_id))
+        if node is None:
+            return {"ok": False, "error": "外部节点不存在"}
+        now = time.time()
+        interval = float(store.get_setting("probe_interval", 60) or 60)
+        cached = self.manual_probe.get(int(node_id))
+        if cached and not force and now - cached[0] < interval:
+            return {"ok": bool(cached[1]), "reason": cached[2],
+                    "at": int(cached[0]), "cached": True}
+
+        ok, why = await tcp_probe(
+            str(node["server_addr"]), int(node["server_port"]),
+            float(store.get_setting("probe_timeout", 4) or 4),
+        )
+        self.manual_probe[int(node_id)] = (now, ok, why)
+        return {"ok": ok, "reason": why, "at": int(now), "cached": False}
+
+    def manual_node_rows(self) -> list[dict]:
+        """给 UI 用的外部节点列表（含探测结果、绑定的实例与隧道）。"""
+        rows = []
+        for n in store.list_manual_nodes():
+            nid = int(n["id"])
+            insts = store.list_instances_of_manual_node(nid)
+            tunnels = store.list_tunnels_of_manual_node(nid)
+            cached = self.manual_probe.get(nid)
+            rows.append({
+                "id": nid,
+                "name": n["name"],
+                "server_addr": n["server_addr"],
+                "server_port": int(n["server_port"]),
+                "endpoint": f"{n['server_addr']}:{int(n['server_port'])}",
+                "auth_method": n["auth_method"],
+                "has_token": bool(n.get("auth_token")),
+                "auth_user": n.get("auth_user") or "",
+                "config_format": n["config_format"],
+                "note": n.get("note") or "",
+                "enabled": bool(n["enabled"]),
+                # 三态：None = 还没探过 / True / False
+                "probe_ok": cached[1] if cached else None,
+                "probe_reason": cached[2] if cached else "",
+                "probe_at": int(cached[0]) if cached else 0,
+                "instances": [{"id": int(i["id"]), "name": i["name"],
+                               "config_path": i["config_path"]} for i in insts],
+                "instance_count": len(insts),
+                "tunnel_count": len(tunnels),
+                "tunnels": [{
+                    "id": int(t["id"]), "name": t["name"],
+                    "proxy_name": t["proxy_name"],
+                    "proxy_type": t["proxy_type"],
+                    "remote_port": t.get("current_remote_port"),
+                    "enabled": bool(t["enabled"]),
+                    "dns_record_name": t.get("dns_record_name") or "",
+                } for t in tunnels],
+            })
+        return rows
 
     def resolve_map(self) -> dict:
         """给 UI 用的完整绑定关系：每个实例承载哪些隧道、哪些隧道没绑定。"""
@@ -461,6 +598,12 @@ class GuardEngine:
             assert self.client is not None
 
             s = store.get_settings()
+            # mefrp 这一侧这轮能不能用。**不能用也不代表整轮没得做** ——
+            # 外部节点的隧道压根不走 mefrp API（地址就在库里），它们完全可以
+            # 在 mefrp 挂掉 / 没配 token 的时候照常探测、照常同步 DNS。
+            # 原来这两处都是直接 `return`，于是 mefrp 一抖，用户自建的节点就
+            # 跟着一起瞎掉：探测不更新、DNS 不解析，而页面上一点线索都没有。
+            remote_ok = True
             if not s.get("mefrp_token"):
                 self.last_error = "尚未配置 mefrp Token"
                 # 用户组这时候也是「不知道」，把原因写清楚，
@@ -468,22 +611,27 @@ class GuardEngine:
                 self.user_group = ""
                 self.user_group_friendly = ""
                 self.user_group_error = "尚未配置 mefrp Token"
-                return
-
-            # 1. 拉全量状态
-            try:
-                await self._refresh_remote()
-                self.last_error = ""
-            except MefrpError as exc:
-                self.last_error = str(exc)
-                # 整轮拉取就失败了 → 用户组自然也拿不到，如实记下原因。
-                if not self.user_group:
-                    self.user_group_error = str(exc)
-                store.add_event("error", "system", f"拉取 mefrp 状态失败：{exc}")
-                return
+                remote_ok = False
+            else:
+                # 1. 拉全量状态
+                try:
+                    await self._refresh_remote()
+                    self.last_error = ""
+                except MefrpError as exc:
+                    self.last_error = str(exc)
+                    # 拉取失败了 → 用户组自然也拿不到，如实记下原因。
+                    if not self.user_group:
+                        self.user_group_error = str(exc)
+                    store.add_event("error", "system", f"拉取 mefrp 状态失败：{exc}")
+                    remote_ok = False
 
             # 2. 逐隧道对账
             for tunnel in store.list_tunnels(enabled_only=True):
+                # ⚠️ mefrp 侧不可用时**只**对账外部节点的隧道。反过来放行 mefrp
+                #    隧道是危险的：proxy 列表是陈旧的，`_evaluate` 会拿旧数据判出
+                #    假故障、一路涨 fail_streak、最后触发一次不该发生的切换。
+                if not remote_ok and not self.tunnel_is_manual(tunnel):
+                    continue
                 try:
                     await self._reconcile(tunnel)
                 except Exception as exc:  # noqa: BLE001
@@ -610,6 +758,13 @@ class GuardEngine:
     async def _reconcile(self, tunnel: dict) -> None:
         assert self.client is not None
         tid = tunnel["id"]
+
+        # 外部节点托管的隧道走完全独立的一条路：不碰 mefrp 的 proxy 列表，
+        # 也永远不会自动切换。见 _reconcile_manual。
+        if self.tunnel_is_manual(tunnel):
+            await self._reconcile_manual(tunnel)
+            return
+
         proxy = self.proxies.get(tunnel["proxy_name"])
 
         verdict = self._evaluate(tunnel, proxy)
@@ -681,6 +836,101 @@ class GuardEngine:
             return
 
         await self._failover(tunnel, verdict.reason)
+
+    async def _reconcile_manual(self, tunnel: dict) -> None:
+        """外部节点上的隧道：**只探测、只报告，永不自动切换**。
+
+        为什么不能自动切换：外部节点没有 API，在它上面建不了也删不了隧道。
+        对 mefrp 节点来说「切换」= 删掉旧 proxy、在新节点建一个同名 proxy ——
+        这套动作在外部节点上根本不存在。唯一能做的只有「改本地 frpc 配置里的
+        serverAddr 再重启容器」，但换过去那台是不是活着、端口有没有被占、
+        鉴权对不对，我们一概不知道。硬切很可能**把一条还能用的隧道弄成彻底
+        不能用**，比不切糟得多。
+
+        所以这里诚实地只报不修：涨 fail_streak、记事件、推通知，把决定权交回人。
+        ⚠️ 注意这是**实例级**的活儿，不是隧道级的：换外部节点要改写承载它的那个
+        frpc 实例的配置文件（一个 frpc 进程只能连一个 serverAddr），所以入口在
+        「frpc」页的「改连外部节点」，以及隧道卡片上的「更新节点配置」。
+        """
+        tid = int(tunnel["id"])
+        node = self.manual_node_for(tunnel)
+        if node is None:
+            # 指向一个已经被删掉的外部节点。既不能当健康，也不能自动切 ——
+            # 如实报错，让用户看见。
+            store.update_tunnel(tid, {"last_error": "挂接的外部节点已不存在"})
+            return
+
+        if not node.get("enabled"):
+            store.update_tunnel(
+                tid, {"last_error": f"外部节点「{node['name']}」已停用"})
+            return
+
+        host = str(node["server_addr"] or "").strip()
+        port = int(tunnel.get("current_remote_port") or 0)
+        if not port:
+            store.update_tunnel(tid, {
+                "last_error": "这条隧道没有远程端口，无法探测"
+                              "（导入配置时该段没写 remotePort）"})
+            return
+
+        ok, why = await self._probe_cached(tid, host, port,
+                                           tunnel.get("proxy_type", "tcp"))
+
+        if ok is True:
+            if tunnel["fail_streak"]:
+                store.update_tunnel(tid, {"fail_streak": 0, "last_error": ""})
+            store.update_tunnel(tid, {"last_ok_at": int(time.time())})
+            # 外部节点没有 Proxy 对象，地址直接就是节点的 serverAddr。
+            await self._sync_dns(tunnel, None, host=host)
+            return
+
+        if ok is None:
+            # 协议不适用探测（udp）。外部节点上我们**没有**第二层判据可用
+            # —— mefrp 那套「proxy 是否在线」是 API 给的，这里没有。
+            # 所以只能如实说「没探」：**既不算失败，也不算健康**。
+            #   · 不能涨 fail_streak（那会把健康隧道判成故障）；
+            #   · 不能写 last_error —— 前端把它画成红色「异常」，而这里只是
+            #     「探不了」。原因已经进了 probe_cache，页面上以 ⓘ 提示显示。
+            #   · **但 DNS 必须照常同步**：地址对不对，跟能不能用 TCP 去探它
+            #     没有任何关系。原来这里直接 return，于是 udp 的外部隧道
+            #     **永远同步不了 DNS** —— 而 udp 恰恰是外部节点上最常见的一类。
+            #     顺带把老代码留下的那条「无法探测」清掉（它现在是红色的）。
+            if tunnel["fail_streak"] or (tunnel.get("last_error") or ""):
+                store.update_tunnel(tid, {"fail_streak": 0, "last_error": ""})
+            await self._sync_dns(tunnel, None, host=host)
+            return
+
+        streak = int(tunnel["fail_streak"]) + 1
+        threshold = int(store.get_setting("fail_threshold", 3) or 3)
+        store.update_tunnel(tid, {"fail_streak": streak, "last_error": why})
+
+        if streak == 1:
+            store.add_event(
+                "warn", "probe",
+                f"隧道「{tunnel['name']}」异常（外部节点「{node['name']}」）：{why}",
+                tunnel_id=tid, detail=f"探测目标：{host}:{port}",
+            )
+            if store.get_setting("notify_on_probe_fail"):
+                await self._notify(f"隧道异常：{tunnel['name']}", why, "warn")
+
+        if streak == threshold:
+            # ⚠️ 只在刚跨过阈值那一次记 —— 否则 streak 会一直保持在高位，
+            #    每 20 秒一条，很快把日志刷满，真正的问题反而被淹没。
+            store.add_event(
+                "error", "failover",
+                f"隧道「{tunnel['name']}」连续 {streak} 次异常，"
+                f"但它由外部节点「{node['name']}」托管，不会自动切换",
+                tunnel_id=tid,
+                detail="外部节点没有 API，无法在服务端建/删隧道。"
+                       "换节点是**实例级**动作：去「frpc」页把承载这条隧道的那个实例"
+                       "改连到别的节点（或点隧道卡片上的「更新节点配置」重新粘一份配置）。",
+            )
+            await self._notify(
+                f"⚠️ 隧道异常（需人工处理）：{tunnel['name']}",
+                f"外部节点：{node['name']}（{host}:{port}）\n"
+                f"原因：{why}\n\n外部节点不支持自动切换，请手动处理。",
+                "error",
+            )
 
     def _evaluate(self, tunnel: dict, proxy: Proxy | None) -> Verdict:
         if proxy is None:
@@ -1000,8 +1250,27 @@ class GuardEngine:
         返回 dict，**每一步失败都要如实回传** —— 手动切换的接口直接把结果给前端，
         如果这里静默 return，页面就会骗用户说「已触发切换」而实际什么都没做。
         """
-        assert self.client is not None
         tid = int(tunnel["id"])
+
+        # 外部节点托管的隧道**永不自动切换**（原因见 _reconcile_manual）。
+        # 这是道防御性闸门：_reconcile_manual 压根不会调到这里，但 force_failover
+        # 等其它入口可能误入。必须在这里挡住，而不是让它往下走去调 mefrp 的
+        # 建/删接口 —— 那些接口操作的是「mefrp 账号里的 proxy」，而这条隧道
+        # 在 mefrp 上根本不存在。
+        if self.tunnel_is_manual(tunnel):
+            node = self.manual_node_for(tunnel)
+            name = node["name"] if node else "已删除的外部节点"
+            store.add_event(
+                "error", "failover",
+                f"隧道「{tunnel['name']}」需要切换，但它由外部节点「{name}」托管，"
+                "外部节点不支持自动切换",
+                tunnel_id=tid,
+            )
+            return {"ok": False,
+                    "error": f"这条隧道由外部节点「{name}」托管，只能手动切换"
+                             "（点隧道卡片上的「切换节点」）"}
+
+        assert self.client is not None
         now = time.time()
         cooldown = float(store.get_setting("failover_cooldown", 300) or 300)
 
@@ -1499,6 +1768,13 @@ class GuardEngine:
             return {**base, "changed": False, "restart_ok": False,
                     "error": str(exc)}
 
+        # 外部节点托管的实例：配置不归引擎管，所以「没变化」不是异常，
+        # 也不该说成「配置无变化，跳过重启」—— 那句话会让用户以为引擎
+        # 检查过配置并且是对的。
+        if summary.get("manual"):
+            return {**base, "changed": False, "restart_ok": True, "manual": True,
+                    "summary": summary, "note": summary.get("note", "")}
+
         if not changed:
             store.add_event("info", "frpc",
                             f"frpc 实例「{label}」配置无变化，跳过重启", tunnel_id=tid)
@@ -1593,6 +1869,19 @@ class GuardEngine:
         iid = int(inst["id"])
         label = str(inst["name"])
 
+        # 外部节点托管的实例：配置文件由「手动切换」维护，引擎**一个字都不碰**。
+        # 手工模式的语义就是手工 —— 引擎自作主张去改写它，用户手写的注释、
+        # 手工加的 [[proxies]] 全都会被冲掉，而且那是用户自己维护的文件，
+        # 被工具悄悄改掉是最难排查的一类问题。
+        if inst.get("manual_node_id"):
+            node = store.get_manual_node(int(inst["manual_node_id"]))
+            nname = node["name"] if node else "已删除的外部节点"
+            return False, {
+                "manual": True,
+                "proxy_count": 0,
+                "note": f"该实例由外部节点「{nname}」托管，配置不由引擎改写",
+            }
+
         tunnels = []
         for t in store.list_tunnels(enabled_only=True):
             if not t["current_proxy_id"]:
@@ -1673,24 +1962,45 @@ class GuardEngine:
     # ------------------------------------------------------------------
 
     async def _sync_dns(self, tunnel: dict, proxy: Proxy | None,
-                        force: bool = False) -> str:
-        if proxy is None:
-            return ""
+                        force: bool = False, host: str | None = None) -> str:
+        """同步 DNS。
+
+        `host` 是给外部节点用的 —— 那种情况下没有 mefrp 的 Proxy 对象，
+        节点地址直接由调用方给出（就是外部节点的 serverAddr）。
+        不传 `host` 时走原来的路：从 mefrp 反推节点地址。
+        """
         record_name = (tunnel.get("dns_record_name") or "").strip()
         if not record_name:
             return ""
         if not store.get_setting("auto_dns_sync", True) and not force:
             return ""
 
-        node = self.nodes.get(proxy.node_id)
-        if node is None:
-            return ""
+        # ⚠️ 没配 token 是**静态配置问题**，不是「这条隧道此刻解析失败了」。
+        #    如果照常往下走，`CloudflareAuthError` 会被下面那个 except 抓住、
+        #    每轮巡检记一条 error 事件 —— 20 秒一条 × 每条填了记录名的隧道，
+        #    很快把事件日志刷满，真正的问题反而被淹掉。
+        #    所以这里直接说清楚，且**只在用户明确要求时**（force）才记事件。
+        if self.cf is None or not self.cf.token:
+            msg = "尚未配置 Cloudflare API Token，无法同步 DNS"
+            if force:
+                store.add_event("error", "dns", msg, tunnel_id=tunnel["id"])
+            return msg
 
-        # 节点地址只能从「该节点上已有隧道的官方配置」里反推（非管理员账号下
-        # /auth/node/list 的 hostname 是空串），所以这里必须走解析器而不是直接读 node.hostname。
-        host = (await self.node_address(proxy.node_id)).strip()
+        if host is None:
+            if proxy is None:
+                return ""
+            node = self.nodes.get(proxy.node_id)
+            if node is None:
+                return ""
+            # 节点地址只能从「该节点上已有隧道的官方配置」里反推（非管理员账号下
+            # /auth/node/list 的 hostname 是空串），所以这里必须走解析器而不是
+            # 直接读 node.hostname。
+            host = (await self.node_address(proxy.node_id)).strip()
+        else:
+            host = str(host).strip()
+
         if not host:
-            msg = f"拿不到节点 {proxy.node_id} 的公网地址，无法同步 DNS"
+            msg = f"拿不到节点 {proxy.node_id if proxy else '?'} 的公网地址，无法同步 DNS"
             if force:
                 store.add_event("warn", "dns", msg, tunnel_id=tunnel["id"])
             return msg
@@ -1760,6 +2070,15 @@ class GuardEngine:
         if tunnel is None:
             return {"ok": False, "error": "隧道不存在"}
 
+        # 外部节点托管的隧道不能用这个接口切：它换的是「mefrp 账号里的 proxy」，
+        # 而外部节点根本没有 API。换节点请走 switch_instance_to_node。
+        if self.tunnel_is_manual(tunnel):
+            node = self.manual_node_for(tunnel)
+            name = node["name"] if node else "未知"
+            return {"ok": False,
+                    "error": f"这条隧道由外部节点「{name}」托管，"
+                             "请用「切换节点」手动切换"}
+
         if self.client is None:
             self.reload_clients()
 
@@ -1793,6 +2112,221 @@ class GuardEngine:
                 prefer_node_id=int(node_id) if node_id else None,
                 ignore_cooldown=True,
             )
+
+    # ------------------------------------------------------------------
+    # 手工切换：把实例切到某个外部节点
+    # ------------------------------------------------------------------
+
+    async def switch_instance_to_node(self, instance_id: int, node_id: int,
+                                      *, restart: bool | None = None) -> dict:
+        """把一个 frpc 实例切到某个外部节点上 —— 外部节点**唯一**的切换方式。
+
+        按顺序做三件事：
+
+          1. 改写实例配置文件里的 **server 段**（地址 / 端口 / 鉴权）
+          2. 按设置决定是否重启它的容器
+          3. 重新同步相关隧道的 DNS
+
+        ⚠️ **隧道定义一个字都不动。** 切换的语义是「同一套本地服务，换一台 frps
+           接」，所以 `[[proxies]]` / `[段名]` 原样保留，连注释和排版都不碰 ——
+           见 frpcparse.patch_server 里为什么用文本级替换而不是重新序列化。
+
+        `restart` 传 None 表示「按设置来」（实例的 restart_mode + 全局
+        auto_restart_frpc），传 True/False 则由调用方强制。
+        """
+        inst = store.get_frpc_instance(int(instance_id))
+        if inst is None:
+            return {"ok": False, "error": f"frpc 实例 {instance_id} 不存在"}
+        node = store.get_manual_node(int(node_id))
+        if node is None:
+            return {"ok": False, "error": f"外部节点 {node_id} 不存在"}
+        if not node.get("enabled"):
+            return {"ok": False, "error": f"外部节点「{node['name']}」已停用"}
+
+        iid = int(inst["id"])
+        label = str(inst["name"])
+        path = Path(str(inst["config_path"]))
+
+        try:
+            current = frpc.read_config(path)
+        except frpc.FrpcError as exc:
+            return {"ok": False, "error": str(exc)}
+
+        fmt = str(node.get("config_format") or "toml")
+        # 手上没有现成配置（首次接管这个实例）→ 用导入时存的原文做底
+        base = current if current.strip() else str(node.get("config_text") or "")
+
+        token = str(node.get("auth_token") or "").strip()
+        user = str(node.get("auth_user") or "").strip()
+        method = str(node.get("auth_method") or "none")
+
+        # ⚠️ 目标节点不需要鉴权时**不传** token/user —— patch_server 只在明确给了
+        #    值时才动鉴权字段。刻意**不清空**原有的 token：清空得写
+        #    `auth.token = ""`，让配置更难读；而 frps 没配鉴权时，客户端多带一个
+        #    token 是无害的（服务端根本不校验）。
+        try:
+            patched = frpcparse.patch_server(
+                base,
+                addr=str(node["server_addr"]),
+                port=int(node["server_port"]),
+                auth_method=(method if (token or user) else None),
+                auth_token=(token or None),
+                auth_user=(user or None),
+                fmt=fmt,
+            )
+        except Exception as exc:  # noqa: BLE001 - 解析/改写出任何问题都要如实回传
+            return {"ok": False, "error": f"改写配置失败：{exc}"}
+
+        async with self._lock:
+            changed = patched.strip() != current.strip()
+            backup = None
+            if changed:
+                try:
+                    backup = frpc.write_config(
+                        patched, path=path,
+                        backup_dir=frpc.instance_backup_dir(iid))
+                except frpc.FrpcError as exc:
+                    return {"ok": False, "error": str(exc)}
+
+            # ---- 落库：实例挂到新节点 ----
+            # 记下它原来连的是哪个节点 —— 切走之后那个节点可能就没人用了。
+            old_nid = int(inst["manual_node_id"]) if inst.get("manual_node_id") else 0
+            store.update_frpc_instance(iid, {"manual_node_id": int(node["id"])})
+
+            # 隧道跟着实例走：它们由这个实例承载，实例换服务端，它们就换了服务端。
+            # 顺便按新配置里的 remotePort 刷新各自的当前端口 —— 不同节点的端口
+            # 段不一样，不刷新的话下一轮探测会拿旧端口去连，白白判成故障。
+            ports: dict[str, int] = {}
+            try:
+                ports = {p.name: int(p.remote_port or 0)
+                         for p in frpcparse.parse(patched, fmt=fmt).proxies}
+            except frpcparse.FrpcParseError:
+                pass
+
+            moved: list[dict] = []
+            missing: list[str] = []
+            for t in store.list_tunnels_of_frpc(iid):
+                upd: dict[str, Any] = {"manual_node_id": int(node["id"])}
+                new_port = ports.get(str(t["proxy_name"]))
+                if new_port:
+                    upd["current_remote_port"] = new_port
+                elif ports:
+                    # 新配置里没有这条隧道 —— 它在这个节点上不会生效，如实报出来，
+                    # 不能让用户以为切换之后它还在跑。
+                    missing.append(str(t["name"]))
+                store.update_tunnel(int(t["id"]), upd)
+                self.probe_cache.pop(int(t["id"]), None)
+                moved.append(store.get_tunnel(int(t["id"])) or t)
+
+            # ---- 顺手清理没人用的旧节点 ----
+            # 外部节点是**跟着隧道/实例走的一次性东西**，用户从不在页面上管理它。
+            # 所以实例改连之后，原节点如果谁都不引用了就该消失 —— 否则每换一次
+            # 节点就在库里留一条记录，用户在页面上既看不见也删不掉，只会越积越多。
+            # ⚠️ 仍被隧道或别的实例引用着的不删：那些东西的配置里还写着这个地址。
+            dropped_node = 0
+            if old_nid and old_nid != int(node["id"]):
+                still_used = (store.count_tunnels_of_manual_node(old_nid)
+                              + len(store.list_instances_of_manual_node(old_nid)))
+                if still_used == 0 and store.get_manual_node(old_nid) is not None:
+                    store.delete_manual_node(old_nid)
+                    self.manual_probe.pop(old_nid, None)
+                    dropped_node = old_nid
+
+            # ---- 重启 ----
+            restart_ok = False
+            restart_note = ""
+            if not changed:
+                restart_ok = True
+                restart_note = "配置无变化，未重启"
+            else:
+                mode = str(inst.get("restart_mode") or "docker")
+                allow = (bool(store.get_setting("auto_restart_frpc", True))
+                         if restart is None else bool(restart))
+                if mode == "none":
+                    restart_note = "该实例的 restart_mode=none，需要手动重启"
+                elif not allow:
+                    restart_note = "自动重启已关闭，需要手动重启"
+                else:
+                    dk = self.docker_for(inst)
+                    if dk is None:
+                        restart_note = "没有可用的容器控制器（未填容器名，或 Docker 不可达）"
+                    else:
+                        try:
+                            dk.restart()
+                            restart_ok = True
+                        except frpc.FrpcError as exc:
+                            restart_note = str(exc)
+
+        # 顺手探一下新节点，给用户即时反馈（缓存里直接写新结果）
+        probe = await self.probe_manual_node(int(node["id"]), force=True)
+
+        # ---- 重新解析 DNS ----
+        # 地址变了就必须跟着改，否则「配置看着对、访问打不开」。
+        # 这里**强制**同步（force=True）：切换是用户明确点的动作，DNS 记录名也是
+        # 用户逐条配的，两者都表达过意图；再被全局的 auto_dns_sync 拦一道，
+        # 结果就是切完了域名还指着旧地址 —— 那才是最糟的失败方式。
+        dns_msgs: list[str] = []
+        for t in moved:
+            if not (t.get("dns_record_name") or "").strip():
+                continue
+            try:
+                msg = await self._sync_dns(t, None, force=True,
+                                           host=str(node["server_addr"]))
+            except Exception as exc:  # noqa: BLE001 - 单条 DNS 失败不能拖垮整轮
+                msg = f"更新 DNS 异常：{exc}"
+            if msg:
+                dns_msgs.append(f"{t['name']}：{msg}")
+
+        lines = [
+            f"实例：{label}",
+            f"新节点：{node['name']}（{node['server_addr']}:{node['server_port']}）",
+            f"配置文件：{path}",
+            f"写入：{'已改写' if changed else '无变化'}"
+            + (f"（备份 {backup.name}）" if backup else ""),
+            f"重启：{'成功' if restart_ok else '未完成'}"
+            + (f" —— {restart_note}" if restart_note else ""),
+            f"节点探测：{'可达' if probe.get('ok') else '不可达'}"
+            + ("" if probe.get("ok") else f" —— {probe.get('reason', '')}"),
+            f"受影响隧道：{len(moved)} 条",
+        ]
+        if missing:
+            lines.append("")
+            lines.append("⚠️ 新配置里找不到这些隧道，它们在新节点上不会生效："
+                         + "、".join(missing))
+        if dns_msgs:
+            lines.append("DNS：" + "；".join(dns_msgs))
+
+        level = "success" if (restart_ok and probe.get("ok")) else "warn"
+        store.add_event(
+            level, "failover",
+            f"实例「{label}」已手动切换到外部节点「{node['name']}」",
+            detail="\n".join(lines),
+        )
+        await self._notify(
+            f"{'✅' if level == 'success' else '⚠️'} 已切换外部节点：{label}",
+            "\n".join(lines), level,
+        )
+
+        return {
+            "ok": True,
+            "instance": label,
+            "instance_id": iid,
+            "node": node["name"],
+            "node_id": int(node["id"]),
+            "endpoint": f"{node['server_addr']}:{node['server_port']}",
+            "config_path": str(path),
+            "changed": changed,
+            "backup": backup.name if backup else "",
+            "restart_ok": restart_ok,
+            "restart_note": restart_note,
+            "node_probe_ok": bool(probe.get("ok")),
+            "node_probe_reason": probe.get("reason", ""),
+            "tunnels": [t["name"] for t in moved],
+            "tunnels_missing": missing,
+            "dns": dns_msgs,
+            "dropped_manual_node": dropped_node,
+            "detail": "\n".join(lines),
+        }
 
     # ------------------------------------------------------------------
     # 通知

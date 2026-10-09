@@ -60,7 +60,12 @@ class CloudflareClient:
                     method, url, headers=headers, json=json_body, params=params
                 )
         except httpx.HTTPError as exc:
-            raise CloudflareError(f"请求 Cloudflare 失败：{exc}") from exc
+            # ⚠️ 必须带上异常**类型**：httpx 的超时类异常 str() 常常是空串，
+            #    只拼 {exc} 的话事件日志里就只剩一句「请求 Cloudflare 失败：」，
+            #    完全看不出是超时、连不上、还是 TLS 出错 —— 这坑真踩过。
+            raise CloudflareError(
+                f"请求 Cloudflare 失败：{type(exc).__name__}: {exc}"
+            ) from exc
 
         try:
             payload = resp.json()

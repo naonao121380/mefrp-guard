@@ -29,8 +29,11 @@ mefrp 的节点会不定期变更（下线、维护、被禁用）。手工处�
 ### 一轮循环（默认 20 秒）
 
 ```
-拉全量状态 → 逐隧道对账 → 健康就顺手纠正漂移的 DNS → 不健康就累计失败次数 → 够了就故障转移
+拉全量状态 → 逐隧道对账 → 没判成故障就顺手纠正 DNS → 判成故障就累计失败次数 → 够了就故障转移
 ```
+
+> 「没判成故障」包括**探测不适用**（udp）这种情况 —— 探不了 ≠ 地址不对，
+> DNS 照常同步。详见下文「DNS 同步」。
 
 ### 三层健康判定
 
@@ -151,6 +154,58 @@ WireGuard 的握手包）。那属于业务侧的事，不是这个工具该做�
 
 程序内部一律用 `group` 做权限判断，界面上显示 `friendlyGroup`。
 
+## DNS 同步
+
+一条隧道**填了 DNS 记录名**（「编辑隧道」里的那一栏）之后，程序会在
+**导入时 / 每次端到端探测 / 每轮巡检**这三处，把那条记录纠到隧道的当前地址上。
+
+判据只有三件事，**跟隧道协议无关，也跟探测通不通无关**：
+
+1. `dns_record_name` 非空 —— 留空 = 这条隧道的 DNS 你自己管，程序一次都不碰；
+2. `auto_dns_sync` 开着，或者调用方传了 `force=True`（用户明确点的动作）；
+3. 拿得到地址 —— mefrp 隧道从 `proxy_list` 的 `nodes` 子数组反推，外部节点直接用自己的
+   `serverAddr`（不查任何 API，所以外部节点有没有 API 都无所谓）。
+
+地址是 IP 就写 `A`，是域名就写 `CNAME`。zone 按**最长后缀匹配**自动定位
+（`resolve_zone`），结果落库，之后不再重复问。记录内容已经对得上就**什么都不写**
+（不产生事件、不产生噪音）—— 所以「每轮巡检都调一次」是安全的。
+
+### 踩过的坑
+
+用户报过「手动添加的隧道好像没有自动进行 cf dns 解析」。查下来**是代码的问题**，
+不是忘了填记录名（当然前提还是那条隧道上填了 —— 没填的话按上面第 1 条，
+程序本来就不该碰它）。三条独立的路各自把 DNS 那一步漏掉了，另外还有三个连带问题：
+
+- **★ 「不适用探测」不等于「地址不对」** —— udp 隧道在 `auto` 模式下不做 TCP 探测，
+  `_probe_cached` 返回 `None`（三态里的「不适用」）。原来 `_reconcile_manual` 在这个分支
+  **直接 `return`**，于是 udp 的外部隧道**永远**同步不了 DNS —— 而 udp 恰恰是外部节点上
+  最常见的一类（VPN / 游戏服 / DNS）。现在改成：不涨 `fail_streak`、**不写 `last_error`**
+  （写了的话前端会把它画成红色「异常」，而这里只是「探不了」），**但照常调 `_sync_dns`**。
+- **★ 探测端点要和巡检对齐** —— `POST /api/tunnels/{id}/probe` 里同款分支也一样漏了。
+  两条路行为不一致时，用户点一次按钮反而更懵。现在两边都同步，并把结果放进返回值的
+  `dns` 字段，弹窗里当场显示成功 / 失败原因。⚠️ 探测**失败**时不动 DNS —— 地址并没有变，
+  改它只会把一条本来对的记录改坏。
+- **★ 导入时立刻同步，别等下一轮** —— 导入接口原来**从来不碰 DNS**，全靠引擎巡检
+  （最长 20 秒）。用户粘完配置站在页面前什么都不发生，只会以为「没生效」。现在导入
+  时 `force=True` 逐条同步（用户刚填的记录名 = 明确指令），失败也当场回话。
+- **★ `last_error` 里的历史遗留值要能自愈** —— 老版本把「无法探测：…」写进 `last_error`，
+  前端把它画成红色「异常」，升级后那条红字会一直挂着。新代码在「不适用」分支顺手清掉它。
+- **★ 没配 CF token 时不能每轮记一条错误事件** —— 那是**静态配置问题**，不是「这条隧道
+  此刻解析失败了」。照常往下走的话 `CloudflareAuthError` 会被 `except` 抓住、每轮巡检
+  记一条 error —— 20 秒一条 × 每条填了记录名的隧道，很快把事件日志刷满，真正的问题
+  反而被淹掉。现在 `_sync_dns` 开头就判掉，**只在 `force`（用户明确点的动作）时才记事件**。
+  ⚠️ 测试里的假 CF 也得带上 `token` 属性，否则会以 `AttributeError` 炸而不是「跳过 DNS」。
+- **CF 的 httpx 异常必须带上类型名** —— 超时类异常 `str()` 常常是空串，只拼 `{exc}` 的话
+  事件日志里只剩一句「请求 Cloudflare 失败：」，完全看不出是超时、连不上还是 TLS 出错。
+
+### 相关的巡检坑：mefrp 挂了不该连累外部节点
+
+`tick()` 原来在「没配 mefrp Token」和「拉取 mefrp 失败」两处**直接 `return`** ——
+外部节点的隧道压根不走 mefrp API，却跟着一起瞎掉（探测不更新、DNS 不解析），
+页面上一点线索都没有。现在这两处改成 `remote_ok = False` 后继续跑，
+**但只对账外部节点的隧道**：反过来放行 mefrp 隧道是危险的 —— proxy 列表是陈旧的，
+`_evaluate` 会拿旧数据判出假故障、一路涨 `fail_streak`，最后触发一次不该发生的切换。
+
 ## 前置条件
 
 1. **每条要管的隧道，都有一个自己的 frpc 容器**。本程序不负责创建它，只负责改它的
@@ -180,14 +235,14 @@ WireGuard 的握手包）。那属于业务侧的事，不是这个工具该做�
 ```bash
 cp .env.example .env
 vim .env                 # 至少填 MEFRP_TOKEN、MG_WEB_PASSWORD、FRPC_PATH
-docker build -t mefrp-guard:v1.0.0 .
+docker build -t mefrp-guard:v1.0.1 .
 docker compose up -d
 ```
 
 > 也可以一步做完：`docker compose up -d --build`，两者等价。
 >
-> 镜像 tag 固定成 `v1.0.0` 而不是 `latest` —— `latest` 会让「现在跑的是哪一版」
-> 变成一个回答不了的问题，回滚时也没有可指的目标。改了代码就 build 成 `v1.0.1`
+> 镜像 tag 固定成 `v1.0.1` 而不是 `latest` —— `latest` 会让「现在跑的是哪一版」
+> 变成一个回答不了的问题，回滚时也没有可指的目标。改了代码就 build 成 `v1.0.2`
 > 之类的新 tag，`docker compose up -d` 会自动用新镜像重建容器。
 
 起来后访问 `http://<宿主机>:<HOST_PORT>`（默认 8080），会先跳到登录页。
@@ -440,11 +495,13 @@ mefrp-guard/
 ├── app/
 │   ├── settings.py     双层配置：BOOTSTRAP（环境变量，需重启）+ 运行期设置（存库，UI 可改）
 │   ├── auth.py         鉴权原语：PBKDF2 密码哈希 / 会话令牌 / 登录防爆破（纯标准库）
-│   ├── store.py        SQLite（WAL）。settings / tunnels / node_prefs / events / sessions 五张表
+│   ├── store.py        SQLite（WAL）。settings / tunnels / node_prefs / events / sessions /
+│   │                   frpc_instances / manual_nodes 七张表 + 启动时自动迁移
 │   ├── mefrp.py        mefrp 5.0 API 客户端（含 WAF 检测）
 │   ├── cloudflare.py   Cloudflare DNS 客户端
 │   ├── notifier.py     Gotify 推送
 │   ├── frpc.py         TOML 合并 + 配置读写备份 + 容器管控
+│   ├── frpcparse.py    外部 frpc 配置解析（TOML / INI，只读不改）
 │   ├── engine.py       自愈引擎（三层判定 / 择优 / 故障转移 / DNS 同步）
 │   ├── main.py         FastAPI 后端（含登录 / 登出 / 改密码）
 │   └── web/
@@ -452,7 +509,8 @@ mefrp-guard/
 │       ├── index.html  主单页 UI（自包含，无外部依赖）
 │       ├── favicon.svg 站点图标（`/favicon.svg`，不需登录即可取）
 │       └── favicon.ico 老浏览器 / Safari / webview 的回落图标（`/favicon.ico`）
-├── tests/              五层测试（鉴权 / 纯逻辑 / API 冒烟 / 端到端故障转移 / 多容器挂接）
+├── tests/              九个测试文件（鉴权 / 纯逻辑 / 外部节点逻辑 / API / 外部节点 API /
+│                       标签 / 作用域 / 故障转移 / 多容器挂接），共 909 条断言
 ├── run_local.sh        本地试跑脚本（不依赖 Docker，用沙箱 frpc 配置）
 ├── Dockerfile
 ├── docker-compose.yml
@@ -585,10 +643,15 @@ Dockerfile 里加 `COPY wheels /wheels`，安装那行换成
 改完下游配置后点「已处理」清掉。
 
 **DNS 没同步**
-检查隧道记录里填了「关联的 Cloudflare 记录名」没有；
-检查 CF Token 权限是不是 `Zone.DNS:Edit`、zone 是否在授权范围内。
-节点地址是 IP 就写 A 记录，是域名就写 CNAME —— 程序按节点 hostname 自动判断。
-如果事件里写「拿不到节点地址」，见上文「已知限制」第二条。
+先看隧道卡片上「DNS 记录」那一栏填了没有 —— **留空 = 程序不管这条的 DNS**，
+一次都不会去问 Cloudflare（这是设计，不是故障）。填了的话再往下查：
+
+- CF Token 权限是不是 `Zone.DNS:Edit`、记录所在的 zone 在不在授权范围内；
+- 节点地址是 IP 就写 A 记录，是域名就写 CNAME —— 程序按节点地址自动判断；
+- 如果事件里写「拿不到节点地址」，见上文「已知限制」第二条。
+
+导入 / 探测 / 切换之后都会**当场**在弹窗里回报 DNS 的结果（成功 / 找不到 zone /
+token 没权限），不必去翻事件日志。判据与设计取舍见上文「DNS 同步」。
 
 **界面上「节点地址」是空的 / 公网入口显示 `—`**
 说明这个节点上还没有任何隧道，mefrp 对非管理员不返回它的地址。
@@ -621,28 +684,31 @@ UDP 隧道只有 L1（mefrp 状态）+ L2（节点状态）两层判定，
 ## 测试
 
 ```bash
-PY=<python> ./tests/run_all.sh
+PY=<python>
+$PY -m pip install --target .devdeps fastapi httpx pydantic   # 只需装一次
+PYTHONPATH=$PWD/.devdeps PY=$PY ./tests/run_all.sh
 ```
 
-五个文件，共 **550+ 条断言**（当前 59 + 141 + 188 + 73 + 93 = 554）：
+> ⚠️ `run_all.sh` **自己不设 `PYTHONPATH`** —— 不带上的话会在第一个需要依赖的文件上
+> 报 `No module named 'fastapi'`。
+
+九个文件，共 **909 条断言**（59 + 141 + 114 + 188 + 164 + 30 + 47 + 73 + 93）：
 
 | 文件 | 覆盖 | 需要第三方库 |
 |---|---|---|
 | `tests/test_auth.py` | **密码哈希（随机盐/迭代数/异常输入安全降级）、默认密码识别、会话令牌、登录防爆破、来源 IP 解析** | 否 |
 | `tests/test_logic.py` | frpc TOML 合并与跨节点校验、**单引号字面量解析**、配置备份/恢复/路径穿越、SQLite 持久化与字段白名单、Node/Proxy 字段解析、`pick_node` 择优调度、**节点偏好的有序语义与归一化**、**`probe_plan` 探测适用性** | 否 |
+| `tests/test_manual_node.py` | **frpc 配置解析（TOML / INI）、`patch_server` 文本级改写的保真与合法性、外部节点数据层 CRUD、1.0.0 老库补列迁移、引擎对外部隧道的分支（含「不适用探测」的三态与 UDP 的 DNS 同步）** | 否 |
 | `tests/test_api.py` | FastAPI 全端点：**登录页/会话 Cookie/登出作废/改密码/CSRF/防爆破/只读设置保护**、鉴权、CRUD、密钥打码、错误码、枚举字段校验、引擎生命周期、**frpc 实例 CRUD 与挂接 API**、**节点偏好预览（含路由遮蔽回归）** | fastapi / httpx / pydantic |
+| `tests/test_manual_api.py` | 外部节点全部 HTTP 端点：导入 / 更新 / 删除 / 改连 / 探测、token 不回明文、**「地址已导入过」的 409 契约与「覆盖重建空节点」**、**导入时顺手同步 DNS 与 udp 隧道的探测端点**、删掉最后一条隧道自动清理空节点 | fastapi / httpx / pydantic |
+| `tests/test_tags.py` | 隧道标签：默认打 `mefrp`、归一化与截断、`?tag=` 筛选（**空串 = 筛未打标的**）、`/api/tags` 计数与排序、显式清空、**老库只回填一次** | fastapi / httpx / pydantic |
+| `tests/test_scope.py` | **隧道名的唯一性作用域**：同名隧道跨运营商并存、展示名重名不报错、mefrp 作用域内仍唯一、`/api/orphans` 与 `probe` 按作用域分流、**老库整表重建去掉 UNIQUE** | fastapi / httpx / pydantic |
 | `tests/test_failover.py` | 完整故障转移流水线（mefrp / CF / Gotify / Docker 全部打桩），含**节点地址取址路径**与 **UDP 跳过探测** | fastapi / httpx / pydantic |
 | `tests/test_frpc_multi.py` | **多容器挂接：不自动播种、只认显式挂接、未挂接拒绝切换、按容器重建、成组切换、跨容器隔离、失败回滚、自动发现** | 否 |
 
-前两个和最后一个用 `sys.modules` 注入假的 `httpx`（或压根不依赖），
-所以在**没装任何依赖**的环境里也能跑。
-
-中间两个需要 fastapi 等依赖。不想污染环境就装到隔离目录：
-
-```bash
-$PY -m pip install --target .devdeps fastapi httpx pydantic
-PYTHONPATH=$PWD/.devdeps $PY tests/test_api.py
-```
+`test_auth` / `test_logic` / `test_failover` / `test_frpc_multi` 用 `sys.modules` 注入假的
+`httpx`，`test_manual_node` 则压根不依赖 —— 这五个在**没装任何依赖**的环境里也能跑。
+其余四个需要 fastapi 等依赖（装到 `.devdeps` 即可，不污染环境）。
 
 `test_failover.py` 里最关键的几条用例（都是踩过的坑）：
 
@@ -670,6 +736,31 @@ PYTHONPATH=$PWD/.devdeps $PY tests/test_api.py
 - **两个容器不能共用同一个配置文件**，相对路径也直接拒绝
 - **老库迁移**：补 `frpc_instance_id` 列（老库里已有的绑定关系原样保留）
 
+`test_scope` / `test_tags` / `test_manual_api` 里最关键的几条（都是踩过的坑）：
+
+- **★ 隧道名的唯一性只在「同一台 frps 内」** —— 导入一份含同名隧道的外部配置时
+  **不能被跳过**，两条同名隧道要能并存，且外部那条的展示名**就是本名**（不许自动加后缀）
+- **★ 展示名重名不报错**：新建同名展示名、把名字改成已存在的，都得 200 而不是 500
+  （`name` 上的 UNIQUE 已经整表重建摘掉了）
+- **★ `find_tunnel_by_proxy` 三向隔离**：mefrp 作用域、某个外部节点、另一个外部节点各查各的
+- **★ `/api/orphans` 不被同名的外部隧道干扰** —— `managed` 集合只算 mefrp 作用域，
+  否则一条真·未纳管的 mefrp 隧道会被同名的那条外部隧道**藏掉**
+- **★ `probe` 按作用域分流** —— 外部隧道拿的是自己节点的地址与端口，
+  绝不能拿 `proxy_name` 去 mefrp 的列表里找（会探到一条完全不相干的隧道）
+- **★ 老库整表重建**：`name` / `proxy_name` 上的 UNIQUE 都去掉，数据、主键、标签原样保留，
+  重建后能插同名；新表 DDL **从 `sqlite_master` 读出来再摘约束**（手写 DDL 会因可空性 /
+  默认值不一致而让 `INSERT ... SELECT` 失败）
+- **★ 标签只在「刚加出这一列」的那一次回填** —— 用户手动清空后重启**不能**被打回 `mefrp`
+- **`?tag=` 的空串语义**：筛的是「未打标签的」，不是「不过滤」
+- **PATCH 不带 `tag` 字段时不能动标签**（要能区分「没传」和「传了空串」）
+- **★ 「地址已导入过」是出路不是死路**：409 的结构化 detail 必须带 `existing_id` 与两个计数；
+  `overwrite=true` **只对零隧道零实例的残留节点**生效，有隧道挂着的一律拒（且节点与隧道都还在）
+- **★ 残留空节点是同名 bug 的产物**：导入时隧道被全局重名判掉 → 只建出节点、零纳管
+  （`delete_tunnel` / `switch_instance_to_node` 会自动清理没人引用的空节点）
+
+`test_manual_node` / `test_manual_api` 里还钉了一组 DNS 同步的用例，
+设计取舍见上文「[DNS 同步](#dns-同步)」。
+
 ## 已知限制
 
 - **一个 frpc 只能连一个节点**，所以**同一个容器上的隧道必须同节点**。
@@ -681,9 +772,14 @@ PYTHONPATH=$PWD/.devdeps $PY tests/test_api.py
   `/auth/node/list` 的 `hostname` 被脱敏成空串，而 `/auth/proxy/list` 的 `nodes` 子数组
   只覆盖已经有隧道的节点。所以对一个**此前完全没用过**的新节点，程序拿不到它的地址
   → 无法做端到端探测 → 故障转移到这种节点后，验证这一步会降级为「无法验证」，
-  DNS 同步也会跳过（除非该节点上有别的隧道可供反推）。
+  这一轮的 DNS 同步也拿不到地址而跳过（除非该节点上有别的隧道可供反推）。
+  ⚠️ 这只影响 **mefrp 隧道** —— 外部节点的 `serverAddr` 就在自己库里，不查任何 API。
   这是 mefrp 侧的权限限制，不是程序缺陷。**想彻底解决就得给账号加管理员权限。**
+- **DNS 只在隧道上填了记录名时才管**（判据见上文「DNS 同步」）。记录所在的 zone 必须
+  在 API Token 的可见范围内（权限 `Zone.DNS:Edit`），否则 `resolve_zone` 找不到，
+  这一轮会如实记一条「找不到 … 所属的 Cloudflare zone」。
 - 端到端探测只能证明 **TCP 层可达**，不能证明后端服务健康。要做应用层探测得另加 HTTP 检查。
   同理，**UDP 隧道根本没有可靠的端到端探测手段**（见上文「探测模式」），只能靠 L1 + L2 判定。
+  这类隧道在 UI 上显示「在线 · 不探测」—— 是「没探」，不是「探挂了」。
 - 隧道被 mefrp 判为 `isBanned` 时不会自动处理 —— 这类问题通常需要人工去申诉，换节点也会继续被封。
 - 事件日志默认保留最近 5000 条。

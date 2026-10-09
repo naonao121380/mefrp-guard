@@ -13,7 +13,7 @@ PY="${PY:-python3}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 rc=0
-for t in test_auth test_logic test_api test_failover test_frpc_multi; do
+for t in test_auth test_logic test_manual_node test_api test_manual_api test_tags test_scope test_failover test_frpc_multi; do
   echo "=================== $t ==================="
   "$PY" "tests/$t.py" || rc=1
 done

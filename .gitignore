@@ -16,3 +16,7 @@ __pycache__/
 # 本地试跑 / 验证脚本的临时产物
 _check.js
 _shot*.js
+
+# 构建产物（镜像 tar，60+ MB）—— 走 Releases 分发，不进 git 树
+out/
+*.tar

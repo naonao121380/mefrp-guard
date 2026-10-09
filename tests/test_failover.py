@@ -97,7 +97,9 @@ class FakeMefrp:
 
 # ---------------- 假 Cloudflare ----------------
 class FakeCF:
-    def __init__(self): self.upserts = []
+    def __init__(self):
+        self.token = "fake-cf-token"   # _sync_dns 会先看「有没有配 token」
+        self.upserts = []
     async def resolve_zone(self, name):
         from app.cloudflare import Zone
         return Zone(zone_id="Z1", name="example.com")

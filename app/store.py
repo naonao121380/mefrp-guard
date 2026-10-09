@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import threading
 import time
@@ -27,8 +28,18 @@ CREATE TABLE IF NOT EXISTS settings (
 
 CREATE TABLE IF NOT EXISTS tunnels (
     id                       INTEGER PRIMARY KEY AUTOINCREMENT,
-    name                     TEXT NOT NULL UNIQUE,   -- 展示名
-    proxy_name               TEXT NOT NULL,          -- mefrp 上的隧道名（唯一标识）
+    -- 展示名。**刻意不加 UNIQUE**：隧道名的唯一性只在「同一台 frps 内」有意义，
+    -- 而展示名连那层意义都没有 —— 不同运营商（mefrp / 自建 frps / 别家服务商）
+    -- 的命名空间互不相干，重名是完全正常的。加了全局 UNIQUE 会有两个后果：
+    --   1. 导入别家的同名隧道时被迫改名成 xxx-7，看不出它原本叫什么；
+    --   2. 用户手动把名字改成已存在的那个 → 直接撞约束、接口 500。
+    -- 真正需要唯一的是 `proxy_name`，而它的作用域由 find_tunnel_by_proxy 把关。
+    name                     TEXT NOT NULL,
+    proxy_name               TEXT NOT NULL,          -- 它**在自己那台 frps 上**的隧道名
+    -- 自由标签，用来给隧道分组、筛选。空串 = 没打标签。
+    -- mefrp 纳管的隧道默认打 'mefrp'（见 _migrate 的回填与 main 里的自动打标），
+    -- 外部节点的隧道默认空串，由用户自己设（例如 '公司frps' / '临时'）。
+    tag                      TEXT NOT NULL DEFAULT '',
     proxy_type               TEXT NOT NULL DEFAULT 'tcp',
     local_ip                 TEXT NOT NULL DEFAULT '127.0.0.1',
     local_port               INTEGER NOT NULL,
@@ -40,6 +51,11 @@ CREATE TABLE IF NOT EXISTS tunnels (
     -- 这条隧道由哪个 frpc 实例承载。NULL = 还没有挂接。
     -- 解析只有这一级：不兜底、不自动发现（见 engine.frpc_for_tunnel 的说明）。
     frpc_instance_id         INTEGER,
+
+    -- 这条隧道跑在哪个**外部节点**上。NULL = 走 mefrp API 节点（老行为）。
+    -- 非 NULL 时引擎完全不碰 mefrp：不比对 proxy、不择优、**永不自动切换** ——
+    -- 因为外部节点没有 API，在它上面建不了也删不了隧道，换节点只能靠人点。
+    manual_node_id           INTEGER,
 
     current_proxy_id         INTEGER,
     current_node_id          INTEGER,
@@ -83,8 +99,38 @@ CREATE TABLE IF NOT EXISTS frpc_instances (
     restart_mode TEXT NOT NULL DEFAULT 'docker',   -- docker | none
     enabled      INTEGER NOT NULL DEFAULT 1,
     note         TEXT DEFAULT '',
+    -- 这个实例当前接在哪个**外部节点**上。NULL = 走 mefrp API（老行为）。
+    -- 非 NULL 时它的配置文件由「手动切换」维护（切换/绑定时改写），
+    -- 引擎**不会**自动改写它 —— 手工模式的语义就是手工。
+    manual_node_id INTEGER,
     created_at   INTEGER NOT NULL,
     updated_at   INTEGER NOT NULL
+);
+
+-- 外部节点：由用户粘贴的 frpc 配置导入，**与 mefrp API 节点同级**。
+--
+-- 为什么需要它：mefrp 有开放 API，节点能查、隧道能建能删，所以引擎可以自动择优、
+-- 自动故障转移。但**其它 frp 服务商和自建 frps 根本没有 API**，唯一的真相来源就是
+-- 用户手上那份 frpc 配置。导入之后它和 mefrp 节点一样出现在节点列表里，能绑 frpc
+-- 实例、能绑域名 —— 唯独**不支持自动切换**：没有 API 就没法在服务端建/删隧道，
+-- 换节点只能靠人手动点。
+--
+-- config_text 存的是**导入时的原文**。手工切换时以它为底改写 server 段，
+-- 这样用户的注释和排版不会在来回切换中被磨掉。
+CREATE TABLE IF NOT EXISTS manual_nodes (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    name          TEXT NOT NULL UNIQUE,
+    server_addr   TEXT NOT NULL,
+    server_port   INTEGER NOT NULL DEFAULT 7000,
+    auth_method   TEXT NOT NULL DEFAULT 'none',    -- token | user | none
+    auth_token    TEXT DEFAULT '',
+    auth_user     TEXT DEFAULT '',
+    config_format TEXT NOT NULL DEFAULT 'toml',    -- toml | ini
+    config_text   TEXT NOT NULL DEFAULT '',
+    note          TEXT DEFAULT '',
+    enabled       INTEGER NOT NULL DEFAULT 1,
+    created_at    INTEGER NOT NULL,
+    updated_at    INTEGER NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS events (
@@ -137,12 +183,120 @@ def _migrate() -> None:
     `CREATE TABLE IF NOT EXISTS` 对已存在的表**不会**补列，所以新增字段必须
     在这里显式 ALTER。不做这一步的话，老用户升级后 frpc_instance_id 这一列
     根本不存在，所有查询都会炸。
+
+    ⚠️ 每加一个新列都要往下面这张表里补一行，否则老库升上来会缺列。
+       判断「列在不在」用的是 PRAGMA，不是 try/except —— ALTER 失败的原因
+       很多（锁、磁盘），不能一律当成「列已存在」吞掉。
     """
     conn = _db()
-    cols = {r["name"] for r in conn.execute("PRAGMA table_info(tunnels)").fetchall()}
-    if "frpc_instance_id" not in cols:
-        conn.execute("ALTER TABLE tunnels ADD COLUMN frpc_instance_id INTEGER")
+    wanted = (
+        ("tunnels", "frpc_instance_id", "INTEGER"),
+        ("tunnels", "manual_node_id", "INTEGER"),
+        ("tunnels", "tag", "TEXT NOT NULL DEFAULT ''"),
+        ("frpc_instances", "manual_node_id", "INTEGER"),
+    )
+    for table, col, decl in wanted:
+        cols = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+        if col not in cols:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
+            conn.commit()
+            # ⚠️ 只在「这一列刚被加出来」的那一次回填。放无条件 UPDATE 的话，
+            #    用户手动把某条 mefrp 隧道的标签清空后，下次重启又会被打回
+            #    'mefrp' —— 一个静默覆盖用户设置的 bug。
+            if (table, col) == ("tunnels", "tag"):
+                conn.execute(
+                    "UPDATE tunnels SET tag = 'mefrp' "
+                    "WHERE manual_node_id IS NULL AND (tag IS NULL OR tag = '')"
+                )
+                conn.commit()
+
+    _drop_tunnels_scope_uniques(conn)
+
+
+# 隧道表上**不该有**唯一约束的两列：它们的唯一性范围是「同一台 frps 内」，
+# 而不同运营商（mefrp / 自建 frps / 别家服务商）的命名空间互不相干。
+#   · name       展示名，连作用域内的唯一性都不需要 —— 它只是个标签。
+#   · proxy_name 隧道名，唯一性由 find_tunnel_by_proxy 按作用域把关，
+#                不能靠数据库的全局 UNIQUE（那会把别家的同名隧道也挡掉）。
+_SCOPE_UNIQUE_COLUMNS = ("name", "proxy_name")
+
+
+def _tunnels_ddl(conn: sqlite3.Connection) -> str:
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'tunnels'"
+    ).fetchone()
+    return str(row["sql"] or "") if row else ""
+
+
+def _sql_code(sql: str) -> str:
+    """去掉 SQL 里的 `--` 行尾注释 —— 判断关键字时不能把注释里的字当代码。"""
+    return "\n".join(ln.split("--", 1)[0] for ln in sql.splitlines())
+
+
+def _strip_scope_uniques(ddl: str) -> tuple[str, bool]:
+    """把 name / proxy_name 上的 UNIQUE 约束摘掉（列级或表级）。返回 (新 DDL, 有没有改过)。"""
+    changed = False
+    out: list[str] = []
+    for line in ddl.splitlines():
+        code, sep, comment = line.partition("--")
+        low = code.strip().lower()
+        # 表级约束：`UNIQUE (name, proxy_name)` —— 整行丢掉。
+        if low.startswith("unique") or (low.startswith("constraint") and "unique" in low):
+            changed = True
+            continue
+        # 列级约束：`name TEXT NOT NULL UNIQUE,` —— 只抠掉 UNIQUE 这个词。
+        if any(low.startswith(c + " ") for c in _SCOPE_UNIQUE_COLUMNS) and "unique" in low:
+            code = re.sub(r"\s*\bUNIQUE\b", "", code, flags=re.I)
+            changed = True
+        out.append(code + sep + comment)
+    return "\n".join(out), changed
+
+
+def _drop_tunnels_scope_uniques(conn: sqlite3.Connection) -> None:
+    """把 tunnels 上 name / proxy_name 的**全局 UNIQUE** 去掉（整表重建）。
+
+    为什么必须去掉：隧道名的唯一性只在「同一台 frps 内」成立。mefrp 一家时
+    proxyName 天然全局唯一，所以这条约束一直没暴露问题；一旦开始纳管**别家
+    frps**（命名空间互不相干），它就变成三个实打实的故障：
+
+      · 导入别家的同名隧道被当成「已经纳管过了」，**直接吞掉**，用户导不进来；
+      · 展示名被硬改成 `xxx-7`，看不出它原本叫什么；
+      · 用户手动改成已存在的名字 → 撞约束、IntegrityError 冒到接口层变成 500。
+
+    SQLite 不支持 DROP CONSTRAINT，只能整表搬一次。⚠️ 新表的 DDL **从现有
+    sqlite_master 里读出来再摘 UNIQUE**，不另写一份 —— 这样列集合、可空性、
+    默认值都天然对齐，不会出现「新表 NOT NULL 而老数据是 NULL」这种搬不过去的
+    情况（另写一份 DDL 就踩过这个坑：老库 last_ok_at 是 NULL）。
+    """
+    ddl = _tunnels_ddl(conn)
+    if not ddl:
+        return
+    new_ddl, changed = _strip_scope_uniques(ddl)
+    if not changed:
+        return
+
+    new_ddl, n = re.subn(
+        r"^(\s*CREATE\s+TABLE\s+)(?:IF\s+NOT\s+EXISTS\s+)?[\"'`\[]?tunnels[\"'`\]]?",
+        r"\1tunnels_rebuild", new_ddl, count=1, flags=re.I | re.M)
+    if n != 1:
+        raise RuntimeError("重建 tunnels 表失败：没能把表名换成临时名")
+    if re.search(r"\bunique\b", _sql_code(new_ddl), re.I):
+        raise RuntimeError("重建 tunnels 表失败：DDL 里还残留 UNIQUE 约束")
+
+    old_cols = [r["name"] for r in conn.execute("PRAGMA table_info(tunnels)")]
+    conn.execute("DROP TABLE IF EXISTS tunnels_rebuild")   # 上次搬到一半留下的
+    conn.execute(new_ddl)
+    new_cols = [r["name"] for r in conn.execute("PRAGMA table_info(tunnels_rebuild)")]
+    if old_cols != new_cols:
+        conn.execute("DROP TABLE tunnels_rebuild")
         conn.commit()
+        raise RuntimeError(f"重建 tunnels 表失败：列对不上 {old_cols} != {new_cols}")
+
+    collist = ",".join(f'"{c}"' for c in old_cols)
+    conn.execute(f"INSERT INTO tunnels_rebuild ({collist}) SELECT {collist} FROM tunnels")
+    conn.execute("DROP TABLE tunnels")
+    conn.execute("ALTER TABLE tunnels_rebuild RENAME TO tunnels")
+    conn.commit()
 
 
 def _db() -> sqlite3.Connection:
@@ -309,8 +463,9 @@ def set_settings(items: dict[str, Any]) -> None:
 
 TUNNEL_FIELDS = (
     "name", "proxy_name", "proxy_type", "local_ip", "local_port",
+    "tag",
     "desired_remote_port", "pin_node_id", "enabled", "auto_failover",
-    "frpc_instance_id",
+    "frpc_instance_id", "manual_node_id",
     "current_proxy_id", "current_node_id", "current_remote_port",
     "dns_zone_id", "dns_record_id", "dns_record_name", "dns_proxied",
     "needs_downstream_review", "downstream_note",
@@ -323,14 +478,42 @@ TUNNEL_FIELDS = (
 )
 
 
-def list_tunnels(enabled_only: bool = False) -> list[dict[str, Any]]:
+def list_tunnels(enabled_only: bool = False,
+                 tag: str | None = None) -> list[dict[str, Any]]:
+    """列出受管隧道。
+
+    `tag` 给了就只回这个标签的（空串 = 筛「没打标签」的）；`None` = 不过滤。
+    ⚠️ 用 `tag is None` 而不是 `if tag` 判断 —— 否则「筛没标签的」这个诉求
+       会被当成「不过滤」，永远回全量。
+    """
     sql = "SELECT * FROM tunnels"
+    where: list[str] = []
+    params: list[Any] = []
     if enabled_only:
-        sql += " WHERE enabled = 1"
+        where.append("enabled = 1")
+    if tag is not None:
+        where.append("tag = ?")
+        params.append(tag)
+    if where:
+        sql += " WHERE " + " AND ".join(where)
     sql += " ORDER BY id"
     with _LOCK:
-        rows = _db().execute(sql).fetchall()
+        rows = _db().execute(sql, params).fetchall()
     return [dict(r) for r in rows]
+
+
+def list_tags() -> list[dict[str, Any]]:
+    """所有用到的标签 + 各自的隧道条数，按条数降序。
+
+    空标签（没打标签）**不返回** —— 它不是一个标签，前端用「全部」来表达。
+    """
+    with _LOCK:
+        rows = _db().execute(
+            "SELECT tag, COUNT(*) AS n FROM tunnels "
+            "WHERE tag IS NOT NULL AND tag != '' "
+            "GROUP BY tag ORDER BY n DESC, tag"
+        ).fetchall()
+    return [{"tag": str(r["tag"]), "count": int(r["n"])} for r in rows]
 
 
 def get_tunnel(tunnel_id: int) -> dict[str, Any] | None:
@@ -339,11 +522,30 @@ def get_tunnel(tunnel_id: int) -> dict[str, Any] | None:
     return dict(row) if row else None
 
 
-def find_tunnel_by_proxy(proxy_name: str) -> dict[str, Any] | None:
+def find_tunnel_by_proxy(proxy_name: str, *,
+                         manual_node_id: int | None = None) -> dict[str, Any] | None:
+    """在**同一台 frps 的作用域内**按隧道名找。
+
+    ⚠️ 隧道名的唯一性范围是「一台 frps 内」，**不是全局**：
+
+      · mefrp 的「一台 frps」= 整个 mefrp 账号 —— 运营商自己就要求 proxyName 唯一；
+      · 外部节点的「一台 frps」= 那个 manual_node。
+
+    不同运营商之间重名完全合法（各家的命名空间互不相干），所以**不能拿全局查** ——
+    否则「别家 frps 上恰好同名的隧道」会被误判成「已经纳管过了」，导入时直接被吞掉。
+
+    `manual_node_id=None` 表示 **mefrp 作用域**（外部隧道的这一列非空）。
+    刻意做成 keyword-only：调用点必须写出 `manual_node_id=...`，
+    免得有人顺手传个位置参数、把作用域搞错还不自知。
+    """
+    if manual_node_id is None:
+        sql = "SELECT * FROM tunnels WHERE proxy_name = ? AND manual_node_id IS NULL"
+        params: tuple[Any, ...] = (proxy_name,)
+    else:
+        sql = "SELECT * FROM tunnels WHERE proxy_name = ? AND manual_node_id = ?"
+        params = (proxy_name, int(manual_node_id))
     with _LOCK:
-        row = _db().execute(
-            "SELECT * FROM tunnels WHERE proxy_name = ?", (proxy_name,)
-        ).fetchone()
+        row = _db().execute(sql, params).fetchone()
     return dict(row) if row else None
 
 
@@ -388,7 +590,7 @@ def delete_tunnel(tunnel_id: int) -> None:
 # ---------------------------------------------------------------------------
 
 FRPC_FIELDS = ("name", "config_path", "container", "restart_mode",
-               "enabled", "note")
+               "enabled", "note", "manual_node_id")
 
 RESTART_MODES = ("docker", "none")
 
@@ -481,6 +683,141 @@ def unbind_tunnels_of_frpc(instance_id: int) -> int:
         cur = _db().execute(
             "UPDATE tunnels SET frpc_instance_id = NULL WHERE frpc_instance_id = ?",
             (int(instance_id),),
+        )
+        _db().commit()
+        return int(cur.rowcount or 0)
+
+
+# ---------------------------------------------------------------------------
+# 外部节点
+# ---------------------------------------------------------------------------
+
+MANUAL_NODE_FIELDS = ("name", "server_addr", "server_port", "auth_method",
+                      "auth_token", "auth_user", "config_format", "config_text",
+                      "note", "enabled")
+
+AUTH_METHODS = ("token", "user", "none")
+
+
+def list_manual_nodes(enabled_only: bool = False) -> list[dict[str, Any]]:
+    sql = "SELECT * FROM manual_nodes"
+    if enabled_only:
+        sql += " WHERE enabled = 1"
+    sql += " ORDER BY id"
+    with _LOCK:
+        rows = _db().execute(sql).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_manual_node(node_id: int) -> dict[str, Any] | None:
+    with _LOCK:
+        row = _db().execute("SELECT * FROM manual_nodes WHERE id = ?",
+                            (int(node_id),)).fetchone()
+    return dict(row) if row else None
+
+
+def get_manual_node_by_name(name: str) -> dict[str, Any] | None:
+    with _LOCK:
+        row = _db().execute("SELECT * FROM manual_nodes WHERE name = ?",
+                            (name,)).fetchone()
+    return dict(row) if row else None
+
+
+def find_manual_node_by_addr(addr: str, port: int) -> dict[str, Any] | None:
+    """按地址+端口找。导入时用它提示「这个节点已经导过了」。"""
+    with _LOCK:
+        row = _db().execute(
+            "SELECT * FROM manual_nodes WHERE server_addr = ? AND server_port = ?",
+            (str(addr), int(port)),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def create_manual_node(data: dict[str, Any]) -> int:
+    now = int(time.time())
+    cols = [f for f in MANUAL_NODE_FIELDS if f in data]
+    vals = [data[f] for f in cols]
+    cols += ["created_at", "updated_at"]
+    vals += [now, now]
+    placeholders = ",".join("?" for _ in cols)
+    with _LOCK:
+        cur = _db().execute(
+            f"INSERT INTO manual_nodes({','.join(cols)}) VALUES ({placeholders})", vals
+        )
+        _db().commit()
+        return int(cur.lastrowid)
+
+
+def update_manual_node(node_id: int, data: dict[str, Any]) -> None:
+    cols = [f for f in MANUAL_NODE_FIELDS if f in data]
+    if not cols:
+        return
+    sets = ",".join(f"{c} = ?" for c in cols)
+    vals = [data[c] for c in cols]
+    vals.append(int(time.time()))
+    with _LOCK:
+        _db().execute(
+            f"UPDATE manual_nodes SET {sets}, updated_at = ? WHERE id = ?",
+            vals + [int(node_id)],
+        )
+        _db().commit()
+
+
+def delete_manual_node(node_id: int) -> None:
+    """删节点。**不动隧道和实例记录** —— 解绑由调用方决定，见 unbind_* 两个函数。"""
+    with _LOCK:
+        _db().execute("DELETE FROM manual_nodes WHERE id = ?", (int(node_id),))
+        _db().commit()
+
+
+def list_tunnels_of_manual_node(node_id: int) -> list[dict[str, Any]]:
+    with _LOCK:
+        rows = _db().execute(
+            "SELECT * FROM tunnels WHERE manual_node_id = ? ORDER BY id",
+            (int(node_id),),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def count_tunnels_of_manual_node(node_id: int) -> int:
+    with _LOCK:
+        row = _db().execute(
+            "SELECT COUNT(*) AS n FROM tunnels WHERE manual_node_id = ?",
+            (int(node_id),),
+        ).fetchone()
+    return int(row["n"]) if row else 0
+
+
+def list_instances_of_manual_node(node_id: int) -> list[dict[str, Any]]:
+    with _LOCK:
+        rows = _db().execute(
+            "SELECT * FROM frpc_instances WHERE manual_node_id = ? ORDER BY id",
+            (int(node_id),),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def unbind_tunnels_of_manual_node(node_id: int) -> int:
+    """把挂在某外部节点上的隧道全部解绑（同时关掉它们的自动切换标记）。
+
+    ⚠️ 删节点前必须调用。留着 manual_node_id 指向一个不存在的节点，下一轮
+       引擎就会拿着一份空节点去探测，把健康隧道判成故障。
+    """
+    with _LOCK:
+        cur = _db().execute(
+            "UPDATE tunnels SET manual_node_id = NULL WHERE manual_node_id = ?",
+            (int(node_id),),
+        )
+        _db().commit()
+        return int(cur.rowcount or 0)
+
+
+def unbind_instances_of_manual_node(node_id: int) -> int:
+    """把指向某外部节点的 frpc 实例解绑（回到 mefrp API 模式）。"""
+    with _LOCK:
+        cur = _db().execute(
+            "UPDATE frpc_instances SET manual_node_id = NULL WHERE manual_node_id = ?",
+            (int(node_id),),
         )
         _db().commit()
         return int(cur.rowcount or 0)
