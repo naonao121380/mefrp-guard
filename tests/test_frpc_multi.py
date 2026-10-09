@@ -100,7 +100,7 @@ class FakeMefrp:
         return ps, brief
 
     async def user_info(self):
-        return UserInfo(username="naonao", group="default",
+        return UserInfo(username="demo", group="default",
                         friendly_group="正式用户", max_proxies=10,
                         used_proxies=len(self.proxies))
 
@@ -132,7 +132,7 @@ class FakeMefrp:
         lp = p.local_port if p else 0
         # 官方配置用 TOML 单引号字面量，这里保持一致
         return (f"serverAddr = '{node}'\nserverPort = 7000\nauth.method = 'token'\n"
-                f"auth.token = 'tk'\nuser = 'naonao'\n\n[[proxies]]\nname = '{name}'\n"
+                f"auth.token = 'tk'\nuser = 'demo'\n\n[[proxies]]\nname = '{name}'\n"
                 f"type = 'tcp'\nlocalIP = '127.0.0.1'\nlocalPort = {lp}\n"
                 f"remotePort = {port}\n")
 
@@ -241,7 +241,7 @@ store.update_tunnel(tD, {"current_proxy_id": pid_d})
 
 # 模拟「用户手上本来就有一份能跑的 frpcB.toml」，里面写着 disc-panel
 pathlib.Path(CFG_B).write_text(
-    "serverAddr = '10.0.0.5'\nserverPort = 7000\nuser = 'naonao'\n\n"
+    "serverAddr = '10.0.0.5'\nserverPort = 7000\nuser = 'demo'\n\n"
     "[[proxies]]\nname = 'disc-panel'\ntype = 'tcp'\n"
     "localIP = '127.0.0.1'\nlocalPort = 6000\nremotePort = 41237\n",
     encoding="utf-8")

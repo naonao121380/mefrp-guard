@@ -111,7 +111,7 @@ remotePort = 16080
 TOML_LEGACY = '''server_addr = "5.6.7.8"
 server_port = 7100
 token = "legacy-tok"
-user = "naonao"
+user = "demo"
 
 [[proxies]]
 name = "git"
@@ -211,7 +211,7 @@ p = frpcparse.parse(TOML_LEGACY)
 check("下划线键名 server_addr 能识别", p.server_addr == "5.6.7.8", p.server_addr)
 check("server_port 能识别", p.server_port == 7100, p.server_port)
 check("顶层 token 能识别", p.auth_token == "legacy-tok", p.auth_token)
-check("顶层 user 能识别", p.auth_user == "naonao", p.auth_user)
+check("顶层 user 能识别", p.auth_user == "demo", p.auth_user)
 check("单条隧道解析出来", len(p.proxies) == 1, [x.name for x in p.proxies])
 
 print("  --- ★ 把 [[proxies]] 写成 [proxies]（少一对方括号）---")

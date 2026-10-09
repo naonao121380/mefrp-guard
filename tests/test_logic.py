@@ -68,7 +68,7 @@ CONF_A = '''serverAddr = "1.2.3.4"
 serverPort = 7000
 auth.method = "token"
 auth.token = "abcdef"
-user = "naonao"
+user = "demo"
 
 [[proxies]]
 name = "nas-panel"

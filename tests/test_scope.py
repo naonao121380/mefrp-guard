@@ -362,9 +362,9 @@ CREATE TABLE sessions (
 );
 INSERT INTO tunnels (id,name,proxy_name,local_port,current_remote_port,
                      created_at,updated_at)
-    VALUES (2,'ikuai_ovpn','ikuai_ovpn',58002,48518,1,1);
+    VALUES (2,'demo_tunnel','demo_tunnel',58002,48518,1,1);
 INSERT INTO tunnels (id,name,proxy_name,local_port,created_at,updated_at)
-    VALUES (3,'39KTO11_rdp','39KTO11_rdp',57111,1,1);
+    VALUES (3,'demo-rdp','demo-rdp',57111,1,1);
 INSERT INTO frpc_instances (id,name,config_path,created_at,updated_at)
     VALUES (1,'默认','/frpc/a/frpc.toml',1,1);
 """
@@ -403,10 +403,10 @@ print("ROW2_MANUAL", rows[0]["manual_node_id"])
 print("BACKFILL", sum(1 for r in rows if r["tag"] == "mefrp"))
 # 摘掉 UNIQUE 之后，两条同名都能插
 conn.execute("INSERT INTO tunnels (name,proxy_name,local_port,created_at,updated_at)"
-             " VALUES ('ikuai_ovpn','ikuai_ovpn',58002,1,1)")
+             " VALUES ('demo_tunnel','demo_tunnel',58002,1,1)")
 conn.commit()
 print("DUP_OK", conn.execute(
-    "SELECT COUNT(*) AS n FROM tunnels WHERE name='ikuai_ovpn'").fetchone()["n"])
+    "SELECT COUNT(*) AS n FROM tunnels WHERE name='demo_tunnel'").fetchone()["n"])
 # 主键序列不能被重建搞坏（否则下一条新隧道会撞 id）
 cur = conn.execute("INSERT INTO tunnels (name,proxy_name,local_port,created_at,updated_at)"
                    " VALUES ('新的','brand-new',1234,1,1)")
@@ -431,7 +431,7 @@ check("★ 补上了 frpc_instances.manual_node_id", o2.get("INST_MANUAL") == "T
 check("★ manual_nodes 表被建出来", o2.get("MANUAL_TABLE") == "True", o2)
 check("★ 两条老隧道都在", o2.get("N_ROWS") == "2", o2)
 check("★ 老行逐字段原样保留",
-      o2.get("ROW2", "") == "2 ikuai_ovpn ikuai_ovpn 58002 48518 mefrp", o2)
+      o2.get("ROW2", "") == "2 demo_tunnel demo_tunnel 58002 48518 mefrp", o2)
 check("★ 老库里的隧道被回填成 mefrp 标签", o2.get("BACKFILL") == "2", o2)
 check("★ 老行的 manual_node_id 保持 NULL", o2.get("ROW2_MANUAL") == "None", o2)
 check("★ 升级后能插同名（原来会 IntegrityError）", o2.get("DUP_OK") == "2", o2)

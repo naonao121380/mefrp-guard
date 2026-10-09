@@ -74,7 +74,7 @@ class FakeMefrp:
         return (list(self._proxies), brief)
     async def user_info(self):
         from app.mefrp import UserInfo
-        return UserInfo(username="naonao12138", group="default",
+        return UserInfo(username="demo-user", group="default",
                         friendly_group="正式用户", max_proxies=10, used_proxies=2)
     async def proxy_create(self, *, node_id, proxy_name, local_ip, local_port,
                            proxy_type="tcp", remote_port=None, **kw):
@@ -94,7 +94,7 @@ class FakeMefrp:
         #   原正则只认双引号，会把引号一起吃进捕获组，导致同一地址被误判为跨节点。
         node = {111: NODE_ADDR[5], 222: NODE_ADDR[9]}.get(pid, NODE_ADDR[9])
         return (f"serverAddr = '{node}'\nserverPort = 7000\nauth.method = 'token'\n"
-                f"auth.token = 'tk'\nuser = 'naonao'\n\n[[proxies]]\nname = 'nas-panel'\n"
+                f"auth.token = 'tk'\nuser = 'demo'\n\n[[proxies]]\nname = 'nas-panel'\n"
                 f"type = 'tcp'\nlocalIP = '127.0.0.1'\nlocalPort = 5000\nremotePort = 41234\n")
 
 # ---------------- 假 Cloudflare ----------------
