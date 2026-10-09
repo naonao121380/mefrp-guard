@@ -1,0 +1,13 @@
+# 统一换行符 —— 仓库里一律 LF。
+# 这些脚本要跑在 Linux 容器里，CRLF 会让 `#!/bin/sh` 直接报错。
+* text=auto eol=lf
+
+# 二进制，别做任何转换
+*.ico binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.woff binary
+*.woff2 binary
+*.db binary

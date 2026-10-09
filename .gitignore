@@ -1,0 +1,18 @@
+# 运行时数据（状态库、事件日志、frpc 配置备份）—— 绝不能提交
+data/
+*.db
+*.db-wal
+*.db-shm
+
+# 密钥
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.devdeps/
+
+# 本地试跑 / 验证脚本的临时产物
+_check.js
+_shot*.js

@@ -1,0 +1,13 @@
+# 构建上下文里不需要的东西
+.git
+.gitignore
+.env
+data/
+tests/
+.devdeps/
+__pycache__/
+*.pyc
+*.pyo
+*.md
+_check.js
+_shot*.js

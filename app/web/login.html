@@ -1,0 +1,175 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>登录 · mefrp-guard</title>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<style>
+:root{
+  --bg:#1A1A19; --surface:#232322; --surface2:#2C2C2A; --border:#3A3A38;
+  --text:#E8E6E0; --muted:#B4B2A9; --dim:#888780;
+  --teal:#5DCAA5; --teal-bg:#085041; --blue:#85B7EB; --blue-bg:#0C447C;
+  --red:#E24B4A; --red-bg:#501313; --amber:#EF9F27; --amber-bg:#412402;
+  --mono:"SF Mono",Menlo,Consolas,"Liberation Mono",monospace;
+}
+*{box-sizing:border-box}
+body{
+  margin:0;min-height:100vh;background:var(--bg);color:var(--text);
+  font:14px/1.65 "PingFang SC","Microsoft YaHei",system-ui,-apple-system,"Segoe UI",sans-serif;
+  display:flex;align-items:center;justify-content:center;padding:24px;
+}
+.box{width:100%;max-width:352px}
+.brand{text-align:center;margin-bottom:22px}
+.brand .mark{
+  width:42px;height:42px;margin:0 auto 12px;border-radius:11px;
+  background:var(--teal-bg);border:1px solid var(--teal);
+  display:flex;align-items:center;justify-content:center;
+  color:var(--teal);font-size:19px;font-weight:500;font-family:var(--mono);
+}
+.brand h1{font-size:17px;font-weight:500;margin:0 0 3px;letter-spacing:-.2px}
+.brand p{margin:0;color:var(--dim);font-size:12px}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:13px;padding:20px 20px 22px}
+label{display:block;font-size:12px;color:var(--muted);margin:0 0 6px}
+input{
+  width:100%;background:var(--bg);border:1px solid var(--border);color:var(--text);
+  border-radius:8px;padding:10px 12px;font-size:14px;font-family:inherit;margin-bottom:15px;
+}
+input:focus{outline:none;border-color:var(--blue)}
+input:disabled{opacity:.5}
+button{
+  width:100%;background:var(--blue-bg);border:1px solid var(--blue);color:#B5D4F4;
+  padding:10px 14px;border-radius:8px;font-size:14px;font-family:inherit;cursor:pointer;
+}
+button:hover:not(:disabled){filter:brightness(1.15)}
+button:disabled{opacity:.5;cursor:not-allowed}
+.msg{
+  border-radius:9px;padding:10px 13px;font-size:12px;margin-bottom:15px;display:none;
+  border:1px solid var(--border);border-left-width:2px;
+}
+.msg.on{display:block}
+.msg.err{background:var(--red-bg);border-left-color:var(--red);color:#F09595}
+.msg.warn{background:var(--amber-bg);border-left-color:var(--amber);color:#FAC775}
+.msg.info{background:var(--blue-bg);border-left-color:var(--blue);color:#B5D4F4}
+.foot{margin-top:16px;text-align:center;color:var(--dim);font-size:11px;line-height:1.9}
+.foot code{font-family:var(--mono);color:var(--muted);background:var(--surface2);padding:1px 5px;border-radius:4px}
+.hint{margin-top:13px;font-size:11px;color:var(--dim);line-height:1.8}
+</style>
+</head>
+<body>
+<div class="box">
+  <div class="brand">
+    <div class="mark">MG</div>
+    <h1>mefrp-guard</h1>
+    <p>隧道自愈守护</p>
+  </div>
+
+  <div class="card">
+    <div id="msg" class="msg"></div>
+    <form id="form" autocomplete="on">
+      <label for="u">用户名</label>
+      <input id="u" name="username" autocomplete="username" autocapitalize="off" spellcheck="false" required>
+      <label for="p">密码</label>
+      <input id="p" name="password" type="password" autocomplete="current-password" required>
+      <button id="btn" type="submit">登 录</button>
+    </form>
+    <div id="hint" class="hint"></div>
+  </div>
+
+  <div class="foot">
+    未认证的请求一律返回 <code>401</code> · 会话保存在 HttpOnly Cookie 里
+  </div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const msgEl = $('msg'), btn = $('btn'), form = $('form');
+
+function show(kind, text){
+  msgEl.className = 'msg on ' + kind;
+  msgEl.textContent = text;
+}
+function hide(){ msgEl.className = 'msg'; msgEl.textContent = ''; }
+
+// 锁定倒计时：服务端返回 429 + Retry-After，这里把剩余秒数走完再放开按钮。
+// 纯前端倒计时，不做任何安全判断 —— 真正的闸门在服务端。
+let lockTimer = null;
+function startLockout(seconds, reason){
+  let left = Math.max(1, parseInt(seconds, 10) || 60);
+  $('u').disabled = $('p').disabled = btn.disabled = true;
+  const tick = () => {
+    if(left <= 0){
+      clearInterval(lockTimer);
+      $('u').disabled = $('p').disabled = btn.disabled = false;
+      btn.textContent = '登 录';
+      show('warn', reason + ' 现在可以重试了。');
+      return;
+    }
+    show('err', `${reason}（${left} 秒后可重试）`);
+    btn.textContent = `已锁定 ${left}s`;
+    left -= 1;
+  };
+  tick();
+  lockTimer = setInterval(tick, 1000);
+}
+
+// 从 URL 读 ?next=，登录成功后跳回去。只接受站内相对路径 —— 
+// 否则就成了开放重定向（钓鱼常用手法）。
+function nextTarget(){
+  const raw = new URLSearchParams(location.search).get('next') || '/';
+  return (raw.startsWith('/') && !raw.startsWith('//')) ? raw : '/';
+}
+
+form.addEventListener('submit', async ev => {
+  ev.preventDefault();
+  hide();
+  btn.disabled = true;
+  btn.textContent = '登录中…';
+  try{
+    const r = await fetch('/api/auth/login', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      credentials: 'same-origin',
+      body: JSON.stringify({username: $('u').value, password: $('p').value}),
+    });
+    let data = {};
+    try{ data = await r.json(); }catch(e){}
+
+    if(r.ok){
+      btn.textContent = '成功，跳转中…';
+      location.replace(nextTarget());
+      return;
+    }
+    if(r.status === 429){
+      startLockout(r.headers.get('Retry-After'), data.detail || '登录失败次数过多');
+      return;
+    }
+    show('err', data.detail || `登录失败（HTTP ${r.status}）`);
+    $('p').value = '';
+    $('p').focus();
+  }catch(e){
+    show('err', '网络错误：' + e.message);
+  }
+  btn.disabled = false;
+  btn.textContent = '登 录';
+});
+
+// 如果已经有有效会话，就不用再登一次 —— 直接进主页。
+// 用 /api/auth/me 判断：它未登录时返回 200 + authenticated:false（不抛 401），
+// 所以这里不会在控制台刷出红色报错。
+(async () => {
+  try{
+    const r = await fetch('/api/auth/me', {credentials:'same-origin'});
+    const d = await r.json();
+    if(d && d.authenticated === true){
+      location.replace(nextTarget());
+      return;
+    }
+    if(d && d.username) $('u').value = d.username;
+  }catch(e){}
+  if(!$('u').value) $('u').value = 'admin';
+  $('p').focus();
+})();
+</script>
+</body>
+</html>

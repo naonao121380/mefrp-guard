@@ -1,0 +1,1043 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>mefrp-guard · 隧道自愈</title>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<style>
+:root{
+  --bg:#1A1A19; --surface:#232322; --surface2:#2C2C2A; --border:#3A3A38;
+  --text:#E8E6E0; --muted:#B4B2A9; --dim:#888780;
+  --teal:#5DCAA5; --teal-bg:#085041; --blue:#85B7EB; --blue-bg:#0C447C;
+  --red:#E24B4A; --red-bg:#501313; --amber:#EF9F27; --amber-bg:#412402;
+  --purple:#AFA9EC;
+  --mono:"SF Mono",Menlo,Consolas,"Liberation Mono",monospace;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font:14px/1.65 "PingFang SC","Microsoft YaHei",system-ui,-apple-system,"Segoe UI",sans-serif}
+.wrap{max-width:1100px;margin:0 auto;padding:28px 22px 70px}
+.topbar{display:flex;justify-content:space-between;align-items:flex-start;gap:16px;flex-wrap:wrap}
+.who{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--muted);padding-top:4px}
+.who .avatar{width:24px;height:24px;border-radius:50%;background:var(--teal-bg);border:1px solid var(--teal);color:var(--teal);display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:500;font-family:var(--mono)}
+h1{font-size:21px;font-weight:500;margin:0 0 4px;letter-spacing:-.2px}
+.sub{color:var(--dim);font-size:12px;margin:0 0 20px}
+h2{font-size:15px;font-weight:500;margin:26px 0 12px}
+h3{font-size:13px;font-weight:500;margin:18px 0 8px;color:var(--muted)}
+nav{display:flex;gap:4px;border-bottom:1px solid var(--border);margin-bottom:22px;flex-wrap:wrap}
+nav button{background:none;border:none;color:var(--muted);padding:9px 15px;cursor:pointer;font-size:13px;font-family:inherit;border-bottom:2px solid transparent}
+nav button:hover{color:var(--text)}
+nav button.on{color:var(--teal);border-bottom-color:var(--teal)}
+section{display:none}
+section.on{display:block}
+.cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(232px,1fr));gap:12px}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:14px 16px}
+.card .n{font-size:21px;font-weight:500;line-height:1.25}
+.card .l{font-size:12px;color:var(--dim);margin-top:4px}
+.tun{background:var(--surface);border:1px solid var(--border);border-left-width:3px;border-radius:12px;padding:14px 16px;margin-bottom:12px}
+.tun.ok{border-left-color:var(--teal)}
+.tun.bad{border-left-color:var(--red)}
+.tun.warn{border-left-color:var(--amber)}
+.tun.idle{border-left-color:var(--dim)}
+.tun .head{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;flex-wrap:wrap}
+.tun .name{font-size:15px;font-weight:500}
+.tun .meta{color:var(--dim);font-size:12px;margin-top:3px}
+.kv{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:8px 18px;margin-top:12px;font-size:12px}
+/* min-width:0 是必须的 —— grid item 默认 min-width:auto，会被长内容（比如
+   tunnel-01.abcdefgh.dyndns.org 这种域名）撑破列宽，文字直接压到右边一列上。
+   overflow-wrap 再兜一层，保证超长串能在格子内断行而不是溢出去。 */
+.kv div{min-width:0}
+.kv div span{color:var(--dim);display:block;font-size:11px}
+.kv div b{font-weight:500;color:var(--text);font-family:var(--mono);font-size:12px;
+  overflow-wrap:anywhere;word-break:break-word}
+.pill{display:inline-block;padding:2px 9px;border-radius:20px;font-size:11px;white-space:nowrap}
+.pill.ok{background:var(--teal-bg);color:#9FE1CB}
+.pill.bad{background:var(--red-bg);color:#F09595}
+.pill.warn{background:var(--amber-bg);color:#FAC775}
+.pill.idle{background:var(--surface2);color:var(--muted)}
+.pill.info{background:var(--blue-bg);color:#B5D4F4}
+button.act{background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:5px 12px;border-radius:7px;font-size:12px;cursor:pointer;font-family:inherit}
+button.act:hover{border-color:var(--muted)}
+button.act.pri{background:var(--blue-bg);border-color:var(--blue);color:#B5D4F4}
+button.act.danger{border-color:#6b2b2b;color:#F09595}
+button.act:disabled{opacity:.45;cursor:not-allowed}
+/* 节点偏好：有序多选的「标签」列表。序号就是优先级，所以把数字显式画出来。 */
+.chips{display:flex;gap:6px;flex-wrap:wrap;align-items:center;min-height:30px}
+.chip{display:inline-flex;align-items:center;gap:1px;background:var(--teal-bg);border:1px solid var(--teal);
+  color:#9FE1CB;border-radius:20px;padding:3px 7px 3px 11px;font-size:12px}
+.chip b{font-weight:500;color:var(--teal);font-family:var(--mono);margin-right:5px}
+.chip button{background:none;border:none;color:#9FE1CB;cursor:pointer;font-size:12px;padding:0 3px;font-family:inherit;line-height:1}
+.chip button:hover{color:#fff}
+.chip button:disabled{opacity:.3;cursor:not-allowed}
+.actions{display:flex;gap:6px;flex-wrap:wrap;margin-top:12px}
+table{width:100%;border-collapse:collapse;font-size:12px}
+th{text-align:left;color:var(--dim);font-weight:400;padding:7px 9px;border-bottom:1px solid var(--border);white-space:nowrap}
+td{padding:7px 9px;border-bottom:1px solid #2E2E2C;vertical-align:middle}
+tr:last-child td{border-bottom:none}
+td.mono{font-family:var(--mono);font-size:11px}
+.note{background:var(--surface);border:1px solid var(--border);border-left:2px solid var(--amber);border-radius:10px;padding:13px 16px;margin:14px 0;font-size:12px;color:var(--muted)}
+.note.bad{border-left-color:var(--red)}
+.note b{color:var(--text);font-weight:500}
+.alert{background:var(--red-bg);border:1px solid #6b2b2b;border-radius:10px;padding:14px 16px;margin-bottom:16px}
+.alert h3{margin:0 0 8px;color:#F09595;font-size:13px}
+.alert ul{margin:6px 0 0;padding-left:18px}
+.alert li{margin:5px 0;color:#F09595;font-size:12px}
+label{display:block;font-size:12px;color:var(--muted);margin:12px 0 5px}
+input,select,textarea{width:100%;background:var(--bg);border:1px solid var(--border);color:var(--text);border-radius:7px;padding:8px 10px;font-size:13px;font-family:inherit}
+input:focus,select:focus,textarea:focus{outline:none;border-color:var(--blue)}
+textarea{font-family:var(--mono);font-size:11.5px;min-height:170px;resize:vertical}
+.row{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+.row3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:14px}
+.chk{display:flex;align-items:center;gap:8px;margin:12px 0}
+.chk input{width:auto}
+pre{background:var(--bg);border:1px solid var(--border);border-radius:9px;padding:13px;overflow:auto;font-size:11.5px;max-height:420px;color:var(--muted);margin:0}
+.log{font-family:var(--mono);font-size:11.5px;line-height:1.75;background:var(--bg);border:1px solid var(--border);border-radius:9px;padding:12px;max-height:480px;overflow:auto}
+.log div{padding:3px 0;border-bottom:1px solid #262624;display:flex;gap:10px}
+.log div:last-child{border-bottom:none}
+.log .t{color:var(--dim);white-space:nowrap}
+.log .k{white-space:nowrap;width:76px}
+.log .info .k{color:var(--blue)}.log .success .k{color:var(--teal)}
+.log .warn .k{color:var(--amber)}.log .error .k{color:var(--red)}
+.log .m{flex:1;color:var(--muted);word-break:break-word}
+.muted{color:var(--dim);font-size:12px}
+.flex{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+.sp{flex:1}
+dialog{background:var(--surface);color:var(--text);border:1px solid var(--border);border-radius:14px;padding:22px;max-width:620px;width:92%}
+dialog::backdrop{background:rgba(0,0,0,.62)}
+dialog h3{margin-top:0;color:var(--text);font-size:15px}
+@media(max-width:640px){.row,.row3{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="topbar">
+    <div>
+      <h1>mefrp-guard</h1>
+      <p class="sub" id="sub">隧道自愈守护 · 加载中…</p>
+    </div>
+    <div class="who" id="who"></div>
+  </div>
+
+  <div id="alert"></div>
+
+  <nav>
+    <button class="on" data-tab="overview">总览</button>
+    <button data-tab="tunnels">隧道</button>
+    <button data-tab="nodes">节点</button>
+    <button data-tab="frpc">frpc</button>
+    <button data-tab="events">事件</button>
+    <button data-tab="settings">设置</button>
+  </nav>
+
+  <section id="overview" class="on">
+    <div class="cards" id="statCards"></div>
+    <h2>受管隧道</h2>
+    <div id="tunnelList"></div>
+  </section>
+
+  <section id="tunnels">
+    <div class="flex"><h2 style="margin:0">受管隧道</h2><div class="sp"></div>
+      <button class="act pri" onclick="openTunnelDialog()">新增隧道</button>
+      <button class="act" onclick="loadTunnels()">刷新</button></div>
+    <div id="tunnelManage" style="margin-top:14px"></div>
+
+    <h2>mefrp 上未纳管的隧道</h2>
+    <p class="muted">这些隧道存在于你的 mefrp 账号里，但还没有被本程序管理。可以点「纳管」把它绑到一条记录上。</p>
+    <div id="orphans"></div>
+  </section>
+
+  <section id="nodes">
+    <div class="flex"><h2 style="margin:0">节点</h2><div class="sp"></div>
+      <span class="muted" id="groupInfo"></span>
+      <button class="act" onclick="refreshNodes()">重新拉取</button></div>
+    <p class="muted" id="pickRule"></p>
+    <div id="nodeList" style="margin-top:12px"></div>
+  </section>
+
+  <section id="frpc">
+    <div class="flex"><h2 style="margin:0">frpc 实例</h2><div class="sp"></div>
+      <button class="act" onclick="discoverFrpc()">自动发现绑定</button>
+      <button class="act pri" onclick="openFrpcDialog()">新增实例</button>
+      <button class="act" onclick="loadFrpc()">刷新</button></div>
+    <p class="muted">一个 frpc 进程只能连一个节点，所以 <b>同一个实例承载的隧道必须落在同一个节点上</b>。
+      自动切换时，该实例的<b>全部隧道会一起搬到新节点</b>，然后只重启它自己的容器 —— 其它实例完全不受影响。</p>
+    <div id="frpcUnbound"></div>
+    <div id="frpcList" style="margin-top:14px"></div>
+    <div id="frpcDetail"></div>
+  </section>
+
+  <section id="events">
+    <div class="flex"><h2 style="margin:0">事件日志</h2><div class="sp"></div>
+      <button class="act" onclick="loadEvents()">刷新</button></div>
+    <div class="log" id="eventLog" style="margin-top:14px"></div>
+  </section>
+
+  <section id="settings">
+    <h2>凭据</h2>
+    <div class="note">密钥留空表示不修改。填了就点右边的测试按钮验证一下。</div>
+    <label>mefrp 访问 Token（mefrp.com → 用户设置 → 访问 Token）</label>
+    <div class="flex"><input id="s_mefrp_token" placeholder="留空 = 不修改"><button class="act" onclick="testMefrp()">测试</button></div>
+    <label>Cloudflare API Token（权限需要 Zone.DNS:Edit）</label>
+    <div class="flex"><input id="s_cf_api_token" placeholder="留空 = 不修改"><button class="act" onclick="testCf()">测试</button></div>
+    <label>Gotify 地址</label>
+    <input id="s_gotify_url" placeholder="http://192.168.1.10:8080">
+    <label>Gotify App Token</label>
+    <div class="flex"><input id="s_gotify_token" placeholder="留空 = 不修改"><button class="act" onclick="testGotify(false)">测试</button><button class="act" onclick="testGotify(true)">发条测试消息</button></div>
+
+    <h2>引擎节奏</h2>
+    <div class="row3">
+      <div><label>主循环间隔（秒）</label><input id="s_engine_interval" type="number" min="5"></div>
+      <div><label>端到端探测间隔（秒）</label><input id="s_probe_interval" type="number" min="10"></div>
+      <div><label>TCP 探测超时（秒）</label><input id="s_probe_timeout" type="number" min="1"></div>
+    </div>
+    <label>端到端探测模式</label>
+    <select id="s_probe_mode">
+      <option value="auto">自动（推荐）—— TCP 隧道做 TCP 探测，UDP 隧道跳过</option>
+      <option value="tcp">强制 TCP —— 所有隧道都用 TCP 探测</option>
+      <option value="none">关闭 —— 只用 mefrp 状态 + 节点状态判定</option>
+    </select>
+    <div class="note">UDP 隧道在节点上监听的是 UDP 端口，<b>没有 TCP 监听</b>，用 TCP 去探必然失败。选「强制 TCP」会让健康的 UDP 隧道被反复判定为故障、<b>触发无意义的切换</b>，除非你清楚后果，否则保持「自动」。</div>
+    <div class="row3">
+      <div><label>连续失败几次才切换</label><input id="s_fail_threshold" type="number" min="1"></div>
+      <div><label>切换后冷却（秒）</label><input id="s_failover_cooldown" type="number" min="0"></div>
+      <div><label>节点冷却（秒）</label><input id="s_node_cooldown" type="number" min="0"></div>
+    </div>
+
+    <h2>节点择优</h2>
+    <div class="row3">
+      <div><label>最低带宽（Mbps）</label><input id="s_min_bandwidth_mbps" type="number" min="0"></div>
+      <div><label>最高负载（%）</label><input id="s_max_load_percent" type="number" min="1" max="100"></div>
+      <div><label>允许区域（逗号分隔）</label><input id="s_allow_regions" placeholder="cn"></div>
+    </div>
+    <h2>节点偏好</h2>
+    <div class="note">按<b>节点名称里包含的字</b>排序（包含匹配，不是相等）—— mefrp 节点名形如「北京BGP-1」，填「北京」两个字就够。
+      <b>靠上的优先</b>：填了「北京」和「上海」时，北京的所有节点排在上海之前。
+      一个都没命中的节点排在最后，但<b>仍会被选中</b> —— 偏好是排序，不是筛选。
+      匹配范围：节点名称 + 描述 + 区域。</div>
+    <div id="prefChips" class="chips"></div>
+    <div class="flex" style="margin-top:9px">
+      <input id="prefNew" placeholder="加一个，比如 北京 / 上海 / 广州" style="max-width:290px" onkeydown="if(event.key==='Enter'){event.preventDefault();addPref();}">
+      <button class="act" onclick="addPref()">添加</button>
+      <button class="act" onclick="resetPref()">恢复默认（北京）</button>
+    </div>
+    <div id="prefPreview" class="muted" style="margin-top:10px;line-height:1.9"></div>
+    <input type="hidden" id="s_prefer_keywords">
+
+    <h2>行为开关</h2>
+    <div class="chk"><input type="checkbox" id="s_auto_failover"><label for="s_auto_failover" style="margin:0">允许自动故障转移</label></div>
+    <div class="chk"><input type="checkbox" id="s_auto_dns_sync"><label for="s_auto_dns_sync" style="margin:0">自动纠正漂移的 DNS 记录</label></div>
+    <div class="chk"><input type="checkbox" id="s_auto_restart_frpc"><label for="s_auto_restart_frpc" style="margin:0">配置变化后自动重启 frpc</label></div>
+    <div class="chk"><input type="checkbox" id="s_notify_on_probe_fail"><label for="s_notify_on_probe_fail" style="margin:0">未达阈值也推送探测失败（会比较吵）</label></div>
+
+    <div class="flex" style="margin-top:22px"><button class="act pri" onclick="saveSettings()">保存设置</button></div>
+
+    <h2>账号安全</h2>
+    <div id="pwdWarn"></div>
+    <div class="note">改用户名或密码<b>需要先输入当前密码</b>。改完后，其他设备上的登录会<b>全部失效</b>，需要重新登录 —— 这是有意的，否则旧密码泄露期间建立的会话在改密码后依然有效。</div>
+    <div class="row3">
+      <div><label>用户名（留空 = 不改）</label><input id="pw_user" autocomplete="username" placeholder="admin"></div>
+      <div><label>当前密码</label><input id="pw_cur" type="password" autocomplete="current-password"></div>
+      <div><label>新密码（至少 8 位）</label><input id="pw_new" type="password" autocomplete="new-password"></div>
+    </div>
+    <div class="row3">
+      <div><label>确认新密码</label><input id="pw_new2" type="password" autocomplete="new-password"></div>
+      <div><label>会话有效期（小时）</label><input id="s_session_ttl_hours" type="number" min="1" max="8760"></div>
+      <div><label>登录失败锁定（秒）</label><input id="s_login_lockout_seconds" type="number" min="0" max="86400"></div>
+    </div>
+    <div class="row3">
+      <div><label>连续失败几次锁定</label><input id="s_login_max_attempts" type="number" min="1" max="100"></div>
+      <div></div><div></div>
+    </div>
+    <div class="flex" style="margin-top:6px">
+      <button class="act pri" onclick="changePassword()">修改凭据</button>
+      <button class="act danger" onclick="logout()">退出登录</button>
+    </div>
+  </section>
+</div>
+
+<dialog id="tunDlg">
+  <h3 id="tunDlgTitle">新增隧道</h3>
+  <input type="hidden" id="f_id">
+  <div class="row">
+    <div><label>显示名</label><input id="f_name" placeholder="例如 NAS 面板"></div>
+    <div><label>mefrp 隧道名（proxyName）</label><input id="f_proxy_name" placeholder="例如 nas-panel"></div>
+  </div>
+  <div class="row3">
+    <div><label>类型</label><select id="f_proxy_type"><option value="tcp">TCP</option><option value="udp">UDP</option><option value="http">HTTP</option><option value="https">HTTPS</option></select></div>
+    <div><label>本地 IP</label><input id="f_local_ip" value="127.0.0.1"></div>
+    <div><label>本地端口</label><input id="f_local_port" type="number" min="1" max="65535"></div>
+  </div>
+  <div class="row">
+    <div><label>期望远程端口（留空自动分配）</label><input id="f_desired_remote_port" type="number" min="1" max="65535"></div>
+    <div><label>锁定节点（留空 = 自动择优）</label><select id="f_pin_node_id"><option value="">自动</option></select></div>
+  </div>
+  <label>挂接的 frpc 容器</label>
+  <select id="f_frpc_instance_id"><option value="0">（不挂接）</option></select>
+  <div class="note">模型是<b>一条隧道 : 一个 frpc 容器</b>。没挂接的隧道<b>不会被写进任何 frpc 配置</b>，
+    也就没人帮它改配置、重启容器 —— 必须显式指定，程序不会替你猜。</div>
+  <label>关联的 Cloudflare 记录名（留空 = 不管理 DNS）</label>
+  <input id="f_dns_record_name" placeholder="例如 nas.example.com">
+  <div class="chk"><input type="checkbox" id="f_dns_proxied"><label for="f_dns_proxied" style="margin:0">DNS 记录走 Cloudflare 代理（橙云）</label></div>
+  <label>下游备忘（端口变了要改什么，会显示在提醒里）</label>
+  <textarea id="f_downstream_note" style="min-height:70px" placeholder="例如：Lucky 反代规则 nas 的后端要改成 节点IP:端口"></textarea>
+  <div class="chk"><input type="checkbox" id="f_enabled" checked><label for="f_enabled" style="margin:0">启用</label></div>
+  <div class="chk"><input type="checkbox" id="f_auto_failover" checked><label for="f_auto_failover" style="margin:0">允许这条隧道自动切换</label></div>
+  <div class="note">保存后，如果 mefrp 上还没有同名的隧道，程序会<b>自动在你的账号上创建一条</b>；如果已存在同名隧道，则会直接接管它。</div>
+  <div class="flex" style="margin-top:18px"><div class="sp"></div>
+    <button class="act" onclick="document.getElementById('tunDlg').close()">取消</button>
+    <button class="act pri" onclick="saveTunnel()">保存</button></div>
+</dialog>
+
+<dialog id="foDlg">
+  <h3>手动切换隧道</h3>
+  <p class="muted" id="foInfo"></p>
+  <label>目标节点</label>
+  <select id="fo_node_id"></select>
+  <div class="note">留空 = 走自动择优（带宽 ≥ 阈值、负载达标、命中优先关键词的排前面）。
+    指定节点会绕过冷却期与排除名单，但仍需满足用户组权限与带宽/负载门槛。</div>
+  <p class="muted">切换过程：删旧隧道 → 新建隧道 → 重建该 frpc 实例的配置 → 重启它的容器 → 端到端验证 → 更新 DNS。整个流程要几十秒。</p>
+  <div class="note">为什么是「先删后建」：mefrp 上<b>同名隧道不能共存</b>，不先删掉旧的就会直接撞名失败。
+    代价是这条隧道在中间那几步会<b>短暂完全不可用</b> —— 它本来就已经是坏的了，所以可以接受；
+    但如果新建失败，程序会把旧的<b>重新建回原节点</b>，不会让它凭空消失。</div>
+  <div class="flex" style="margin-top:18px"><div class="sp"></div>
+    <button class="act" onclick="document.getElementById('foDlg').close()">取消</button>
+    <button class="act pri" onclick="doFailover()">确认切换</button></div>
+</dialog>
+
+<dialog id="frpcDlg">
+  <h3 id="frpcDlgTitle">新增 frpc 实例</h3>
+  <input type="hidden" id="g_id">
+  <label>实例名（自己认得出就行）</label>
+  <input id="g_name" placeholder="例如 主线路 / 备用线路">
+  <label>配置文件绝对路径</label>
+  <input id="g_config_path" placeholder="/etc/frpc/frpc.toml" class="mono">
+  <div class="note">必须是<b>绝对路径</b>（相对路径会随进程工作目录变化），而且不能和别的实例重复 ——
+    两个实例共用一个配置文件会互相覆盖。容器里跑的话填<b>容器内看到的路径</b>（也就是挂载点）。</div>
+  <div class="row">
+    <div><label>容器名（留空 = 不重启容器）</label><input id="g_container" placeholder="frpc"></div>
+    <div><label>配置变化后</label><select id="g_restart_mode">
+      <option value="docker">重启 Docker 容器</option>
+      <option value="none">不自动重启（只写文件）</option>
+    </select></div>
+  </div>
+  <label>备注</label>
+  <input id="g_note" placeholder="例如：走北京节点，带 NAS 面板和 Git">
+  <div class="chk"><input type="checkbox" id="g_enabled" checked><label for="g_enabled" style="margin:0">启用</label></div>
+  <div class="flex" style="margin-top:18px"><div class="sp"></div>
+    <button class="act" onclick="document.getElementById('frpcDlg').close()">取消</button>
+    <button class="act pri" onclick="saveFrpc()">保存</button></div>
+</dialog>
+
+<script>
+const $ = id => document.getElementById(id);
+let OVERVIEW = null, TUNNELS = [], NODES = [], SETTINGS = null, TICK = null;
+
+async function api(path, opts){
+  const r = await fetch(path, Object.assign(
+    {headers:{'Content-Type':'application/json'}, credentials:'same-origin'}, opts||{}));
+  const t = await r.text();
+  let j = null; try { j = t ? JSON.parse(t) : null; } catch(e){ j = {detail:t}; }
+  // 401 = 会话过期或没登录。直接跳登录页并记住当前位置，
+  // 比在页面上弹一个「需要登录」的错误有用得多。
+  if(r.status === 401){
+    location.replace('/login?next=' + encodeURIComponent(location.pathname + location.search));
+    throw new Error('未登录，正在跳转登录页…');
+  }
+  if(!r.ok) throw new Error((j && (j.detail || j.error)) || ('HTTP '+r.status));
+  return j;
+}
+const esc = s => String(s==null?'':s).replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+// 域名这类「中间没有空格的长串」，在 overflow-wrap:anywhere 下会从字符中间硬切
+// （断成 tunnel-01.abcdefgh.dy / ndns.org 这种，很难读）。插 <wbr> 告诉浏览器
+// 优先在点后断，断出来就是 tunnel-01.abcdefgh. / dyndns.org。
+const wbr = s => esc(s).replace(/\./g, '.<wbr>');
+const ts2s = t => t ? new Date(t*1000).toLocaleString('zh-CN',{hour12:false}) : '—';
+const ago = t => { if(!t) return '—'; const d=Math.floor(Date.now()/1000-t);
+  if(d<60) return d+' 秒前'; if(d<3600) return Math.floor(d/60)+' 分钟前';
+  if(d<86400) return Math.floor(d/3600)+' 小时前'; return Math.floor(d/86400)+' 天前'; };
+
+document.querySelectorAll('nav button').forEach(b=>{
+  b.onclick = ()=>{
+    document.querySelectorAll('nav button').forEach(x=>x.classList.remove('on'));
+    document.querySelectorAll('section').forEach(x=>x.classList.remove('on'));
+    b.classList.add('on'); $(b.dataset.tab).classList.add('on');
+    if(b.dataset.tab==='nodes') loadNodes();
+    if(b.dataset.tab==='frpc') loadFrpc();
+    if(b.dataset.tab==='events') loadEvents();
+    if(b.dataset.tab==='settings') loadSettings();
+    if(b.dataset.tab==='tunnels') loadTunnels();
+  };
+});
+
+// ---------- 总览 ----------
+async function loadOverview(){
+  try{
+    OVERVIEW = await api('/api/overview');
+  }catch(e){ $('sub').textContent = '加载失败：'+e.message; return; }
+  const g = OVERVIEW.engine, f = OVERVIEW.frpc.container || {};
+  const fCount = OVERVIEW.frpc.instance_count || 0;
+  const fUnbound = OVERVIEW.frpc.unassigned_count || 0;
+  $('sub').innerHTML = `引擎 <b style="color:${g.running?'var(--teal)':'var(--red)'}">${g.running?'运行中':'已停止'}</b>`
+    + (g.user_group
+        ? ` · 用户组 <b>${esc(g.user_group_friendly||g.user_group)}</b>`
+        : ` · 用户组 <b style="color:var(--amber)">未知${g.user_group_error?`（${esc(g.user_group_error)}）`:''}</b>`)
+    + ` · 节点 ${g.node_online}/${g.node_total} 在线`
+    + (g.address_known!==undefined ? ` · 已知节点地址 ${g.address_known} 个` : '')
+    + ` · 第 ${g.tick_count} 轮，${g.next_tick_in}s 后下一轮`
+    + (g.last_error ? ` · <span style="color:var(--amber)">${esc(g.last_error)}</span>` : '');
+
+  const stats = [
+    ['受管隧道', OVERVIEW.tunnels.length, ''],
+    ['健康', OVERVIEW.tunnels.filter(t=>t.probe_ok===true).length, 'var(--teal)'],
+    ['异常', OVERVIEW.tunnels.filter(t=>t.probe_ok===false).length, 'var(--red)'],
+    ['不探测', OVERVIEW.tunnels.filter(t=>t.probe_skipped).length, 'var(--muted)'],
+    ['待确认下游', OVERVIEW.pending_review.length, 'var(--amber)'],
+  ];
+  $('statCards').innerHTML = stats.map(([l,n,c])=>
+    `<div class="card"><div class="n" style="color:${c||'var(--text)'}">${n}</div><div class="l">${l}</div></div>`).join('')
+    + `<div class="card"><div class="n" style="color:${f.status==='running'?'var(--teal)':'var(--red)'}">${esc(f.status||'不可用')}</div><div class="l">frpc ${fCount>1?`${fCount} 个实例`:'容器'} ${esc(f.name||'')}</div></div>`
+    // 未挂接 frpc 容器的隧道不会被写进任何 frpc 配置 —— 必须在总览就看得见，
+    // 不能只在 frpc 页提示
+    + (fUnbound ? `<div class="card"><div class="n" style="color:var(--amber)">${fUnbound}</div><div class="l">隧道未挂接 frpc</div></div>` : '');
+
+  const pend = OVERVIEW.pending_review;
+  // 默认密码的警告放在总览顶部 —— 这是落地页，必须第一眼看到。
+  const pwdAlert = (ME && ME.password_is_default)
+    ? `<div class="alert"><h3>⚠️ 正在使用默认密码（admin / admin123）</h3>
+       <div style="color:#F09595;font-size:12px">默认密码是公开的。请立刻到「设置 → 账号安全」修改 ——
+       否则任何能访问到这个服务的人都能接管你的隧道。</div></div>`
+    : '';
+  $('alert').innerHTML = pwdAlert + (pend.length ? `<div class="alert"><h3>⚠️ 有 ${pend.length} 条隧道的远程端口发生过变化，请检查下游配置</h3><ul>${
+    pend.map(t=>`<li><b>${esc(t.name)}</b>：当前端口 <b>${t.current_remote_port}</b> ｜ 节点 ${esc(t.node_name||'—')}${t.downstream_note?` ｜ 备忘：${esc(t.downstream_note)}`:''}
+      <button class="act" style="margin-left:8px" onclick="clearReview(${t.id})">已处理</button></li>`).join('')}</ul></div>` : '');
+
+  renderTunnels(OVERVIEW.tunnels, 'tunnelList');
+}
+
+function renderTunnels(list, target){
+  if(!list.length){ $(target).innerHTML = '<p class="muted">还没有受管隧道。去「隧道」页新增一条。</p>'; return; }
+  $(target).innerHTML = list.map(t=>{
+    let cls='idle', label='未纳管';
+    if(!t.enabled){ cls='idle'; label='已停用'; }
+    else if(t.proxy_found && !t.proxy_online){ cls='bad'; label='异常'; }
+    else if(t.probe_ok===false){ cls='bad'; label='异常'; }
+    else if(t.proxy_found && t.probe_ok===true){ cls='ok'; label='健康'; }
+    // 协议不适用端到端探测（如 UDP 隧道）—— 这是「没探」而不是「探挂了」，
+    // 不能画成红色，否则用户会以为服务有问题。
+    else if(t.proxy_found && t.probe_skipped){ cls='ok'; label='在线 · 不探测'; }
+    else if(t.proxy_found){ cls='warn'; label='待探测'; }
+    const note = t.last_error ? `<div class="muted" style="margin-top:8px;color:var(--red)">${esc(t.last_error)}</div>` : '';
+    const pnote = (t.probe_skipped && t.probe_reason) ? `<div class="muted" style="margin-top:8px">ⓘ ${esc(t.probe_reason)}</div>` : '';
+    const probeTxt = t.probe_skipped ? '不适用' : (t.probe_ok===true ? '通过' : (t.probe_ok===false ? '失败' : '—'));
+    return `<div class="tun ${cls}">
+      <div class="head">
+        <div><div class="name">${esc(t.name)} <span class="pill ${cls==='ok'?'ok':cls==='bad'?'bad':cls==='warn'?'warn':'idle'}">${label}</span></div>
+        <div class="meta">proxyName <code>${esc(t.proxy_name)}</code> · 本地 ${esc(t.local_ip)}:${t.local_port} · ${esc(t.proxy_type).toUpperCase()}</div></div>
+      </div>
+      <div class="kv">
+        <div><span>当前节点</span><b>${esc(t.node_name||'—')}</b></div>
+        <div><span>节点地址</span><b>${esc(t.node_hostname||'—')}</b></div>
+        <div><span>公网入口</span><b>${esc(t.public_endpoint||'—')}</b></div>
+        <div><span>远程端口</span><b>${t.current_remote_port||'—'}</b></div>
+        <div><span>端到端探测</span><b>${probeTxt}</b></div>
+        <div><span>失败计数</span><b>${t.fail_streak} / ${SETTINGS?SETTINGS.settings.fail_threshold:'?'}</b></div>
+        <div><span>上次健康</span><b>${ago(t.last_ok_at)}</b></div>
+        <div><span>DNS 记录</span><b>${t.dns_record_name ? wbr(t.dns_record_name) : '未管理'}</b></div>
+        <div><span>frpc 容器</span><b>${t.frpc_bound===undefined ? '—'
+          : (t.frpc_bound ? esc(t.frpc_instance_name||'—')
+             : '<span style="color:var(--amber)">未挂接</span>')}</b></div>
+      </div>${note}${pnote}
+      <div class="actions">
+        <button class="act" onclick="probeNow(${t.id})">立即探测</button>
+        <button class="act pri" onclick="failover(${t.id})">手动切换</button>
+        <button class="act" onclick="bindTunnel(${t.id})">挂接 frpc</button>
+        <button class="act" onclick="editTunnel(${t.id})">编辑</button>
+        ${t.needs_downstream_review?`<button class="act" onclick="clearReview(${t.id})">下游已处理</button>`:''}
+        <button class="act danger" onclick="delTunnel(${t.id})">删除</button>
+      </div></div>`;
+  }).join('');
+}
+
+// ---------- 隧道 ----------
+async function loadTunnels(){
+  TUNNELS = await api('/api/tunnels');
+  if(!OVERVIEW) { try{ OVERVIEW = await api('/api/overview'); }catch(e){} }
+  renderTunnels(OVERVIEW ? OVERVIEW.tunnels : TUNNELS, 'tunnelManage');
+  const managed = new Set(TUNNELS.map(t=>t.proxy_name));
+  try{
+    const raw = await api('/api/orphans');
+    const orphans = (raw||[]).filter(p=>!managed.has(p.proxy_name));
+    $('orphans').innerHTML = orphans.length ? `<table><thead><tr><th>proxyName</th><th>ID</th><th>节点</th><th>远程端口</th><th>本地</th><th>在线</th><th></th></tr></thead><tbody>${
+      orphans.map(p=>`<tr><td class="mono">${esc(p.proxy_name)}</td><td class="mono">${p.proxy_id}</td><td class="mono">${esc(p.node_name||p.node_id)}</td><td class="mono">${p.remote_port}</td><td class="mono">${esc(p.local_ip)}:${p.local_port}</td><td>${p.is_online?'<span class="pill ok">在线</span>':'<span class="pill idle">离线</span>'}</td><td><button class="act" onclick="adopt(${p.proxy_id})">纳管</button></td></tr>`).join('')}</tbody></table>`
+      : '<p class="muted">没有未纳管的隧道。</p>';
+  }catch(e){ $('orphans').innerHTML = `<p class="muted">无法读取：${esc(e.message)}</p>`; }
+}
+
+async function ensureNodes(){
+  if(NODES.length) return;
+  try{ const d = await api('/api/nodes'); NODES = d.nodes || []; }catch(e){}
+}
+
+function fillNodeSelect(){
+  const sel = $('f_pin_node_id');
+  sel.innerHTML = '<option value="">自动择优</option>' + NODES.map(n=>
+    `<option value="${n.node_id}"${n.selectable?'':' disabled'}>${esc(n.name)} · ${esc(n.bandwidth)}${n.eligible?'':(n.selectable?' · 低于阈值':' · 不可用')}</option>`).join('');
+}
+
+async function fillFrpcSelect(){
+  if(!FRPC){ try{ FRPC = await api('/api/frpc'); }catch(e){ FRPC = {instances:[]}; } }
+  const sel = $('f_frpc_instance_id');
+  sel.innerHTML = '<option value="0">（不挂接）</option>'
+    + (((FRPC&&FRPC.instances)||[]).map(i=>`<option value="${i.id}">${esc(i.name)}</option>`).join(''));
+}
+
+async function openTunnelDialog(){
+  await ensureNodes();
+  await fillFrpcSelect();
+  $('tunDlgTitle').textContent='新增隧道'; $('f_id').value='';
+  ['f_name','f_proxy_name','f_local_port','f_desired_remote_port','f_dns_record_name','f_downstream_note']
+    .forEach(i=>$(i).value='');
+  $('f_local_ip').value='127.0.0.1'; $('f_proxy_type').value='tcp';
+  $('f_dns_proxied').checked=false; $('f_enabled').checked=true; $('f_auto_failover').checked=true;
+  $('f_frpc_instance_id').value='0';
+  $('f_proxy_name').disabled=false;
+  fillNodeSelect(); $('tunDlg').showModal();
+}
+
+async function editTunnel(id){
+  await ensureNodes();
+  await fillFrpcSelect();
+  const t = TUNNELS.find(x=>x.id===id); if(!t) return;
+  $('tunDlgTitle').textContent='编辑隧道';
+  $('f_id').value=t.id; $('f_name').value=t.name; $('f_proxy_name').value=t.proxy_name;
+  $('f_proxy_name').disabled=true;
+  $('f_proxy_type').value=t.proxy_type; $('f_local_ip').value=t.local_ip; $('f_local_port').value=t.local_port;
+  $('f_desired_remote_port').value=t.desired_remote_port||'';
+  $('f_dns_record_name').value=t.dns_record_name||''; $('f_dns_proxied').checked=!!t.dns_proxied;
+  $('f_downstream_note').value=t.downstream_note||'';
+  $('f_enabled').checked=!!t.enabled; $('f_auto_failover').checked=!!t.auto_failover;
+  fillNodeSelect(); $('f_pin_node_id').value=t.pin_node_id||'';
+  $('f_frpc_instance_id').value = t.frpc_instance_id || '0';
+  $('tunDlg').showModal();
+}
+
+async function saveTunnel(){
+  const id = $('f_id').value;
+  const body = {
+    name:$('f_name').value.trim(), proxy_name:$('f_proxy_name').value.trim(),
+    proxy_type:$('f_proxy_type').value, local_ip:$('f_local_ip').value.trim()||'127.0.0.1',
+    local_port:parseInt($('f_local_port').value,10),
+    desired_remote_port: $('f_desired_remote_port').value?parseInt($('f_desired_remote_port').value,10):null,
+    pin_node_id: $('f_pin_node_id').value?parseInt($('f_pin_node_id').value,10):null,
+    dns_record_name:$('f_dns_record_name').value.trim(),
+    dns_proxied:$('f_dns_proxied').checked,
+    downstream_note:$('f_downstream_note').value.trim(),
+    enabled:$('f_enabled').checked, auto_failover:$('f_auto_failover').checked,
+    // 0 表示解绑 —— 后端把 0/null 都当作「不绑定」
+    frpc_instance_id: (parseInt($('f_frpc_instance_id').value,10)||0) || null,
+  };
+  if(!body.name||!body.proxy_name||!body.local_port){ alert('显示名、隧道名、本地端口都是必填'); return; }
+  try{
+    if(id){ const {name,proxy_name,...rest}=body; await api('/api/tunnels/'+id,{method:'PATCH',body:JSON.stringify(rest)}); }
+    else { await api('/api/tunnels',{method:'POST',body:JSON.stringify(body)}); }
+    $('tunDlg').close(); await loadOverview(); loadTunnels();
+  }catch(e){ alert('保存失败：'+e.message); }
+}
+
+async function delTunnel(id){
+  const t = TUNNELS.find(x=>x.id===id);
+  if(!confirm(`删除受管记录「${t?t.name:''}」？\n\n只删本地记录，不会动 mefrp 上的隧道。`)) return;
+  await api('/api/tunnels/'+id,{method:'DELETE'}); loadOverview(); loadTunnels();
+}
+
+async function probeNow(id){
+  try{ const r = await api(`/api/tunnels/${id}/probe`,{method:'POST'});
+    if(r.skipped){
+      alert(`ⓘ 不适用\n目标：${r.target}\n类型：${(r.proxy_type||'').toUpperCase()}\n原因：${r.reason}`);
+    } else {
+      alert(r.ok?`✅ 可达\n目标：${r.target}\n节点：${r.node}`:`❌ 不可达\n目标：${r.target}\n原因：${r.reason}`);
+    }
+    loadOverview();
+  }catch(e){ alert('探测失败：'+e.message); }
+}
+
+let FO_ID = null;
+
+async function failover(id){
+  const t = TUNNELS.find(x=>x.id===id)
+        || (OVERVIEW ? OVERVIEW.tunnels.find(x=>x.id===id) : null);
+  FO_ID = id;
+  await ensureNodes();
+  const sel = $('fo_node_id');
+  const good = NODES.filter(n=>n.eligible);
+  const soft = NODES.filter(n=>n.selectable && !n.eligible);
+  const hard = NODES.filter(n=>!n.selectable);
+  sel.innerHTML = '<option value="">自动择优（推荐）</option>'
+    + good.map(n=>`<option value="${n.node_id}">${esc(n.name)} · ${esc(n.bandwidth)} · 负载 ${n.load_percent}%</option>`).join('')
+    + (soft.length ? `<optgroup label="可手动指定（不满足自动择优阈值）">`
+        + soft.map(n=>`<option value="${n.node_id}">${esc(n.name)} · ${esc(n.bandwidth)} — ${esc(n.warnings.join('、'))}</option>`).join('')
+        + `</optgroup>` : '')
+    + (hard.length ? `<optgroup label="不可用">`
+        + hard.map(n=>`<option value="${n.node_id}" disabled>${esc(n.name)} — ${esc(n.blockers.join('、'))}</option>`).join('')
+        + `</optgroup>` : '');
+  $('foInfo').innerHTML = t
+    ? `隧道 <b>${esc(t.name)}</b> 当前在 <b>${esc(t.node_name||'—')}</b>（${esc(t.node_hostname||'')}，端口 <b>${t.current_remote_port||'—'}</b>）`
+      + (t.frpc_bound
+          ? `<br>它由 frpc 容器 <b>${esc(t.frpc_instance_name||'—')}</b> 承载 ——
+             切换会重建这个容器的配置并重启它。`
+          : `<br><span style="color:var(--amber)">⚠️ 它还没有挂接 frpc 容器，无法切换。
+            请先到「frpc 实例」页新建一个，再回来点「挂接 frpc」。</span>`)
+    : '';
+  $('foDlg').showModal();
+}
+
+async function doFailover(){
+  const raw = $('fo_node_id').value;
+  const nodeId = raw ? parseInt(raw,10) : null;
+  $('foDlg').close();
+  try{
+    const r = await api(`/api/tunnels/${FO_ID}/failover`,
+      {method:'POST', body:JSON.stringify({node_id: nodeId})});
+    const grp = (r.group_size > 1)
+      ? `\n\n⚠️ 同一个 frpc 实例的 ${r.group_size} 条隧道一起搬了：\n  ${(r.group_tunnels||[]).join('、')}`
+      : '';
+    const frpcLine = r.frpc_instance
+      ? `frpc 实例：${r.frpc_instance}\nfrpc 重启：${r.restart_ok?'成功':'失败'}${r.frpc_note?`（${r.frpc_note}）`:''}`
+      : 'frpc：未挂接容器，配置未更新';
+    if(r.healthy){
+      const probeTxt = r.probe_skipped ? '不适用（UDP 隧道不做 TCP 探测）' : '通过';
+      alert(`✅ 切换成功\n\n新节点：${r.node}（${r.node_hostname||'地址未知'}）\n端口：${r.old_port||'—'} → ${r.remote_port}\n${frpcLine}\n端到端探测：${probeTxt}`
+        + grp
+        + (r.port_changed?'\n\n⚠️ 远程端口变了，请检查下游配置（总览页有提示）':''));
+    }else{
+      alert(`⚠️ 已切到新节点「${r.node}」，但隧道没验证通过\n\n原因：${r.error}\n\n完整过程见「事件」页。`);
+    }
+    loadOverview(); loadEvents(); loadFrpc();
+  }catch(e){ alert('切换失败：'+e.message); }
+}
+
+async function clearReview(id){
+  await api('/api/tunnels/'+id,{method:'PATCH',body:JSON.stringify({needs_downstream_review:false})});
+  loadOverview();
+}
+
+async function adopt(proxy_id){
+  if(!confirm('把这条 mefrp 隧道纳管到本程序？\n\n会自动建一条受管记录，本地地址、端口、当前节点都从 mefrp 实读。')) return;
+  try{
+    const r = await api(`/api/orphans/${proxy_id}/adopt`,{method:'POST',body:'{}'});
+    alert(`已纳管「${r.name}」\n本地：${r.local}\n远程端口：${r.remote_port}`);
+    loadOverview(); loadTunnels();
+  }catch(e){ alert('纳管失败：'+e.message); }
+}
+
+// ---------- 节点 ----------
+async function loadNodes(){
+  const d = await api('/api/nodes');
+  NODES = d.nodes;
+  // 用户组有两个值：group 是机器名（匹配节点 allowGroup 用），friendly_group 是展示名。
+  $('groupInfo').textContent = d.user_group
+    ? `当前用户组：${d.user_group_friendly||d.user_group}（${d.user_group}）`
+      + (d.address_known!==undefined ? ` ｜ 已知公网地址的节点：${d.address_known}/${d.nodes.length}` : '')
+    : `当前用户组：未知${d.user_group_error?`（${d.user_group_error}）`:''}`;
+  $('pickRule').textContent = SETTINGS
+    ? `择优规则：带宽 ≥ ${SETTINGS.settings.min_bandwidth_mbps}Mbps ｜ 负载 ≤ ${SETTINGS.settings.max_load_percent}% ｜ 节点偏好「${SETTINGS.settings.prefer_keywords||'无'}」｜ 区域「${SETTINGS.settings.allow_regions||'不限'}」`
+    : '';
+  $('nodeList').innerHTML = NODES.length ? `<table><thead><tr><th>节点</th><th>区域</th><th>带宽</th><th>负载</th><th>隧道</th><th>权限</th><th>可用性</th><th>操作</th></tr></thead><tbody>${
+    NODES.map(n=>{
+      let avail;
+      if(n.eligible) avail = '<span class="pill ok">自动择优可用</span>';
+      else if(n.selectable) avail = `<span class="pill warn">可手动指定</span><div class="muted" style="font-size:11px;margin-top:4px">${esc(n.warnings.join('、'))}</div>`;
+      else avail = `<span class="pill idle">不可用</span><div class="muted" style="font-size:11px;margin-top:4px">${esc(n.blockers.join('、'))}</div>`;
+      return `<tr>
+      <td>${n.keyword_hit?`<span class="pill ok" title="命中节点偏好第 ${n.keyword_rank+1} 顺位">偏好 ${n.keyword_rank+1}</span> `:''}${esc(n.name)}<div class="muted mono" style="font-size:11px">${esc(n.hostname||'')}</div></td>
+      <td class="mono">${esc(n.region||'—')}</td>
+      <td class="mono">${esc(n.bandwidth||'—')}</td>
+      <td class="mono">${n.load_percent}%</td>
+      <td class="mono">${n.online_proxy}</td>
+      <td class="mono muted" style="font-size:11px">${esc(n.allow_group||'不限')}</td>
+      <td>${avail}</td>
+      <td><button class="act" onclick="setPref(${n.node_id},${n.excluded?0:1})">${n.excluded?'取消排除':'排除'}</button></td>
+    </tr>`;}).join('')}</tbody></table>` : '<p class="muted">还没有节点数据。点「重新拉取」。</p>';
+}
+async function refreshNodes(){ await api('/api/nodes/refresh',{method:'POST'}); loadNodes(); loadOverview(); }
+async function setPref(id, excluded){
+  await api(`/api/nodes/${id}/pref`,{method:'POST',body:JSON.stringify({excluded:!!excluded})}); loadNodes();
+}
+
+// ---------- frpc 实例 ----------
+// 一个 frpc 进程只能连一个 serverAddr（= 一个 mefrp 节点），所以同一个实例
+// 承载的隧道必须落在同一个节点上。故障转移因此是「整组搬」，不是「单条搬」。
+let FRPC = null, FRPC_MAP = null, FRPC_SEL = null;
+
+async function loadFrpc(){
+  try{
+    FRPC = await api('/api/frpc');
+    FRPC_MAP = await api('/api/frpc/map');
+  }catch(e){
+    $('frpcList').innerHTML = `<div class="note bad">${esc(e.message)}</div>`;
+    return;
+  }
+  renderFrpcList();
+}
+
+function frpcName(id){
+  const i = ((FRPC && FRPC.instances) || []).find(x=>x.id===id);
+  return i ? i.name : ('#'+id);
+}
+
+function renderFrpcList(){
+  const list = (FRPC && FRPC.instances) || [];
+  const unbound = (FRPC_MAP && FRPC_MAP.unassigned) || [];
+
+  $('frpcUnbound').innerHTML = unbound.length
+    ? `<div class="note warn" style="margin-top:12px">⚠️ 有 ${unbound.length} 条隧道还没有挂接 frpc 容器，
+       它们<b>不会被写进任何 frpc 配置</b>：${unbound.map(t=>`<code>${esc(t.name)}</code>`).join('、')}
+       <div style="margin-top:8px">到「隧道」页逐条点「挂接 frpc」指定容器；如果这些隧道本来就已经在某个
+       frpc 配置文件里跑着，可以点「自动发现绑定」按现有配置一次性匹配（这一步会写入显式绑定）。</div></div>`
+    : '';
+
+  if(!list.length){
+    $('frpcList').innerHTML = '<p class="muted">还没有 frpc 实例。点右上角「新增实例」添加一个。</p>';
+    $('frpcDetail').innerHTML = '';
+    return;
+  }
+  if(FRPC_SEL===null || !list.some(i=>i.id===FRPC_SEL)) FRPC_SEL = list[0].id;
+  $('frpcList').innerHTML = list.map(frpcCard).join('');
+}
+
+function frpcCard(i){
+  const c = i.container_state || {}, s = i.config_summary || {};
+  const tuns = i.tunnels || [];
+  const running = c.status === 'running';
+  const col = !c.available ? 'var(--red)'
+            : (running ? 'var(--teal)'
+            : (c.restart_mode==='none' ? 'var(--muted)' : 'var(--red)'));
+  const sel = i.id === FRPC_SEL;
+  return `<div class="tun ${i.enabled?'':'idle'}" style="${sel?'border-color:var(--teal);':''}">
+    <div class="head">
+      <div><div class="name">${esc(i.name)}
+        ${i.enabled?'':'<span class="pill idle">已停用</span>'}
+        ${sel?'<span class="pill ok">正在查看</span>':''}</div>
+        <div class="meta">配置 <code>${esc(i.config_path)}</code>${i.note?` · ${esc(i.note)}`:''}</div></div>
+    </div>
+    <div class="kv">
+      <div><span>容器</span><b style="color:${col}">${esc(c.name||'—')} · ${esc(c.status||'不可用')}</b></div>
+      <div><span>重启方式</span><b>${c.restart_mode==='none'?'不自动重启':'Docker 重启'}</b></div>
+      <div><span>承载隧道</span><b>${tuns.length} 条</b></div>
+      <div><span>当前连的节点</span><b>${esc(s.server_addr||'—')}${s.server_port?':'+esc(s.server_port):''}</b></div>
+      <div><span>配置文件</span><b>${i.config_exists?'已生成':'不存在（还没写过）'}</b></div>
+      <div><span>备份</span><b>${i.backup_count} 份</b></div>
+    </div>
+    ${c.error?`<div class="muted" style="margin-top:8px;color:var(--red)">${esc(c.error)}</div>`:''}
+    ${i.config_read_error?`<div class="muted" style="margin-top:8px;color:var(--red)">${esc(i.config_read_error)}</div>`:''}
+    <div class="meta" style="margin-top:10px">${tuns.length
+      ? '承载：' + tuns.map(t=>`<code>${esc(t.name)}</code>`).join(' ')
+      : '<span style="color:var(--amber)">还没有隧道挂接这个容器</span>'}</div>
+    <div class="actions">
+      <button class="act" onclick="selectFrpc(${i.id})">看配置</button>
+      <button class="act" onclick="rebuildFrpcOne(${i.id},false)">仅重建</button>
+      <button class="act pri" onclick="rebuildFrpcOne(${i.id},true)">重建并重启</button>
+      <button class="act" onclick="restartFrpcOne(${i.id})">只重启容器</button>
+      <button class="act" onclick="loadFrpcLogsOne(${i.id})">容器日志</button>
+      <button class="act" onclick="openFrpcDialog(${i.id})">编辑</button>
+      <button class="act danger" onclick="delFrpc(${i.id})">删除</button>
+    </div></div>`;
+}
+
+async function selectFrpc(id){
+  FRPC_SEL = id; renderFrpcList();
+  try{
+    const d = await api('/api/frpc/'+id);
+    const bk = await api('/api/frpc/'+id+'/backups');
+    $('frpcDetail').innerHTML = `
+      <h3>「${esc(d.name)}」当前配置</h3>
+      <p class="muted mono">${esc(d.config_path)}</p>
+      <pre>${esc(d.config || '（配置文件为空或不存在）')}</pre>
+      <h3>备份</h3>
+      ${bk.backups.length
+        ? `<table><thead><tr><th>文件</th><th>大小</th><th>时间</th><th></th></tr></thead><tbody>${
+            bk.backups.map(b=>`<tr><td class="mono">${esc(b.name)}</td><td class="mono">${b.size} B</td><td class="mono">${ts2s(b.mtime)}</td><td><button class="act" onclick="restoreFrpcBk(${id},'${esc(b.name)}')">恢复</button></td></tr>`).join('')
+          }</tbody></table>`
+        : '<p class="muted">还没有备份。</p>'}
+      <h3>容器日志</h3><pre id="frpcLogBox">点卡片上的「容器日志」加载</pre>`;
+  }catch(e){ $('frpcDetail').innerHTML = `<div class="note bad">${esc(e.message)}</div>`; }
+}
+
+async function rebuildFrpcOne(id, restart){
+  const nm = frpcName(id);
+  try{
+    const r = await api(`/api/frpc/${id}/rebuild?restart=${restart}`,{method:'POST'});
+    if(!r.changed){ alert(`「${nm}」配置无变化。`); }
+    else if(r.restarted){ alert(`✅ 「${nm}」配置已更新并重启。`); }
+    else { alert(`「${nm}」配置已更新，但没有重启。\n${r.note||'（未开启自动重启）'}`); }
+    await loadFrpc(); if(FRPC_SEL===id) selectFrpc(id);
+  }catch(e){ alert('失败：'+e.message); }
+}
+
+async function restartFrpcOne(id){
+  if(!confirm(`重启 frpc 实例「${frpcName(id)}」的容器？\n\n该实例上的隧道会短暂中断。`)) return;
+  try{ await api(`/api/frpc/${id}/restart`,{method:'POST'}); alert('已重启'); loadFrpc(); }
+  catch(e){ alert('失败：'+e.message); }
+}
+
+async function loadFrpcLogsOne(id){
+  try{
+    if(FRPC_SEL!==id) await selectFrpc(id);
+    const d = await api(`/api/frpc/${id}/logs?tail=150`);
+    const box = $('frpcLogBox');
+    if(box) box.textContent = d.logs || '（无日志）';
+    else alert(d.logs || '（无日志）');
+  }catch(e){ alert('读取日志失败：'+e.message); }
+}
+
+async function restoreFrpcBk(id, name){
+  if(!confirm('用这份备份覆盖当前配置？当前配置会先自动备份。')) return;
+  try{
+    await api(`/api/frpc/${id}/restore?name=`+encodeURIComponent(name),{method:'POST'});
+    alert('已恢复'); await loadFrpc(); selectFrpc(id);
+  }catch(e){ alert('失败：'+e.message); }
+}
+
+async function delFrpc(id){
+  const nm = frpcName(id);
+  if(!confirm(`删除 frpc 实例「${nm}」？\n\n只删这里的记录，不会删磁盘上的 frpc.toml，也不会动容器。\n绑在它上面的隧道会被解绑。`)) return;
+  try{
+    const r = await api(`/api/frpc/${id}?unbind=true`,{method:'DELETE'});
+    alert(`已删除${r.unbound?`，同时解绑了 ${r.unbound} 条隧道`:''}`);
+    if(FRPC_SEL===id){ FRPC_SEL=null; $('frpcDetail').innerHTML=''; }
+    await loadFrpc(); loadTunnels();
+  }catch(e){ alert('失败：'+e.message); }
+}
+
+async function discoverFrpc(){
+  let d;
+  try{ d = await api('/api/frpc/discover'); }catch(e){ alert('失败：'+e.message); return; }
+  const p = d.proposals||[], amb = d.ambiguous||[], un = d.unmatched||[];
+  let msg = `按各实例现有的配置文件，推断出 ${p.length} 条可以自动绑定的隧道：\n`;
+  msg += p.length ? p.map(x=>`  · ${x.tunnel_name} → ${x.instance_name}`).join('\n') : '  （无）';
+  if(amb.length) msg += `\n\n⚠️ 下面 ${amb.length} 条在多个实例的配置里都出现过，需要你手动指定：\n`
+    + amb.map(x=>`  · ${x.tunnel_name}`).join('\n');
+  if(un.length) msg += `\n\nⓘ 另外 ${un.length} 条在任何实例的配置里都找不到，会保持未绑定。`;
+  if(!p.length){ alert(msg); return; }
+  if(!confirm(msg + '\n\n要把这些绑定关系写进数据库吗？')) return;
+  try{
+    const r = await api('/api/frpc/discover?apply=true',{method:'POST'});
+    alert(`已写入 ${r.applied} 条绑定关系`);
+    await loadFrpc(); loadTunnels();
+  }catch(e){ alert('失败：'+e.message); }
+}
+
+function openFrpcDialog(id){
+  const list = (FRPC && FRPC.instances) || [];
+  const i = id ? list.find(x=>x.id===id) : null;
+  $('frpcDlgTitle').textContent = i ? '编辑 frpc 实例' : '新增 frpc 实例';
+  $('g_id').value = i ? i.id : '';
+  $('g_name').value = i ? i.name : '';
+  $('g_config_path').value = i ? i.config_path : '';
+  $('g_container').value = i ? (i.container||'') : '';
+  $('g_restart_mode').value = i ? (i.restart_mode||'docker') : 'docker';
+  $('g_note').value = i ? (i.note||'') : '';
+  $('g_enabled').checked = i ? !!i.enabled : true;
+  $('frpcDlg').showModal();
+}
+
+async function saveFrpc(){
+  const id = $('g_id').value;
+  const body = {
+    name: $('g_name').value.trim(),
+    config_path: $('g_config_path').value.trim(),
+    container: $('g_container').value.trim(),
+    restart_mode: $('g_restart_mode').value,
+    note: $('g_note').value.trim(),
+    enabled: $('g_enabled').checked,
+  };
+  if(!body.name || !body.config_path){ alert('实例名和配置路径都是必填'); return; }
+  try{
+    if(id) await api('/api/frpc/'+id,{method:'PATCH',body:JSON.stringify(body)});
+    else   await api('/api/frpc',{method:'POST',body:JSON.stringify(body)});
+    $('frpcDlg').close(); await loadFrpc();
+  }catch(e){ alert('保存失败：'+e.message); }
+}
+
+// 把一条隧道挂接到某个 frpc 容器（0 = 取消挂接）
+// 模型是「一条隧道 : 一个 frpc 容器」，所以这里通常就是给这条隧道挑它自己的那个容器。
+async function bindTunnel(id){
+  if(!FRPC){ try{ FRPC = await api('/api/frpc'); }catch(e){ alert('失败：'+e.message); return; } }
+  const list = (FRPC.instances)||[];
+  if(!list.length){
+    alert('还没有 frpc 容器可以挂接。\n\n请先到「frpc」页点「新增实例」，'
+        + '填上这个容器的配置文件路径和容器名，再回来挂接。');
+    return;
+  }
+  const t = ((OVERVIEW&&OVERVIEW.tunnels)||[]).find(x=>x.id===id)
+         || (TUNNELS||[]).find(x=>x.id===id) || {};
+  const opts = ['0 = 取消挂接（不写进任何 frpc 配置）']
+    .concat(list.map(i=>`${i.id} = ${i.name}（${i.container||'无容器'}）`)).join('\n');
+  const v = prompt(`把隧道「${t.name}」挂接到哪个 frpc 容器？\n\n${opts}\n\n输入实例编号：`,
+                   String(t.frpc_instance_id || 0));
+  if(v===null) return;
+  const iid = parseInt(v,10);
+  if(isNaN(iid)){ alert('请输入数字'); return; }
+  try{
+    await api('/api/tunnels/'+id,{method:'PATCH',
+      body:JSON.stringify({frpc_instance_id: iid>0 ? iid : null})});
+    await loadOverview(); loadTunnels(); loadFrpc();
+  }catch(e){ alert('失败：'+e.message); }
+}
+
+// ---------- 事件 ----------
+async function loadEvents(){
+  const list = await api('/api/events?limit=300');
+  $('eventLog').innerHTML = list.length ? list.map(e=>
+    `<div class="${esc(e.level)}"><span class="t">${ts2s(e.ts)}</span><span class="k">${esc(e.kind)}</span><span class="m">${esc(e.message)}${e.detail?`<br><span style="color:var(--dim);white-space:pre-wrap">${esc(e.detail)}</span>`:''}</span></div>`
+  ).join('') : '<div class="muted">还没有事件。</div>';
+}
+
+// ---------- 设置 ----------
+const SET_KEYS = ['mefrp_token','cf_api_token','gotify_url','gotify_token','engine_interval','probe_interval','probe_timeout','probe_mode','fail_threshold','failover_cooldown','node_cooldown','min_bandwidth_mbps','max_load_percent','allow_regions','prefer_keywords','auto_failover','auto_dns_sync','auto_restart_frpc','notify_on_probe_fail','session_ttl_hours','login_max_attempts','login_lockout_seconds'];
+// ---------- 节点偏好（有序多选）----------
+// 存库仍是 prefer_keywords 一个逗号分隔串，**顺序就是优先级**。
+// 真正的输入框是隐藏的 #s_prefer_keywords —— 这样上面 SET_KEYS 那套
+// 读 / 写设置的老逻辑一行都不用改，chips 只是它的可视化编辑器。
+function prefList(){
+  return ($('s_prefer_keywords').value||'').split(',')
+    .map(s=>s.trim()).filter((s,i,a)=>s && a.indexOf(s)===i);
+}
+function prefStore(list){ $('s_prefer_keywords').value = list.join(','); renderPrefChips(); }
+function addPref(){
+  const el = $('prefNew'), k = el.value.trim().replace(/[，,]/g,'');
+  if(!k) return;
+  const list = prefList();
+  if(list.some(x=>x.toLowerCase()===k.toLowerCase())){ alert(`「${k}」已经在列表里了`); return; }
+  list.push(k); el.value=''; prefStore(list);
+}
+function delPref(i){ const l = prefList(); l.splice(i,1); prefStore(l); }
+function movePref(i,d){
+  const l = prefList(), j = i + d;
+  if(j < 0 || j >= l.length) return;
+  [l[i], l[j]] = [l[j], l[i]];      // 顺序 = 优先级，所以「上移/下移」是这功能的核心操作
+  prefStore(l);
+}
+function resetPref(){ prefStore(['北京']); }
+function renderPrefChips(){
+  const l = prefList();
+  $('prefChips').innerHTML = l.length ? l.map((k,i)=>`<span class="chip">
+      <b>${i+1}</b>${esc(k)}
+      <button onclick="movePref(${i},-1)" ${i===0?'disabled':''} title="上移">↑</button>
+      <button onclick="movePref(${i},1)" ${i===l.length-1?'disabled':''} title="下移">↓</button>
+      <button onclick="delPref(${i})" title="删除">×</button>
+    </span>`).join('')
+    : '<span class="muted">没有偏好 —— 所有节点同权，只按带宽 / 负载排。</span>';
+  prefPreview();
+}
+// 预览走后端，复用 engine.keyword_rank —— 保证「预览看到的」和「真正择优用的」是同一份逻辑
+async function prefPreview(){
+  const l = prefList();
+  if(!l.length){ $('prefPreview').innerHTML = ''; return; }
+  let d;
+  try{ d = await api('/api/nodes/pref-preview',{method:'POST',body:JSON.stringify({keywords:l})}); }
+  catch(e){ $('prefPreview').innerHTML = `预览失败：${esc(e.message)}`; return; }
+  if(!d.total){ $('prefPreview').innerHTML = '<span class="muted">还没有节点数据 —— 到「节点」页点「重新拉取」。</span>'; return; }
+  const parts = d.groups.map((g,i)=>{
+    const n = g.nodes.length;
+    return `<b style="color:var(--teal)">${i+1}. ${esc(g.keyword)}</b> → ` + (n
+      ? `${n} 个：${g.nodes.slice(0,5).map(esc).join('、')}${n>5?` 等 ${n} 个`:''}`
+      : '<span style="color:var(--amber)">没有节点命中这个名字</span>');
+  });
+  parts.push(`<span class="muted">都不命中：${d.unmatched.length} 个（排在最后，仍可被选中）</span>`);
+  $('prefPreview').innerHTML = parts.join('<br>');
+}
+
+async function loadSettings(){
+  SETTINGS = await api('/api/settings');
+  const s = SETTINGS.settings;
+  SET_KEYS.forEach(k=>{ const el = $('s_'+k); if(!el) return;
+    if(el.type==='checkbox') el.checked = !!s[k]; else el.value = (s[k]===undefined||s[k]===null)?'':s[k]; });
+  $('s_mefrp_token').value=''; $('s_cf_api_token').value=''; $('s_gotify_token').value='';
+  renderPrefChips();          // 节点偏好是 chips 编辑器，值灌进隐藏框后要重画一次
+  $('pw_user').placeholder = SETTINGS.username || 'admin';
+  renderPwdWarn();
+}
+
+// 还在用默认密码就顶个醒目横幅。这是拿默认密码去比对得出的结论，
+// 不是存了个标志位 —— 用户改完又改回来也能正确识别。
+function renderPwdWarn(){
+  const bad = ME && ME.password_is_default;
+  $('pwdWarn').innerHTML = bad
+    ? `<div class="alert"><h3>⚠️ 当前使用的是默认密码（admin123），请立刻修改</h3>
+       <div class="muted" style="font-size:12px">默认密码是公开的。这个服务一旦暴露到公网，任何人都能直接登录并接管你的隧道。</div></div>`
+    : '';
+}
+
+async function changePassword(){
+  const cur = $('pw_cur').value, np = $('pw_new').value, np2 = $('pw_new2').value;
+  if(!cur){ alert('请先输入当前密码'); return; }
+  if(!np){ alert('请填写新密码'); return; }
+  if(np.length < 8){ alert('新密码至少 8 位'); return; }
+  if(np !== np2){ alert('两次输入的新密码不一致'); return; }
+  if(np === 'admin123'){ alert('新密码不能与默认密码相同'); return; }
+  try{
+    const r = await api('/api/auth/password',{method:'POST', body:JSON.stringify({
+      current_password: cur, new_password: np, new_username: $('pw_user').value.trim()})});
+    $('pw_cur').value = $('pw_new').value = $('pw_new2').value = '';
+    alert(`✅ 已更新\n用户名：${r.username}\n已注销其他设备上的 ${r.sessions_revoked} 个会话`);
+    await loadMe(); loadSettings(); loadEvents();
+  }catch(e){ alert('修改失败：'+e.message); }
+}
+
+async function logout(){
+  if(!confirm('退出登录？')) return;
+  try{ await api('/api/auth/logout',{method:'POST', body:'{}'}); }catch(e){}
+  location.replace('/login');
+}
+async function saveSettings(){
+  const body = {};
+  SET_KEYS.forEach(k=>{ const el = $('s_'+k); if(!el) return;
+    if(el.type==='checkbox') body[k]=el.checked; else body[k]=el.value; });
+  try{ const r = await api('/api/settings',{method:'PUT',body:JSON.stringify(body)});
+    alert('已保存：'+(r.updated.join('、')||'无变化')); loadSettings(); loadOverview();
+  }catch(e){ alert('保存失败：'+e.message); }
+}
+async function testMefrp(){
+  const t = $('s_mefrp_token').value.trim();
+  const r = await api('/api/test/mefrp'+(t?'?token='+encodeURIComponent(t):''),{method:'POST'});
+  // 用户组有两个值：group 是机器名（用于匹配节点 allowGroup），
+  // friendlyGroup 才是人看的展示名。两个都显示，出问题时好排查。
+  const grp = r.user_group ? `${r.friendly_group||'?'}（${r.user_group}）` : '未知';
+  alert(r.ok?`✅ 通了\n节点总数 ${r.node_total}，在线 ${r.node_online}\n用户组：${grp}`:'❌ '+r.error);
+}
+async function testCf(){
+  const t = $('s_cf_api_token').value.trim();
+  const r = await api('/api/test/cloudflare'+(t?'?token='+encodeURIComponent(t):''),{method:'POST'});
+  alert(r.ok?`✅ 通了\n可管理的 zone：${(r.zones||[]).join(', ')}`:'❌ '+r.error);
+}
+async function testGotify(send){
+  const r = await api('/api/test/gotify?send='+!!send,{method:'POST'});
+  alert(r.ok?'✅ 成功':'❌ 失败');
+}
+
+// 当前登录状态。username 显示在右上角，password_is_default 决定要不要挂警告横幅。
+let ME = null;
+
+async function loadMe(){
+  try{
+    ME = await api('/api/auth/me');
+  }catch(e){ return; }
+  if(!ME || !ME.authenticated) return;
+  const u = ME.username || '?';
+  $('who').innerHTML =
+    `<span class="avatar">${esc(u.slice(0,2).toUpperCase())}</span>`
+    + `<span>${esc(u)}</span>`
+    + (ME.password_is_default ? `<span class="pill bad">默认密码</span>` : '')
+    + `<button class="act" onclick="logout()">退出</button>`;
+}
+
+(async function boot(){
+  await loadMe();
+  try{ SETTINGS = await api('/api/settings'); }catch(e){}
+  await loadOverview();
+  TICK = setInterval(loadOverview, 10000);
+})();
+</script>
+</body>
+</html>

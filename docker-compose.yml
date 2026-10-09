@@ -1,0 +1,69 @@
+# mefrp-guard —— 构建式部署
+#
+# 先构建镜像，再用它起容器：
+#     docker build -t mefrp-guard:v1.0.0 .
+#     docker compose up -d
+# 也可以一步做完：docker compose up -d --build
+#
+# 镜像 tag 固定成 v1.0.0 而不是 latest —— latest 会让「现在跑的是哪一版」
+# 变成一个回答不了的问题，回滚时也没有可指的目标。
+#
+# 所有跟宿主机有关的取值（端口 / 静态 IP / 网络名 / frpc 配置根目录）都从同目录的
+# .env 里读，所以这份文件本身可以直接搬到别的机器上：
+#     cp .env.example .env && vim .env
+
+services:
+  mefrp-guard:
+    build: .
+    image: mefrp-guard:v1.0.0
+    container_name: mefrp-guard
+    restart: unless-stopped
+
+    # .env 里的变量会注入容器。⚠️ 这个文件必须先存在：
+    #     cp .env.example .env && vim .env
+    # （compose 自己也会读同目录的 .env 来做 ${VAR} 插值，两件事互不冲突。）
+    env_file:
+      - .env
+
+    ports:
+      # 宿主机端口 -> 容器 8080。宿主机端口在 .env 的 HOST_PORT 里改。
+      - "${HOST_PORT:-8080}:8080"
+
+    volumes:
+      # ---- 运行期数据：状态库、事件日志、frpc 配置备份 ----
+      # 唯一需要备份的目录。
+      # ⚠️ 刻意用 ./data/prod 而不是 ./data：./data 还被 run_local.sh 的沙箱实例
+      #    占着（它在 ./data/local）。混在一起的话，本地试跑建出来的那条
+      #    「指向本机路径的 frpc 实例」会被带进容器 —— 容器里没那个路径，直接不可用。
+      - ./data/prod:/data
+
+      # ---- 用于重启 frpc 容器 ----
+      # 注意：这等于把宿主机 docker 控制权交给本容器（详见 README）
+      - /var/run/docker.sock:/var/run/docker.sock
+
+      # ---- frpc 配置根目录（宿主机路径在 .env 的 FRPC_PATH 里改）----
+      # ⚠️ 挂**一个公共根目录**就够，不必给每个 frpc 容器单独挂一行 ——
+      #    容器内看到的是 /frpc/<子目录>/frpc.toml。
+      # 这个路径要和「frpc 实例」页里填的配置路径对得上（那边填的是容器内路径）。
+      - "${FRPC_PATH:?请先在 .env 里设置 FRPC_PATH}:/frpc"
+
+    # Dockerfile 里已经装好 curl，健康检查直接用它
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/healthz"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+
+    # ---------- 可选：接入一个已存在的 Docker 网络并指定静态 IP ----------
+    # 用不到就把这一段和文件末尾的顶层 networks: 一起删掉，走默认 bridge 也能跑。
+    # 名字与 IP 在 .env 的 EXTERNAL_NETWORK_NAME / CONTAINER_IP 里改。
+    networks:
+      extnet:
+        ipv4_address: ${CONTAINER_IP:?请先在 .env 里设置 CONTAINER_IP}
+
+# 引用已存在的外部网络（compose 只挂载它，不创建）
+networks:
+  extnet:
+    external: true
+    name: ${EXTERNAL_NETWORK_NAME:?请先在 .env 里设置 EXTERNAL_NETWORK_NAME}
