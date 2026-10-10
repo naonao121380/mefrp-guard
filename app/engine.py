@@ -316,7 +316,8 @@ class GuardEngine:
             return self.docker
         return None
 
-    def frpc_for_tunnel(self, tunnel: dict) -> dict | None:
+    def frpc_for_tunnel(self, tunnel: dict,
+                        instances: list[dict] | None = None) -> dict | None:
         """解析一条隧道由哪个 frpc 容器承载。返回实例 dict，或 None（未挂接）。
 
         **只有一级：显式绑定** `tunnels.frpc_instance_id`。
@@ -338,7 +339,10 @@ class GuardEngine:
         explicit = tunnel.get("frpc_instance_id")
         if not explicit:
             return None
-        instances = store.list_frpc_instances(enabled_only=True)
+        # `instances` 允许调用方传进来复用 —— 一次要解析几十条隧道时（见
+        # main.list_tunnels），别为每条都扫一遍实例表。
+        if instances is None:
+            instances = store.list_frpc_instances(enabled_only=True)
         # 指向一个已删除 / 已停用的实例 → 当作未挂接。
         # ⚠️ 不能「随便找一个顶上」—— 那会把配置写进用户没指定的那个文件里。
         return next((i for i in instances if int(i["id"]) == int(explicit)), None)

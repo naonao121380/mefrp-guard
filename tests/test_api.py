@@ -475,5 +475,26 @@ with TestClient(app) as c:
           all(t["frpc_bound"] == (t["id"] == _target) for t in ov2["tunnels"]),
           [(t["name"], t["frpc_bound"]) for t in ov2["tunnels"]])
 
+    # ★ 回归：/api/tunnels 也必须带 frpc_bound / frpc_instance_name。
+    #   前端的「手动切换」对话框（failover()）读的是**这个**接口，原来它直接
+    #   返回 store 的原始行、没有这两个字段 → `t.frpc_bound` 是 undefined，
+    #   falsy → **挂接明明成功了，还是提示「它还没有挂接 frpc 容器，无法切换」**。
+    #   同一个隧道在两个接口里形状不一样，是这个 bug 的根因。
+    print("[18f] ★ /api/tunnels 与 /api/overview 的挂接字段口径一致")
+    tl = {t["id"]: t for t in c.get("/api/tunnels", headers=AUTH).json()}
+    check("每条都带 frpc_bound", all("frpc_bound" in t for t in tl.values()),
+          list(tl.values())[:1])
+    check("每条都带 frpc_instance_name",
+          all("frpc_instance_name" in t for t in tl.values()), list(tl.values())[:1])
+    check("★ 两个接口的 frpc_bound 完全一致",
+          all(tl[t["id"]]["frpc_bound"] == t["frpc_bound"] for t in ov2["tunnels"]),
+          [(t["name"], t["frpc_bound"], tl.get(t["id"], {}).get("frpc_bound"))
+           for t in ov2["tunnels"]])
+    _t2 = next(t for t in ov2["tunnels"] if t["id"] == _target)
+    check("★ 已挂接那条在两个接口里都带上了实例名",
+          tl[_target]["frpc_bound"] is True
+          and tl[_target]["frpc_instance_name"] == _t2["frpc_instance_name"],
+          (tl[_target], _t2.get("frpc_instance_name")))
+
 print(f"\n==> PASS {ok} / FAIL {bad}")
 sys.exit(1 if bad else 0)

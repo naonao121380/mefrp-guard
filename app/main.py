@@ -686,8 +686,26 @@ async def list_tunnels(tag: str | None = None,
 
     `?tag=` 按标签筛选；`?tag=`（空串）筛「没打标签的」。不传 = 全量。
     ⚠️ 这里要能区分「不传」和「传空串」，所以默认值是 None 而不是 ""。
+
+    ⚠️ 每条都要带上 `frpc_bound` / `frpc_instance_name`。这两个字段原来**只在**
+    `/api/overview` 里算，于是同一个隧道在两个接口里的形状不一样：前端的
+    「手动切换」对话框（`failover()`）读的是这个接口，`t.frpc_bound` 拿到
+    `undefined` —— falsy，于是**挂接明明成功了，还是提示「它还没有挂接 frpc
+    容器，无法切换」**。实测踩过（隧道卡片因为另有 `=== undefined` 兜底，
+    反而显示正常，更让人以为是挂接没生效）。
+    实例表只查一次，别在循环里逐条查。
     """
-    return store.list_tunnels(tag=(_norm_tag(tag) if tag is not None else None))
+    rows = store.list_tunnels(tag=(_norm_tag(tag) if tag is not None else None))
+    instances = store.list_frpc_instances(enabled_only=True)
+    out: list[dict[str, Any]] = []
+    for t in rows:
+        inst = engine.frpc_for_tunnel(t, instances)
+        out.append({
+            **t,
+            "frpc_instance_name": inst["name"] if inst else "",
+            "frpc_bound": inst is not None,
+        })
+    return out
 
 
 @app.get("/api/tags")
