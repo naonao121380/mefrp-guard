@@ -442,6 +442,25 @@ PY=<python> PORT=18080 ./run_local.sh
 所以挂接必须是**你的一次明确动作**。没挂接的隧道不会被写进任何 frpc 配置，
 总览页 / 「frpc 实例」页 / 事件日志三处都会提示。
 
+### ⚠️ 挂接状态是**算出来**的 —— 别让前端读错接口
+
+`frpc_bound` / `frpc_instance_name` **不是数据库里的列**，是
+`engine.frpc_for_tunnel()` 现算的。它们原来只在 `/api/overview` 里算，而
+`/api/tunnels` 直接 `return store.list_tunnels(...)` 的原始行 ——
+**同一个隧道在两个接口里形状不一样**。
+
+代价是一次真实的 bug：前端的「手动切换」对话框（`failover()`）读的是
+`/api/tunnels`，`t.frpc_bound` 拿到 `undefined`，而 `undefined` 是假值，
+于是**挂接明明成功了，还是提示「它还没有挂接 frpc 容器，无法切换」**。
+隧道卡片那边另有 `t.frpc_bound === undefined ? '—'` 兜底，反而显示正常 ——
+所以现象看着像「挂接没生效」，实际上数据一直是对的。
+
+现在两个接口都带上这两个字段（`/api/tunnels` 里实例表只查一次，
+`engine.frpc_for_tunnel(tunnel, instances=…)` 复用，不在循环里逐条扫）。
+
+> **规则：给 `/api/overview` 加计算字段时，顺手问一句「`/api/tunnels` 要不要也带上」。**
+> 同一个实体有两个形状，早晚会有人读错那个缺字段的。
+
 ### 第一步：登记 frpc 容器
 
 「frpc 实例」页 → 「新增实例」。每个容器要填：
@@ -558,7 +577,7 @@ mefrp-guard/
 │       └── favicon.ico 老浏览器 / Safari / webview 的回落图标（`/favicon.ico`）
 ├── tests/              十个测试文件（鉴权 / 纯逻辑 / CF 客户端 / 外部节点逻辑 / API /
 │                       外部节点 API / 标签 / 作用域 / 故障转移 / 多容器挂接），
-│                       共 958 条断言
+│                       共 962 条断言
 ├── run_local.sh        本地试跑脚本（不依赖 Docker，用沙箱 frpc 配置）
 ├── Dockerfile
 ├── docker-compose.yml
@@ -662,6 +681,27 @@ curl -s -o /dev/null -w '%{size_download}\n' \
 > `No matching distribution found`（和截断是两回事，同样看不出原因）。
 > 实测 2026-10：阿里云 / 腾讯云 / 中科大 / pypi 官方正常，只有清华这样。
 
+**「挂了 frpc，点『手动切换』还说没挂接」**
+
+先分清是哪一种：
+
+1. **隧道卡片上「frpc 容器」那一行显示 `—` 或「未挂接」** → 那是**真没挂上**。
+   查 `/api/tunnels` 里这条的 `frpc_instance_id` 是不是空的；如果非空，再看那个实例
+   是不是被**停用**了 —— `frpc_for_tunnel()` 只认 `enabled = 1` 的实例，指向一个停用的
+   实例会**当作未挂接**（故意的，见 `frpc_for_tunnel` 的注释）。
+2. **卡片显示正常（有容器名），只有对话框说没挂接** → 就是本文档「frpc 容器与隧道挂接」
+   里那个**两个接口形状不一致**的 bug（1.0.1 已修）。对一下两个接口：
+
+   ```bash
+   for p in tunnels overview; do
+     echo "== /api/$p"
+     curl -s -b cookie.txt "http://127.0.0.1:8080/api/$p" \
+       | python -m json.tool | grep -m1 -A1 frpc_bound
+   done
+   ```
+
+   两边都该是 `true`。**只有 overview 有、tunnels 缺字段** → 你的镜像是旧的，重建即可。
+
 **彻底绕开索引**（离线构建）：在能正常联网的机器上把 wheel 抓下来，随镜像一起打包。
 
 ```bash
@@ -747,7 +787,7 @@ PYTHONPATH=$PWD/.devdeps PY=$PY ./tests/run_all.sh
 > ⚠️ `run_all.sh` **自己不设 `PYTHONPATH`** —— 不带上的话会在第一个需要依赖的文件上
 > 报 `No module named 'fastapi'`。
 
-十个文件，共 **958 条断言**（59 + 141 + 22 + 122 + 188 + 183 + 30 + 47 + 73 + 93）：
+十个文件，共 **962 条断言**（59 + 141 + 22 + 122 + 192 + 183 + 30 + 47 + 73 + 93）：
 
 | 文件 | 覆盖 | 需要第三方库 |
 |---|---|---|
@@ -755,7 +795,7 @@ PYTHONPATH=$PWD/.devdeps PY=$PY ./tests/run_all.sh
 | `tests/test_logic.py` | frpc TOML 合并与跨节点校验、**单引号字面量解析**、配置备份/恢复/路径穿越、SQLite 持久化与字段白名单、Node/Proxy 字段解析、`pick_node` 择优调度、**节点偏好的有序语义与归一化**、**`probe_plan` 探测适用性** | 否 |
 | `tests/test_cfclient.py` | **Cloudflare 客户端的 httpx 交互**：传输层退避重试、重试耗尽后 `transient=True` 与异常类型名、非传输层错误不重试、**连接池复用（3 个请求只建 1 个）与跨事件循环重建**、`upsert(existing=…)` 省掉两次自查、没配 token 一个请求都不发 | httpx |
 | `tests/test_manual_node.py` | **frpc 配置解析（TOML / INI）、`patch_server` 文本级改写的保真与合法性、外部节点数据层 CRUD、1.0.0 老库补列迁移、引擎对外部隧道的分支（含「不适用探测」的三态、UDP 的 DNS 同步、瞬时失败 warn→error 的升级与清零）** | 否 |
-| `tests/test_api.py` | FastAPI 全端点：**登录页/会话 Cookie/登出作废/改密码/CSRF/防爆破/只读设置保护**、鉴权、CRUD、密钥打码、错误码、枚举字段校验、引擎生命周期、**frpc 实例 CRUD 与挂接 API**、**节点偏好预览（含路由遮蔽回归）** | fastapi / httpx / pydantic |
+| `tests/test_api.py` | FastAPI 全端点：**登录页/会话 Cookie/登出作废/改密码/CSRF/防爆破/只读设置保护**、鉴权、CRUD、密钥打码、错误码、枚举字段校验、引擎生命周期、**frpc 实例 CRUD 与挂接 API**、**`/api/tunnels` 与 `/api/overview` 的挂接字段口径一致**、**节点偏好预览（含路由遮蔽回归）** | fastapi / httpx / pydantic |
 | `tests/test_manual_api.py` | 外部节点全部 HTTP 端点：导入 / 更新 / 删除 / 改连 / 探测、token 不回明文、**「地址已导入过」的 409 契约与「覆盖重建空节点」**、**导入时顺手同步 DNS 与 udp 隧道的探测端点**、**DNS 记录名查重的 409 契约（含编辑自己 / 导入时只放弃那一个字段）**、删掉最后一条隧道自动清理空节点 | fastapi / httpx / pydantic |
 | `tests/test_tags.py` | 隧道标签：默认打 `mefrp`、归一化与截断、`?tag=` 筛选（**空串 = 筛未打标的**）、`/api/tags` 计数与排序、显式清空、**老库只回填一次** | fastapi / httpx / pydantic |
 | `tests/test_scope.py` | **隧道名的唯一性作用域**：同名隧道跨运营商并存、展示名重名不报错、mefrp 作用域内仍唯一、`/api/orphans` 与 `probe` 按作用域分流、**老库整表重建去掉 UNIQUE** | fastapi / httpx / pydantic |
