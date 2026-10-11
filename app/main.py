@@ -20,8 +20,10 @@ from pydantic import BaseModel, Field
 
 from . import auth, frpc, frpcparse, store
 from .cloudflare import CloudflareClient, CloudflareError
-from .engine import engine, probe_plan, tcp_probe
-from .mefrp import MefrpClient, MefrpError
+from .engine import (PROBE_HTTP, PROBE_NONE, PROBE_TCP, engine, http_probe,
+                     http_probe_url, probe_plan, tcp_probe)
+from .mefrp import (MefrpClient, MefrpError, is_http_type, join_domains,
+                    parse_domains)
 from .settings import (BOOTSTRAP, DEFAULT_SETTINGS, READONLY_SETTINGS,
                        SECRET_KEYS)
 
@@ -30,7 +32,11 @@ WEB_DIR = Path(__file__).parent / "web"
 # 枚举型设置：key -> 允许的取值集合。
 # 写错的值必须报 400，不能静默降级 —— 否则用户以为「关了探测」其实还在探。
 ENUM_SETTINGS: dict[str, set[str]] = {
-    "probe_mode": {"auto", "tcp", "none"},
+    # auto = 按隧道类型自动决定（TCP/UDP 探端口，HTTP 跳过 —— 见 engine.probe_plan）
+    # tcp  = 一律做 TCP 探测（对 http 隧道是假阳性，不推荐）
+    # http = 按类型：http/https 隧道做 HTTP 探测，tcp/udp 照旧做 TCP 探测
+    # none = 全部关闭
+    "probe_mode": {"auto", "tcp", "http", "none"},
 }
 
 
@@ -51,7 +57,7 @@ async def lifespan(_app: FastAPI):
         store.add_event("info", "system", "mefrp-guard 停止")
 
 
-app = FastAPI(title="mefrp-guard", version="1.0.1", lifespan=lifespan,
+app = FastAPI(title="mefrp-guard", version="1.0.2", lifespan=lifespan,
               docs_url=None, redoc_url=None)
 
 
@@ -369,7 +375,23 @@ class TunnelIn(BaseModel):
     proxy_type: str = Field("tcp", pattern="^(tcp|udp|http|https)$")
     local_ip: str = "127.0.0.1"
     local_port: int = Field(..., ge=1, le=65535)
+    # ⚠️ 端口只对 TCP/UDP 有意义；HTTP/HTTPS 恒为 null（见 mefrp.proxy_create）。
+    #    这里不做 Field 层面的强制，交给 create_tunnel 按类型校验 —— 因为
+    #    「该填哪个」取决于 proxy_type，Pydantic 的字段约束表达不了这种条件。
     desired_remote_port: int | None = Field(None, ge=1, le=65535)
+    # ---- HTTP/HTTPS 专用 ----
+    # 想绑定的域名。可以传单个域名、逗号分隔的多个、或已经是 JSON 数组文本。
+    # 统一由 mefrp.join_domains 归一化，见 create_tunnel。
+    desired_domain: str = ""
+    # 内网服务协议 → httpPlugin 映射，见 mefrp.proxy_create 的矩阵：
+    #   http + HTTP  → ''            http + HTTPS → 'http2https'
+    #   https + HTTP → 'https2http'  https + HTTPS → 'https2https'
+    http_plugin: str = ""
+    # 路径路由规则，逗号分隔（mefrp 的 locations 字段）。
+    route_locations: str = ""
+    # ⚠️ https 隧道才需要，而且是**节点侧**的证书路径 —— 免费用户基本用不上。
+    crt_path: str = ""
+    key_path: str = ""
     pin_node_id: int | None = None
     enabled: bool = True
     auto_failover: bool = True
@@ -387,6 +409,11 @@ class TunnelPatch(BaseModel):
     local_ip: str | None = None
     local_port: int | None = None
     desired_remote_port: int | None = None
+    desired_domain: str | None = None
+    http_plugin: str | None = None
+    route_locations: str | None = None
+    crt_path: str | None = None
+    key_path: str | None = None
     pin_node_id: int | None = None
     enabled: bool | None = None
     auto_failover: bool | None = None
@@ -441,6 +468,10 @@ class NodePrefIn(BaseModel):
     priority: int | None = None
     excluded: bool | None = None
     note: str | None = None
+    # HTTP/HTTPS 隧道用：这个节点的「HTTP 入口域名」。
+    # 官方要求把绑定域名 CNAME 到「节点域名」，但非管理员账号看不到 hostname，
+    # 所以只能手填。填了 DNS 就 CNAME 过去，不填就退回节点 IP 走 A 记录。
+    http_entry: str | None = None
 
 
 class PrefPreviewIn(BaseModel):
@@ -613,6 +644,20 @@ async def overview(_: None = Auth) -> dict[str, Any]:
         addr = (str(mn["server_addr"]) if mn
                 else engine.node_address_cached(t["current_node_id"]))
         inst = engine.frpc_for_tunnel(t)
+        # ★ HTTP/HTTPS 隧道的「公网入口」是**域名**，不是 地址:端口。
+        #   它的 current_remote_port 恒为 null，照老逻辑拼出来会是空串，
+        #   页面上就永远显示「—」，用户以为没配好。
+        t_http = is_http_type(t.get("proxy_type"))
+        # 域名优先用 mefrp 上**实际**绑定的；还没建/还没刷新时退回用户填的期望值 ——
+        # 否则刚建完的隧道在页面上会显示「没有绑定域名」，看着像没保存上。
+        dom_list = (parse_domains(t.get("current_domain") or "")
+                    or parse_domains(t.get("desired_domain") or "")) if t_http else []
+        if t_http and dom_list:
+            scheme = "https" if str(t.get("proxy_type")).lower() == "https" else "http"
+            public_endpoint = f"{scheme}://{dom_list[0]}"
+        else:
+            public_endpoint = (f"{addr}:{t['current_remote_port']}"
+                               if addr and t["current_remote_port"] else "")
         items.append({
             **t,
             "node_source": "manual" if mn else "api",
@@ -624,9 +669,10 @@ async def overview(_: None = Auth) -> dict[str, Any]:
             "node_name": mn["name"] if mn else (node.name if node else ""),
             "node_hostname": addr,
             "address_known": bool(addr),
-            # 公网访问入口，例如 203.0.113.10:41234
-            "public_endpoint": f"{addr}:{t['current_remote_port']}"
-                               if addr and t["current_remote_port"] else "",
+            "is_http": t_http,
+            "domains": dom_list,
+            # 公网访问入口。TCP/UDP 是 203.0.113.10:41234；HTTP/S 是 http(s)://域名
+            "public_endpoint": public_endpoint,
             # 归属的 frpc 实例（可能是显式绑定，也可能是自动解析出来的）
             "frpc_instance_name": inst["name"] if inst else "",
             "frpc_bound": inst is not None,
@@ -763,6 +809,39 @@ async def create_tunnel(payload: TunnelIn, _: None = Auth) -> dict[str, Any]:
     data["enabled"] = int(data["enabled"])
     data["auto_failover"] = int(data["auto_failover"])
     data["dns_proxied"] = int(data["dns_proxied"])
+
+    # ★ 按隧道类型做条件校验 —— 这是 1.0.2 的核心分歧点：
+    #   · HTTP/HTTPS —— 靠**域名**工作，必须填绑定域名；端口对它没意义（mefrp 侧
+    #     恒为 null），填了会被静默忽略，不如直接报错让用户少走弯路。
+    #   · TCP/UDP —— 靠**端口**工作，domain 字段必须为空（填了 mefrp 也不认）。
+    http_like = is_http_type(payload.proxy_type)
+    if http_like:
+        if not parse_domains(payload.desired_domain):
+            raise HTTPException(
+                400,
+                "HTTP/HTTPS 隧道必须填写「绑定域名」—— 它是靠域名工作的，"
+                "没有域名节点反代就不知道该把请求转给谁。")
+        if payload.desired_remote_port:
+            raise HTTPException(
+                400,
+                "HTTP/HTTPS 隧道没有远程端口（mefrp 侧 remotePort 恒为 null）—— "
+                "请把「期望远程端口」留空。对外入口是「绑定域名」。")
+        # 归一化成 mefrp 要的「文本化 JSON 数组」（见 mefrp.join_domains）
+        data["desired_domain"] = join_domains(payload.desired_domain)
+        data["desired_remote_port"] = None
+    else:
+        if parse_domains(payload.desired_domain):
+            raise HTTPException(
+                400,
+                "TCP/UDP 隧道不能绑定域名 —— 域名只对 HTTP/HTTPS 隧道有意义。"
+                "对外入口是「远程端口」。")
+        # 归一化：port 组的这几项一律清空，避免从 http 改类型后残留旧值。
+        data["desired_domain"] = ""
+        data["http_plugin"] = ""
+        data["route_locations"] = ""
+        data["crt_path"] = ""
+        data["key_path"] = ""
+
     # 这个端点建的都是 **mefrp** 隧道（外部节点的隧道只能从 frpc 配置导入），
     # 所以没指定标签时默认打上 'mefrp' —— 这样隧道页一进来就能按来源分组，
     # 不用用户挨条去标。想改成别的标签直接传 tag 覆盖即可。
@@ -802,6 +881,31 @@ async def patch_tunnel(tunnel_id: int, payload: TunnelPatch,
     #    字段、记录名原样带上，就会把自己判成冲突，连保存都保存不了。
     if "dns_record_name" in data:
         _claim_dns_name(data["dns_record_name"], exclude_id=tunnel_id)
+
+    # ★ 域名字段要归一化成 mefrp 要的「文本化 JSON 数组」。PATCH 走的是
+    #   exclude_none，前端传裸域名（"a.com,b.com"）上来，不归一化的话库里就存
+    #   裸串、跟 create 那条路存进去的形状不一致，后面比对/显示全乱。
+    if "desired_domain" in data:
+        cur = store.get_tunnel(tunnel_id) or {}
+        # 类型以「这次要改成的」为准，没改类型就看库里现有的。
+        ptype = str(data.get("proxy_type") or cur.get("proxy_type") or "tcp")
+        if is_http_type(ptype):
+            if not parse_domains(data["desired_domain"]):
+                raise HTTPException(
+                    400, "HTTP/HTTPS 隧道必须填写「绑定域名」—— 它是靠域名工作的。")
+            data["desired_domain"] = join_domains(data["desired_domain"])
+        else:
+            if parse_domains(data["desired_domain"]):
+                raise HTTPException(
+                    400, "TCP/UDP 隧道不能绑定域名 —— 域名只对 HTTP/HTTPS 有意义。")
+            data["desired_domain"] = ""
+    # 改类型时也要顺手清掉「另一套」的字段，避免 http↔tcp 来回切之后留下残值。
+    if "proxy_type" in data and not is_http_type(data["proxy_type"]):
+        for k in ("http_plugin", "route_locations", "crt_path", "key_path"):
+            data[k] = ""
+    if "proxy_type" in data and is_http_type(data["proxy_type"]):
+        # HTTP 隧道没有远程端口 —— 显式置空，别留着上一次的残值。
+        data["desired_remote_port"] = None
 
     # ⚠️ manual_node_id 只允许「解绑」（传 null）。想绑到外部节点必须走
     #    /api/manual-nodes/{id}/switch —— 那条路会**改写配置文件并重启容器**。
@@ -982,13 +1086,21 @@ async def probe_now(tunnel_id: int, _: None = Auth) -> dict[str, Any]:
     #    名字找东西，轻则报一个莫名其妙的「mefrp 上找不到这条隧道」，重则
     #    **查到一条同名的 mefrp proxy**，然后去探测一条完全不相干的隧道。
     mn = engine.manual_node_for(tunnel)
+    ptype = tunnel.get("proxy_type", "tcp")
+    http_like = is_http_type(ptype)
+
     if mn is not None:
         host = str(mn["server_addr"] or "").strip()
         node_name = str(mn["name"])
-        port = int(tunnel.get("current_remote_port") or 0)
-        if not port:
-            raise HTTPException(409, "这条隧道没有远程端口，无法探测"
-                                     "（导入配置时那一段没写 remotePort）")
+        if http_like:
+            # HTTP 隧道没有远程端口，靠绑定域名。这里不要求 host 一定拿得到
+            # （探测本来就用不到节点地址），但域名必须有。
+            port = 0
+        else:
+            port = int(tunnel.get("current_remote_port") or 0)
+            if not port:
+                raise HTTPException(409, "这条隧道没有远程端口，无法探测"
+                                         "（导入配置时那一段没写 remotePort）")
     else:
         proxy = engine.proxies.get(tunnel["proxy_name"])
         if proxy is None:
@@ -997,25 +1109,47 @@ async def probe_now(tunnel_id: int, _: None = Auth) -> dict[str, Any]:
         if node is None:
             raise HTTPException(404, f"节点 {proxy.node_id} 不在列表中")
 
-        host = await engine.node_address(proxy.node_id)
-        if not host:
-            raise HTTPException(409, (
-                f"拿不到节点「{node.name}」的公网地址。"
-                "mefrp 对非管理员账号不返回节点地址（/auth/node/list 的 hostname 是空串），"
-                "只有在那个节点上建过隧道才能反推出来。"
-            ))
         node_name = node.name
-        port = int(proxy.remote_port)
+        if http_like:
+            # ⚠️ HTTP 隧道**不需要节点地址**：探测打的是绑定域名，节点反代按
+            #    Host 头分流。所以这里不能因为「拿不到节点公网地址」就报 409 ——
+            #    非管理员账号下节点地址本来就经常拿不到，那会让 HTTP 隧道永远
+            #    点不了「立即探测」。
+            host = ""
+            port = 0
+        else:
+            host = await engine.node_address(proxy.node_id)
+            if not host:
+                raise HTTPException(409, (
+                    f"拿不到节点「{node.name}」的公网地址。"
+                    "mefrp 对非管理员账号不返回节点地址（/auth/node/list 的 hostname 是空串），"
+                    "只有在那个节点上建过隧道才能反推出来。"
+                ))
+            port = int(proxy.remote_port)
 
     timeout = float(store.get_setting("probe_timeout", 4) or 4)
     target = f"{host}:{port}"
-    ptype = tunnel.get("proxy_type", "tcp")
 
-    # UDP 隧道不能做 TCP 探测 —— 直连会必然失败，返回「不可达」是在骗用户。
-    # 这里如实回一个「不适用」，让前端显示成中性提示而不是红色报错。
+    # 探测方式按类型分流，见 engine.probe_plan：
+    #   · TCP/UDP —— 探节点地址 + 远程端口
+    #   · HTTP/HTTPS —— 探绑定域名（节点反代按 Host 头分流）
+    # 这里和引擎每轮做的事必须**同一套判定**，否则会出现「引擎认为健康、
+    # 手动点一下却报故障」的自相矛盾。
     mode = str(store.get_setting("probe_mode", "auto") or "auto")
-    do_probe, skip_why = probe_plan(ptype, mode)
-    if not do_probe:
+    pkind, skip_why = probe_plan(ptype, mode)
+
+    # 域名取自「mefrp 上实际绑定的」（proxy.domain 权威）→ 退回库里记的。
+    cur_domain = ""
+    if http_like:
+        if mn is None:
+            cur_domain = str(proxy.domain or tunnel.get("current_domain") or "")
+        else:
+            cur_domain = str(tunnel.get("current_domain") or "")
+        url = http_probe_url(ptype, cur_domain,
+                             str(store.get_setting("http_probe_path", "/") or "/"))
+        target = url or "（未绑定域名）"
+
+    if pkind == PROBE_NONE:
         engine.probe_cache[tunnel_id] = (time.time(), None, skip_why)
         # ⚠️ 「不适用探测」不等于「地址不对」—— DNS 该同步还得同步。
         #    这里原来直接 return，于是 **udp 隧道点「立即探测」永远不解析 DNS**，
@@ -1025,6 +1159,26 @@ async def probe_now(tunnel_id: int, _: None = Auth) -> dict[str, Any]:
         dns_msg = await _sync_dns_after_probe(tunnel, mn, host)
         return {
             "ok": None, "skipped": True, "reason": skip_why,
+            "target": target, "node": node_name, "proxy_type": ptype,
+            "dns": dns_msg,
+        }
+
+    if pkind == PROBE_HTTP:
+        if not url:
+            why = "这条 HTTP 隧道没有绑定域名，无法做 HTTP 探测"
+            engine.probe_cache[tunnel_id] = (time.time(), None, why)
+            return {
+                "ok": None, "skipped": True, "reason": why,
+                "target": target, "node": node_name, "proxy_type": ptype,
+                "dns": "",
+            }
+        ok, why = await http_probe(url)
+        engine.probe_cache[tunnel_id] = (time.time(), ok, why)
+        # 探测通过 = 域名/地址是对的，顺手同步 DNS（和引擎每轮做的事一致）。
+        # 探测失败时**不动 DNS** —— 地址并没有变，改它只会把一条本来对的记录改坏。
+        dns_msg = await _sync_dns_after_probe(tunnel, mn, host) if ok else ""
+        return {
+            "ok": ok, "skipped": False, "reason": why,
             "target": target, "node": node_name, "proxy_type": ptype,
             "dns": dns_msg,
         }
@@ -1088,7 +1242,8 @@ async def nodes_pref_preview(payload: PrefPreviewIn,
 async def set_node_pref(node_id: int, payload: NodePrefIn,
                         _: None = Auth) -> dict[str, Any]:
     store.upsert_node_pref(
-        int(node_id), payload.priority, payload.excluded, payload.note
+        int(node_id), payload.priority, payload.excluded, payload.note,
+        http_entry=payload.http_entry,
     )
     return {"ok": True}
 
@@ -2032,6 +2187,9 @@ async def get_settings(_: None = Auth) -> dict[str, Any]:
         "config_path": str(BOOTSTRAP.frpc_config_path),
         "auth_enabled": auth_enabled(),
         "username": str(store.get_setting("web_user") or ""),
+        # 节点偏好（含 HTTP 入口域名）。节点页要用它来显示/编辑 http_entry ——
+        # 那个字段不参与择优，是给 DNS 用的，所以不放 /api/nodes 的 nodes 数组里。
+        "node_prefs": store.list_node_prefs(),
     }
 
 

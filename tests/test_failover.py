@@ -210,7 +210,8 @@ check("写了 dns 事件", any(e["kind"] == "dns" for e in evs), [e["kind"] for 
 check("写了 frpc 事件", any(e["kind"] == "frpc" for e in evs), [e["kind"] for e in evs])
 
 print("[9] 冷却期与节点冷却已生效")
-check("新节点进了冷却", 9 in eng.node_cooldown, list(eng.node_cooldown))
+# ⚠️ 1.0.2 起冷却表键是 (隧道类型组, node_id)：port / http 两套偏好各自记。
+check("新节点进了冷却", ("port", 9) in eng.node_cooldown, list(eng.node_cooldown))
 check("last_failover_at 已写", store.get_tunnel(tid)["last_failover_at"] > 0)
 check("fail_streak 已清零", store.get_tunnel(tid)["fail_streak"] == 0)
 
@@ -372,10 +373,15 @@ check("probe_mode=tcp 时强制探测，如实记为失败",
 # probe_mode=none 时连 tcp 隧道都不探
 store.set_setting("probe_mode", "none")
 eng.probe_cache.clear()
-check("probe_mode=none -> tcp 隧道也跳过", E.probe_plan("tcp", "none")[0] is False)
-check("probe_mode=tcp -> tcp 隧道强制探测", E.probe_plan("tcp", "tcp")[0] is True)
+check("probe_mode=none -> tcp 隧道也跳过", E.probe_plan("tcp", "none")[0] == "none")
+check("probe_mode=tcp -> tcp 隧道强制探测", E.probe_plan("tcp", "tcp")[0] == "tcp")
 check("probe_mode=auto -> tcp 探、udp 不探",
-      E.probe_plan("tcp", "auto")[0] is True and E.probe_plan("udp", "auto")[0] is False)
+      E.probe_plan("tcp", "auto")[0] == "tcp" and E.probe_plan("udp", "auto")[0] == "none")
+# ★ 1.0.2：http 隧道在 auto 下不探（TCP 层是假阳性），改 probe_mode=http 才走 HTTP 探测
+check("probe_mode=auto -> http 隧道不探（假阳性）",
+      E.probe_plan("http", "auto")[0] == "none")
+check("probe_mode=http -> http 隧道走 HTTP 探测",
+      E.probe_plan("http", "http")[0] == "http")
 store.set_setting("probe_mode", "auto")
 PROBE["ok"] = True; PROBE["why"] = ""
 

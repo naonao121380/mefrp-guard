@@ -82,6 +82,11 @@ button.act:hover{border-color:var(--muted)}
 button.act.pri{background:var(--blue-bg);border-color:var(--blue);color:#B5D4F4}
 button.act.danger{border-color:#6b2b2b;color:#F09595}
 button.act:disabled{opacity:.45;cursor:not-allowed}
+/* 页签（节点页的 TCP/UDP ↔ HTTP/S 视角、设置页的两套节点偏好）：选中的那个要高亮 */
+.tabs{display:inline-flex;gap:6px;background:var(--surface);border:1px solid var(--border);
+  border-radius:9px;padding:3px}
+.tabs button.act{border-color:transparent;background:transparent}
+.tabs button.act.on{background:var(--blue-bg);border-color:var(--blue);color:#B5D4F4}
 /* 节点偏好：有序多选的「标签」列表。序号就是优先级，所以把数字显式画出来。 */
 .chips{display:flex;gap:6px;flex-wrap:wrap;align-items:center;min-height:30px}
 .chip{display:inline-flex;align-items:center;gap:1px;background:var(--teal-bg);border:1px solid var(--teal);
@@ -175,6 +180,14 @@ dialog h3{margin-top:0;color:var(--text);font-size:15px}
       <div class="sp"></div>
       <span class="muted" id="groupInfo"></span>
       <button class="act" onclick="refreshNodes()">重新拉取</button></div>
+    <div class="flex" style="margin-top:10px">
+      <div class="tabs" id="nodeTabs">
+        <button class="act on" data-kind="port" onclick="switchNodeTab('port')">TCP / UDP 视角</button>
+        <button class="act" data-kind="http" onclick="switchNodeTab('http')">HTTP / HTTPS 视角</button>
+      </div>
+    </div>
+    <div class="note">两类隧道用的是<b>两套独立的偏好</b>（区域 / 带宽 / 负载 / 冷却 / 关键词都各一份），
+      所以同一个节点在这里可能一边「自动择优可用」、另一边「可手动指定」。切上面的页签看对应的口径。</div>
     <p class="muted" id="pickRule"></p>
     <div id="nodeList" style="margin-top:12px"></div>
     <p class="muted" style="margin-top:14px">这一页是 <b>mefrp</b> 纳管的节点。
@@ -222,40 +235,70 @@ dialog h3{margin-top:0;color:var(--text);font-size:15px}
     </div>
     <label>端到端探测模式</label>
     <select id="s_probe_mode">
-      <option value="auto">自动（推荐）—— TCP 隧道做 TCP 探测，UDP 隧道跳过</option>
+      <option value="auto">自动（推荐）—— TCP/UDP 做 TCP 探测；HTTP/S 跳过（TCP 层探不出问题）</option>
+      <option value="http">按类型 —— HTTP/S 隧道做 HTTP 探测（请求绑定域名看返回码），其余照旧</option>
       <option value="tcp">强制 TCP —— 所有隧道都用 TCP 探测</option>
       <option value="none">关闭 —— 只用 mefrp 状态 + 节点状态判定</option>
     </select>
-    <div class="note">UDP 隧道在节点上监听的是 UDP 端口，<b>没有 TCP 监听</b>，用 TCP 去探必然失败。选「强制 TCP」会让健康的 UDP 隧道被反复判定为故障、<b>触发无意义的切换</b>，除非你清楚后果，否则保持「自动」。</div>
+    <div class="note">两类隧道都要小心，原因<b>正好相反</b>：
+      <br>· <b>UDP</b> 在节点上监听的是 UDP 端口，<b>没有 TCP 监听</b> —— 用 TCP 去探必然失败，会让健康隧道被反复判定为故障、<b>触发无意义的切换</b>。
+      <br>· <b>HTTP/HTTPS</b> 反过来：节点反代对<b>任何域名</b>都会握手成功，TCP 探出来<b>永远是「通」</b>（假阳性），等于白探。要真探就得选「按类型」，它会去请求你的绑定域名，<b>返回 2xx/3xx 算通</b>。
+      <br>保持「自动」最安全；想给 HTTP 隧道做真实探测再切「按类型」。</div>
+    <label>HTTP 探测路径（「按类型」模式下请求这个路径）</label>
+    <input id="s_http_probe_path" placeholder="/">
+    <div class="note">默认请求根路径 <code>/</code>。若你的服务在根路径上返回 4xx/5xx（比如必须带特定路径才返回 200），把它改成能返回 2xx 的路径，否则会被判成故障。</div>
     <div class="row3">
       <div><label>连续失败几次才切换</label><input id="s_fail_threshold" type="number" min="1"></div>
       <div><label>切换后冷却（秒）</label><input id="s_failover_cooldown" type="number" min="0"></div>
-      <div><label>节点冷却（秒）</label><input id="s_node_cooldown" type="number" min="0"></div>
-    </div>
-    <div class="row3">
       <div><label>连续失败多久才告警（秒）</label><input id="s_alert_after_seconds" type="number" min="0"></div>
     </div>
     <div class="note">网络抖一下不该惊动你。<b>连续失败满这个时长</b>，才把「拉取 mefrp 状态失败 / DNS 同步失败」升成红色告警；在那之前只在事件里留一条黄色 warn，中途自愈就不再记了。默认 1800（30 分钟）。填 0 = 一失败就告警。</div>
 
-    <h2>节点择优</h2>
+    <h2>节点择优 · TCP / UDP</h2>
+    <div class="note">TCP/UDP 隧道靠<b>端口</b>工作，所以这套偏好只关心「节点能不能给一个可用的端口」。</div>
     <div class="row3">
       <div><label>最低带宽（Mbps）</label><input id="s_min_bandwidth_mbps" type="number" min="0"></div>
       <div><label>最高负载（%）</label><input id="s_max_load_percent" type="number" min="1" max="100"></div>
-      <div><label>允许区域（逗号分隔）</label><input id="s_allow_regions" placeholder="cn"></div>
+      <div><label>节点冷却（秒）</label><input id="s_node_cooldown" type="number" min="0"></div>
     </div>
+    <label>允许区域</label>
+    <div class="regions" id="regions_port"></div>
+    <input type="hidden" id="s_allow_regions">
+
+    <h2>节点择优 · HTTP / HTTPS</h2>
+    <div class="note">HTTP/HTTPS 隧道靠<b>域名</b>工作（节点反代按域名分流），所以是<b>另一套独立的偏好</b>。
+      ⚠️ <b>默认只用港澳台 + 海外节点</b>：官方文档明说大陆节点建 HTTP/S 站<b>需要向管理员报备域名</b>（白名单），
+      腾讯云/阿里云/华为云等节点还要求域名在服务商处<b>接入备案</b>。避开大陆能让新建的 HTTP 隧道直接可用，
+      而不是建完发现打不开。已经报备过、或域名已备案的话，可以把「中国大陆」勾上。</div>
+    <div class="row3">
+      <div><label>最低带宽（Mbps）</label><input id="s_http_min_bandwidth_mbps" type="number" min="0"></div>
+      <div><label>最高负载（%）</label><input id="s_http_max_load_percent" type="number" min="1" max="100"></div>
+      <div><label>节点冷却（秒）</label><input id="s_http_node_cooldown" type="number" min="0"></div>
+    </div>
+    <label>允许区域</label>
+    <div class="regions" id="regions_http"></div>
+    <input type="hidden" id="s_http_allow_regions">
+
     <h2>节点偏好</h2>
     <div class="note">按<b>节点名称里包含的字</b>排序（包含匹配，不是相等）—— mefrp 节点名形如「北京BGP-1」，填「北京」两个字就够。
       <b>靠上的优先</b>：填了「北京」和「上海」时，北京的所有节点排在上海之前。
       一个都没命中的节点排在最后，但<b>仍会被选中</b> —— 偏好是排序，不是筛选。
-      匹配范围：节点名称 + 描述 + 区域。</div>
+      匹配范围：节点名称 + 描述 + 区域。<b>两套偏好各有一份</b>，下面可切换。</div>
+    <div class="flex" style="margin-bottom:9px">
+      <div class="tabs" id="prefTabs">
+        <button class="act on" data-kind="port" onclick="switchPrefTab('port')">TCP / UDP</button>
+        <button class="act" data-kind="http" onclick="switchPrefTab('http')">HTTP / HTTPS</button>
+      </div>
+    </div>
     <div id="prefChips" class="chips"></div>
     <div class="flex" style="margin-top:9px">
       <input id="prefNew" placeholder="加一个，比如 北京 / 上海 / 广州" style="max-width:290px" onkeydown="if(event.key==='Enter'){event.preventDefault();addPref();}">
       <button class="act" onclick="addPref()">添加</button>
-      <button class="act" onclick="resetPref()">恢复默认（北京）</button>
+      <button class="act" onclick="resetPref()">恢复默认</button>
     </div>
     <div id="prefPreview" class="muted" style="margin-top:10px;line-height:1.9"></div>
     <input type="hidden" id="s_prefer_keywords">
+    <input type="hidden" id="s_http_prefer_keywords">
 
     <h2>行为开关</h2>
     <div class="chk"><input type="checkbox" id="s_auto_failover"><label for="s_auto_failover" style="margin:0">允许自动故障转移</label></div>
@@ -297,17 +340,51 @@ dialog h3{margin-top:0;color:var(--text);font-size:15px}
     <div><label>隧道名（proxyName）</label><input id="f_proxy_name" placeholder="例如 nas-panel"></div>
   </div>
   <div class="row3">
-    <div><label>类型</label><select id="f_proxy_type"><option value="tcp">TCP</option><option value="udp">UDP</option><option value="http">HTTP</option><option value="https">HTTPS</option></select></div>
+    <div><label>类型</label><select id="f_proxy_type" onchange="syncTunTypeFields()"><option value="tcp">TCP</option><option value="udp">UDP</option><option value="http">HTTP</option><option value="https">HTTPS</option></select></div>
     <div><label>本地 IP</label><input id="f_local_ip" value="127.0.0.1"></div>
     <div><label>本地端口</label><input id="f_local_port" type="number" min="1" max="65535"></div>
   </div>
+
+  <!-- ---- TCP / UDP：靠端口 ---- -->
+  <div id="wrap_port">
+    <label>期望远程端口（留空自动分配）</label>
+    <input id="f_desired_remote_port" type="number" min="1" max="65535">
+  </div>
+
+  <!-- ---- HTTP / HTTPS：靠域名 ---- -->
+  <div id="wrap_http" style="display:none">
+    <label>绑定域名（必填，多个用逗号分隔）</label>
+    <input id="f_desired_domain" placeholder="例如 nas.example.com">
+    <div class="note">HTTP/HTTPS 隧道<b>没有远程端口</b> —— 对外入口就是这个域名。
+      你需要把这个域名<b>解析到节点</b>：在 Cloudflare 里加一条 <b>A 记录指向节点 IP</b>（或 CNAME 到节点的 HTTP 入口域名），
+      节点反代会按域名把请求转给这条隧道。本程序会在你填了「关联的 Cloudflare 记录名」时自动帮你维护它。</div>
+    <div class="row">
+      <div><label>内网服务协议</label>
+        <select id="f_http_plugin">
+          <option value="">内网是 HTTP（最常见）</option>
+          <option value="http2https">内网是 HTTPS（隧道 http → 后端 https）</option>
+          <option value="https2http">隧道 https，内网是 HTTP（需节点侧证书）</option>
+          <option value="https2https">隧道 https，内网也是 HTTPS（需节点侧证书）</option>
+        </select>
+      </div>
+      <div><label>路径路由规则（可选，逗号分隔）</label><input id="f_route_locations" placeholder="例如 /api,/static"></div>
+    </div>
+    <div id="wrap_crt" style="display:none">
+      <div class="row">
+        <div><label>节点侧证书路径（crtPath）</label><input id="f_crt_path" placeholder="/etc/crt/example.com.crt"></div>
+        <div><label>节点侧私钥路径（keyPath）</label><input id="f_key_path" placeholder="/etc/crt/example.com.key"></div>
+      </div>
+      <div class="note">⚠️ 证书装在<b>节点那一侧</b>，不是你本地。免费用户基本用不上 —— 要 HTTPS 建议用 <b>http 隧道 + Cloudflare 终结 TLS</b>（橙云代理）。</div>
+    </div>
+  </div>
+
   <div class="row">
-    <div><label>期望远程端口（留空自动分配）</label><input id="f_desired_remote_port" type="number" min="1" max="65535"></div>
     <div><label>锁定节点（留空 = 自动择优）</label><select id="f_pin_node_id"><option value="">自动</option></select></div>
+    <div><label>标签（用来分组筛选，留空 = 不打标签）</label><input id="f_tag" placeholder="例如 mefrp / 公司frps / 临时"></div>
   </div>
   <div class="row">
-    <div><label>标签（用来分组筛选，留空 = 不打标签）</label><input id="f_tag" placeholder="例如 mefrp / 公司frps / 临时"></div>
     <div><label>挂接的 frpc 容器</label><select id="f_frpc_instance_id"><option value="0">（不挂接）</option></select></div>
+    <div></div>
   </div>
   <div class="note">模型是<b>一条隧道 : 一个 frpc 容器</b>。没挂接的隧道<b>不会被写进任何 frpc 配置</b>，
     也就没人帮它改配置、重启容器 —— 必须显式指定，程序不会替你猜。</div>
@@ -577,13 +654,15 @@ function renderTunnels(list, target){
     return `<div class="tun ${cls}">
       <div class="head">
         <div><div class="name">${esc(t.name)} <span class="pill ${cls==='ok'?'ok':cls==='bad'?'bad':cls==='warn'?'warn':'idle'}">${label}</span>${isManual?` <span class="pill manual">外部节点${t.node_name?` · ${esc(t.node_name)}`:''}</span>`:''}${_tagOf(t)?` <span class="pill tag">${esc(_tagOf(t))}</span>`:''}</div>
-        <div class="meta">proxyName <code>${esc(t.proxy_name)}</code> · 本地 ${esc(t.local_ip)}:${t.local_port} · ${esc(t.proxy_type).toUpperCase()}</div></div>
+        <div class="meta">proxyName <code>${esc(t.proxy_name)}</code> · 本地 ${esc(t.local_ip)}:${t.local_port} · ${esc(t.proxy_type).toUpperCase()}${t.is_http&&(t.domains||[]).length?` · 域名 ${esc(t.domains.join(', '))}`:''}</div></div>
       </div>
       <div class="kv">
         <div><span>当前节点</span><b>${esc(t.node_name||'—')}</b></div>
         <div><span>节点地址</span><b>${esc(t.node_hostname||'—')}</b></div>
         <div><span>公网入口</span><b>${esc(t.public_endpoint||'—')}</b></div>
-        <div><span>远程端口</span><b>${t.current_remote_port||'—'}</b></div>
+        ${t.is_http
+          ? `<div><span>绑定域名</span><b>${esc((t.domains||[]).join(', ')||'—')}</b></div>`
+          : `<div><span>远程端口</span><b>${t.current_remote_port||'—'}</b></div>`}
         <div><span>端到端探测</span><b>${probeTxt}</b></div>
         <div><span>失败计数</span><b>${t.fail_streak} / ${SETTINGS?SETTINGS.settings.fail_threshold:'?'}</b></div>
         <div><span>上次健康</span><b>${ago(t.last_ok_at)}</b></div>
@@ -672,15 +751,46 @@ async function loadTunnels(){
   }catch(e){ $('orphans').innerHTML = `<p class="muted">无法读取：${esc(e.message)}</p>`; }
 }
 
-async function ensureNodes(){
-  if(NODES.length) return;
-  try{ const d = await api('/api/nodes'); NODES = d.nodes || []; }catch(e){}
+// ⚠️ 节点列表**按隧道类型分别缓存** —— 因为 HTTP 组和 TCP/UDP 组用的是两套
+//    独立的偏好（区域/带宽/负载/冷却/关键词），同一个节点在两类里的
+//    selectable/eligible/warnings 都可能不同。混用会让用户看到一个「明明
+//    合格却显示不可选」的节点。
+let NODES_BY_KIND = {};
+function _kindOfType(t){ return (t==='http'||t==='https') ? 'http' : 'port'; }
+
+async function ensureNodes(proxyType){
+  const kind = _kindOfType(proxyType||'tcp');
+  if(NODES_BY_KIND[kind]) return;
+  try{
+    const d = await api('/api/nodes?proxy_type=' + encodeURIComponent(kind==='http'?'http':'tcp'));
+    NODES_BY_KIND[kind] = d.nodes || [];
+  }catch(e){ NODES_BY_KIND[kind] = []; }
 }
+function _nodesFor(proxyType){
+  return NODES_BY_KIND[_kindOfType(proxyType||'tcp')] || [];
+}
+// 兼容旧调用点（failover 对话框等）：默认拿 port 组。
+function nodesNow(){ return _nodesFor('tcp'); }
 
 function fillNodeSelect(){
   const sel = $('f_pin_node_id');
-  sel.innerHTML = '<option value="">自动择优</option>' + NODES.map(n=>
+  const list = _nodesFor($('f_proxy_type').value);
+  sel.innerHTML = '<option value="">自动择优</option>' + list.map(n=>
     `<option value="${n.node_id}"${n.selectable?'':' disabled'}>${esc(n.name)} · ${esc(n.bandwidth)}${n.eligible?'':(n.selectable?' · 低于阈值':' · 不可用')}</option>`).join('');
+}
+
+// 按隧道类型切换对话框里的字段：TCP/UDP 要端口，HTTP/S 要域名。
+// https 还要节点侧证书路径（免费用户基本用不上，但字段得在）。
+function syncTunTypeFields(){
+  const t = $('f_proxy_type').value;
+  const isHttp = (t==='http'||t==='https');
+  $('wrap_port').style.display = isHttp ? 'none' : '';
+  $('wrap_http').style.display = isHttp ? '' : 'none';
+  $('wrap_crt').style.display = (t==='https') ? '' : 'none';
+  // 切换类型后节点下拉要跟着换成对应偏好组的列表。
+  const keep = $('f_pin_node_id').value;
+  fillNodeSelect();
+  if(keep && _nodesFor(t).some(n=>String(n.node_id)===String(keep))) $('f_pin_node_id').value = keep;
 }
 
 async function fillFrpcSelect(){
@@ -691,25 +801,27 @@ async function fillFrpcSelect(){
 }
 
 async function openTunnelDialog(){
-  await ensureNodes();
+  await ensureNodes('tcp');
   await fillFrpcSelect();
   $('tunDlgTitle').textContent='新增隧道'; $('f_id').value='';
-  ['f_name','f_proxy_name','f_local_port','f_desired_remote_port','f_dns_record_name','f_downstream_note']
+  ['f_name','f_proxy_name','f_local_port','f_desired_remote_port','f_desired_domain',
+   'f_route_locations','f_crt_path','f_key_path','f_dns_record_name','f_downstream_note']
     .forEach(i=>$(i).value='');
   // 这个对话框建的都是 mefrp 隧道，后端默认就打 'mefrp'。这里**显式填出来**，
   // 让用户看见「它会被打上什么标签」，而不是保存完才发现 —— 想换直接改就是。
   $('f_tag').value='mefrp';
   $('f_local_ip').value='127.0.0.1'; $('f_proxy_type').value='tcp';
+  $('f_http_plugin').value='';
   $('f_dns_proxied').checked=false; $('f_enabled').checked=true; $('f_auto_failover').checked=true;
   $('f_auto_failover').disabled=false; $('f_manual_note').innerHTML='';
   $('f_pin_node_id').disabled=false;
   $('f_frpc_instance_id').value='0';
   $('f_proxy_name').disabled=false;
-  fillNodeSelect(); $('tunDlg').showModal();
+  syncTunTypeFields(); $('tunDlg').showModal();
 }
 
 async function editTunnel(id){
-  await ensureNodes();
+  await ensureNodes('tcp');
   await fillFrpcSelect();
   const t = TUNNELS.find(x=>x.id===id) || (OVERVIEW ? OVERVIEW.tunnels.find(x=>x.id===id) : null);
   if(!t) return;
@@ -720,6 +832,11 @@ async function editTunnel(id){
   $('f_proxy_name').disabled=true;
   $('f_proxy_type').value=t.proxy_type; $('f_local_ip').value=t.local_ip; $('f_local_port').value=t.local_port;
   $('f_desired_remote_port').value=t.desired_remote_port||'';
+  // desired_domain 库里存的是「文本化 JSON 数组」，这里显示成人看得懂的逗号分隔。
+  $('f_desired_domain').value=_domainText(t.desired_domain||t.current_domain||'');
+  $('f_http_plugin').value=t.http_plugin||'';
+  $('f_route_locations').value=t.route_locations||'';
+  $('f_crt_path').value=t.crt_path||''; $('f_key_path').value=t.key_path||'';
   $('f_dns_record_name').value=t.dns_record_name||''; $('f_dns_proxied').checked=!!t.dns_proxied;
   $('f_downstream_note').value=t.downstream_note||'';
   $('f_tag').value = t.tag || '';
@@ -737,18 +854,40 @@ async function editTunnel(id){
         隧道是被实例带着走的，所以换节点得去「frpc」页换那个实例连的节点，
         或者点这条卡片上的「更新节点配置」重新粘一份新节点的配置。</div>`
     : '';
-  fillNodeSelect(); $('f_pin_node_id').value=t.pin_node_id||'';
+  syncTunTypeFields();
+  $('f_pin_node_id').value=t.pin_node_id||'';
   $('f_frpc_instance_id').value = t.frpc_instance_id || '0';
   $('tunDlg').showModal();
 }
 
+// 把库里存的 domain（可能是 '["a.com"]' 这种文本化 JSON 数组、也可能已经是
+// 逗号分隔裸串）还原成人看得懂的「a.com」。解析失败就原样返回，不吞掉信息。
+function _domainText(raw){
+  const s = String(raw||'').trim();
+  if(!s) return '';
+  if(s.startsWith('[') && s.endsWith(']')){
+    try{ const a = JSON.parse(s); if(Array.isArray(a)) return a.map(x=>String(x).trim()).filter(Boolean).join(','); }catch(e){}
+  }
+  return s.replace(/[;\s]+/g,',');
+}
+
 async function saveTunnel(){
   const id = $('f_id').value;
+  const ptype = $('f_proxy_type').value;
+  const isHttp = (ptype==='http'||ptype==='https');
   const body = {
     name:$('f_name').value.trim(), proxy_name:$('f_proxy_name').value.trim(),
-    proxy_type:$('f_proxy_type').value, local_ip:$('f_local_ip').value.trim()||'127.0.0.1',
+    proxy_type:ptype, local_ip:$('f_local_ip').value.trim()||'127.0.0.1',
     local_port:parseInt($('f_local_port').value,10),
-    desired_remote_port: $('f_desired_remote_port').value?parseInt($('f_desired_remote_port').value,10):null,
+    // 两套入口字段按类型二选一 —— 后端也会再校验一遍（HTTP 必须域名、不能填端口；
+    // TCP/UDP 反之），这里先保证不会把没用的值一起发过去。
+    desired_remote_port: isHttp ? null
+      : ($('f_desired_remote_port').value?parseInt($('f_desired_remote_port').value,10):null),
+    desired_domain: isHttp ? $('f_desired_domain').value.trim() : '',
+    http_plugin: isHttp ? $('f_http_plugin').value : '',
+    route_locations: isHttp ? $('f_route_locations').value.trim() : '',
+    crt_path: (ptype==='https') ? $('f_crt_path').value.trim() : '',
+    key_path: (ptype==='https') ? $('f_key_path').value.trim() : '',
     pin_node_id: $('f_pin_node_id').value?parseInt($('f_pin_node_id').value,10):null,
     dns_record_name:$('f_dns_record_name').value.trim(),
     dns_proxied:$('f_dns_proxied').checked,
@@ -759,6 +898,7 @@ async function saveTunnel(){
     frpc_instance_id: (parseInt($('f_frpc_instance_id').value,10)||0) || null,
   };
   if(!body.name||!body.proxy_name||!body.local_port){ alert('显示名、隧道名、本地端口都是必填'); return; }
+  if(isHttp && !body.desired_domain){ alert('HTTP/HTTPS 隧道必须填写「绑定域名」'); return; }
   try{
     if(id){ const {name,proxy_name,...rest}=body; await api('/api/tunnels/'+id,{method:'PATCH',body:JSON.stringify(rest)}); }
     else { await api('/api/tunnels',{method:'POST',body:JSON.stringify(body)}); }
@@ -794,21 +934,30 @@ async function failover(id){
   const t = TUNNELS.find(x=>x.id===id)
         || (OVERVIEW ? OVERVIEW.tunnels.find(x=>x.id===id) : null);
   FO_ID = id;
-  await ensureNodes();
+  // ⚠️ 按这条隧道的类型取对应的节点口径 —— HTTP 组和 TCP/UDP 组的可用性判定
+  //    用的是两套偏好，混用会显示一个「按另一套口径算出来」的可用性。
+  const ptype = (t && t.proxy_type) || 'tcp';
+  await ensureNodes(ptype);
+  const list = _nodesFor(ptype);
   const sel = $('fo_node_id');
-  const good = NODES.filter(n=>n.eligible);
-  const soft = NODES.filter(n=>n.selectable && !n.eligible);
-  const hard = NODES.filter(n=>!n.selectable);
+  const good = list.filter(n=>n.eligible);
+  const soft = list.filter(n=>n.selectable && !n.eligible);
+  const hard = list.filter(n=>!n.selectable);
   sel.innerHTML = '<option value="">自动择优（推荐）</option>'
     + good.map(n=>`<option value="${n.node_id}">${esc(n.name)} · ${esc(n.bandwidth)} · 负载 ${n.load_percent}%</option>`).join('')
     + (soft.length ? `<optgroup label="可手动指定（不满足自动择优阈值）">`
-        + soft.map(n=>`<option value="${n.node_id}">${esc(n.name)} · ${esc(n.bandwidth)} — ${esc(n.warnings.join('、'))}</option>`).join('')
+        + soft.map(n=>`<option value="${n.node_id}">${esc(n.name)} · ${esc(n.bandwidth)} — ${esc((n.warnings||[]).join('、'))}</option>`).join('')
         + `</optgroup>` : '')
     + (hard.length ? `<optgroup label="不可用">`
-        + hard.map(n=>`<option value="${n.node_id}" disabled>${esc(n.name)} — ${esc(n.blockers.join('、'))}</option>`).join('')
+        + hard.map(n=>`<option value="${n.node_id}" disabled>${esc(n.name)} — ${esc((n.blockers||[]).join('、'))}</option>`).join('')
         + `</optgroup>` : '');
+  const isHttp = (ptype==='http'||ptype==='https');
+  const entryTxt = isHttp
+    ? `域名 <b>${esc(t?_domainText(t.current_domain||t.desired_domain||''):'—')||'—'}</b>`
+    : `端口 <b>${t?t.current_remote_port||'—':'—'}</b>`;
   $('foInfo').innerHTML = t
-    ? `隧道 <b>${esc(t.name)}</b> 当前在 <b>${esc(t.node_name||'—')}</b>（${esc(t.node_hostname||'')}，端口 <b>${t.current_remote_port||'—'}</b>）`
+    ? `隧道 <b>${esc(t.name)}</b> 当前在 <b>${esc(t.node_name||'—')}</b>（${esc(t.node_hostname||'')}，${entryTxt}）`
+      + (isHttp ? `<br><span class="muted">HTTP 隧道切换后<b>域名不变</b> —— 下游 DNS 不用动，这正是它比 TCP 省事的地方。</span>` : '')
       + (t.frpc_bound
           ? `<br>它由 frpc 容器 <b>${esc(t.frpc_instance_name||'—')}</b> 承载 ——
              切换会重建这个容器的配置并重启它。`
@@ -858,37 +1007,80 @@ async function adopt(proxy_id){
 }
 
 // ---------- 节点 ----------
+// 当前正在看哪一套偏好口径（port / http）。两套偏好各自独立，节点表的
+// 可用性判定也就跟着变 —— 所以这是个真实的切换，不是纯展示。
+let NODE_TAB = 'port';
+function switchNodeTab(kind){
+  NODE_TAB = (kind==='http') ? 'http' : 'port';
+  document.querySelectorAll('#nodeTabs .act').forEach(b=>{
+    b.classList.toggle('on', b.dataset.kind === NODE_TAB);
+  });
+  loadNodes();
+}
+function _prefSettings(kind){
+  const s = (SETTINGS && SETTINGS.settings) || {};
+  if(kind==='http'){
+    return {bw:s.http_min_bandwidth_mbps, load:s.http_max_load_percent,
+            kw:s.http_prefer_keywords, region:s.http_allow_regions,
+            cd:s.http_node_cooldown};
+  }
+  return {bw:s.min_bandwidth_mbps, load:s.max_load_percent,
+          kw:s.prefer_keywords, region:s.allow_regions, cd:s.node_cooldown};
+}
 async function loadNodes(){
-  const d = await api('/api/nodes');
-  NODES = d.nodes;
+  // 每次从后端实拉对应口径的节点表，别复用另一套的缓存 —— 复用会把
+  // 「按 A 口径算出来的可用性」画到 B 口径的页签上。
+  let d;
+  try{
+    d = await api('/api/nodes?proxy_type=' + (NODE_TAB==='http' ? 'http' : 'tcp'));
+  }catch(e){ $('nodeList').innerHTML = `<p class="muted">读取失败：${esc(e.message)}</p>`; return; }
+  NODES = d.nodes || [];
+  NODES_BY_KIND[NODE_TAB] = NODES;
   // 用户组有两个值：group 是机器名（匹配节点 allowGroup 用），friendly_group 是展示名。
   $('groupInfo').textContent = d.user_group
     ? `当前用户组：${d.user_group_friendly||d.user_group}（${d.user_group}）`
-      + (d.address_known!==undefined ? ` ｜ 已知公网地址的节点：${d.address_known}/${d.nodes.length}` : '')
+      + (d.address_known!==undefined ? ` ｜ 已知公网地址的节点：${d.address_known}/${NODES.length}` : '')
     : `当前用户组：未知${d.user_group_error?`（${d.user_group_error}）`:''}`;
+  const p = _prefSettings(NODE_TAB);
+  const groupName = NODE_TAB==='http' ? 'HTTP/HTTPS' : 'TCP/UDP';
   $('pickRule').textContent = SETTINGS
-    ? `择优规则：带宽 ≥ ${SETTINGS.settings.min_bandwidth_mbps}Mbps ｜ 负载 ≤ ${SETTINGS.settings.max_load_percent}% ｜ 节点偏好「${SETTINGS.settings.prefer_keywords||'无'}」｜ 区域「${SETTINGS.settings.allow_regions||'不限'}」`
+    ? `【${groupName} 口径】带宽 ≥ ${p.bw}Mbps ｜ 负载 ≤ ${p.load}% ｜ 节点偏好「${p.kw||'无'}」｜ 区域「${p.region||'不限'}」｜ 节点冷却 ${p.cd}s`
     : '';
+  const prefs = (SETTINGS && SETTINGS.node_prefs) || {};
   $('nodeList').innerHTML = NODES.length ? `<table><thead><tr><th>节点</th><th>区域</th><th>带宽</th><th>负载</th><th>隧道</th><th>权限</th><th>可用性</th><th>操作</th></tr></thead><tbody>${
     NODES.map(n=>{
       let avail;
       if(n.eligible) avail = '<span class="pill ok">自动择优可用</span>';
-      else if(n.selectable) avail = `<span class="pill warn">可手动指定</span><div class="muted" style="font-size:11px;margin-top:4px">${esc(n.warnings.join('、'))}</div>`;
-      else avail = `<span class="pill idle">不可用</span><div class="muted" style="font-size:11px;margin-top:4px">${esc(n.blockers.join('、'))}</div>`;
+      else if(n.selectable) avail = `<span class="pill warn">可手动指定</span><div class="muted" style="font-size:11px;margin-top:4px">${esc((n.warnings||[]).join('、'))}</div>`;
+      else avail = `<span class="pill idle">不可用</span><div class="muted" style="font-size:11px;margin-top:4px">${esc((n.blockers||[]).join('、'))}</div>`;
+      const entry = (prefs[n.node_id]||{}).http_entry || '';
       return `<tr>
-      <td>${n.keyword_hit?`<span class="pill ok" title="命中节点偏好第 ${n.keyword_rank+1} 顺位">偏好 ${n.keyword_rank+1}</span> `:''}${esc(n.name)}<div class="muted mono" style="font-size:11px">${esc(n.hostname||'')}</div></td>
+      <td>${n.keyword_hit?`<span class="pill ok" title="命中节点偏好第 ${n.keyword_rank+1} 顺位">偏好 ${n.keyword_rank+1}</span> `:''}${esc(n.name)}<div class="muted mono" style="font-size:11px">${esc(n.hostname||'')}</div>
+        ${entry?`<div class="muted mono" style="font-size:11px">HTTP 入口 ${esc(entry)}</div>`:''}</td>
       <td class="mono">${esc(n.region||'—')}</td>
       <td class="mono">${esc(n.bandwidth||'—')}</td>
       <td class="mono">${n.load_percent}%</td>
       <td class="mono">${n.online_proxy}</td>
       <td class="mono muted" style="font-size:11px">${esc(n.allow_group||'不限')}</td>
       <td>${avail}</td>
-      <td><button class="act" onclick="setPref(${n.node_id},${n.excluded?0:1})">${n.excluded?'取消排除':'排除'}</button></td>
+      <td class="ops"><button class="act" onclick="setPref(${n.node_id},${n.excluded?0:1})">${n.excluded?'取消排除':'排除'}</button><button class="act" onclick="setHttpEntry(${n.node_id})">HTTP 入口</button></td>
     </tr>`;}).join('')}</tbody></table>` : '<p class="muted">还没有节点数据。点「重新拉取」。</p>';
 }
-async function refreshNodes(){ await api('/api/nodes/refresh',{method:'POST'}); loadNodes(); loadOverview(); }
+async function refreshNodes(){ await api('/api/nodes/refresh',{method:'POST'}); NODES_BY_KIND={}; loadNodes(); loadOverview(); }
 async function setPref(id, excluded){
-  await api(`/api/nodes/${id}/pref`,{method:'POST',body:JSON.stringify({excluded:!!excluded})}); loadNodes();
+  await api(`/api/nodes/${id}/pref`,{method:'POST',body:JSON.stringify({excluded:!!excluded})});
+  NODES_BY_KIND={}; loadNodes();
+}
+// HTTP/HTTPS 隧道的 DNS 要解析到「节点的 HTTP 入口域名」。官方要求 CNAME 到
+// 节点域名，但非管理员账号看不到它，所以让用户手填；不填就退回节点 IP 走 A 记录。
+async function setHttpEntry(id){
+  const cur = ((SETTINGS && SETTINGS.node_prefs) || {})[id] || {};
+  const v = prompt('这个节点的 HTTP 入口域名（留空 = 用节点 IP 走 A 记录）\n\n'
+    + '说明：HTTP/HTTPS 隧道的绑定域名要解析到节点上。填了域名就走 CNAME，\n'
+    + '更抗节点换 IP；不填就写死节点 IP 的 A 记录。', cur.http_entry || '');
+  if(v === null) return;
+  await api(`/api/nodes/${id}/pref`,{method:'POST',body:JSON.stringify({http_entry:v.trim()})});
+  await loadSettings(); loadNodes();
 }
 
 // ---------- 外部节点（手工节点）----------
@@ -1510,16 +1702,63 @@ async function loadEvents(){
 }
 
 // ---------- 设置 ----------
-const SET_KEYS = ['mefrp_token','cf_api_token','gotify_url','gotify_token','engine_interval','probe_interval','probe_timeout','probe_mode','fail_threshold','failover_cooldown','node_cooldown','alert_after_seconds','min_bandwidth_mbps','max_load_percent','allow_regions','prefer_keywords','auto_failover','auto_dns_sync','auto_restart_frpc','notify_on_probe_fail','session_ttl_hours','login_max_attempts','login_lockout_seconds'];
-// ---------- 节点偏好（有序多选）----------
-// 存库仍是 prefer_keywords 一个逗号分隔串，**顺序就是优先级**。
-// 真正的输入框是隐藏的 #s_prefer_keywords —— 这样上面 SET_KEYS 那套
-// 读 / 写设置的老逻辑一行都不用改，chips 只是它的可视化编辑器。
+const SET_KEYS = ['mefrp_token','cf_api_token','gotify_url','gotify_token','engine_interval','probe_interval','probe_timeout','probe_mode','http_probe_path','fail_threshold','failover_cooldown','node_cooldown','alert_after_seconds','min_bandwidth_mbps','max_load_percent','allow_regions','prefer_keywords','http_min_bandwidth_mbps','http_max_load_percent','http_allow_regions','http_prefer_keywords','http_node_cooldown','auto_failover','auto_dns_sync','auto_restart_frpc','notify_on_probe_fail','session_ttl_hours','login_max_attempts','login_lockout_seconds'];
+
+// ---------- 区域多选（两套偏好各一份）----------
+// 存库仍是逗号分隔串（cn / cnos / oversea），这里给它一个复选框 + 快捷选择的面板。
+// 「所有海外节点」= 港澳台 + 海外（cnos,oversea）—— 这也是 HTTP 组的默认值，
+// 因为大陆节点建 HTTP/S 站要报备域名。
+const REGION_DEFS = [['cn','中国大陆'],['cnos','港澳台'],['oversea','海外']];
+const REGION_PRESETS = [
+  ['不限', ''],
+  ['仅中国大陆', 'cn'],
+  ['所有海外节点（港澳台+海外）', 'cnos,oversea'],
+  ['仅港澳台', 'cnos'],
+  ['仅海外', 'oversea'],
+];
+function _regionList(key){
+  return ($('s_'+key).value||'').split(',').map(s=>s.trim()).filter(Boolean);
+}
+function renderRegions(key, hostId){
+  const cur = _regionList(key);
+  const boxes = REGION_DEFS.map(([v,label])=>
+    `<label class="chk" style="margin:0 14px 0 0"><input type="checkbox" data-region="${v}"${cur.includes(v)?' checked':''}`
+    + ` onchange="toggleRegion('${key}','${v}',this.checked)"><span style="margin-left:5px">${label}</span></label>`).join('');
+  const btns = REGION_PRESETS.map(([label,val])=>
+    `<button class="act" onclick="setRegionPreset('${key}','${val}')">${label}</button>`).join('');
+  const none = cur.length ? '' : '<span class="muted" style="margin-left:6px">当前不限区域</span>';
+  $(hostId).innerHTML = `<div class="flex" style="flex-wrap:wrap;align-items:center;gap:2px">${boxes}${none}</div>`
+    + `<div class="flex" style="flex-wrap:wrap;margin-top:6px;gap:6px">${btns}</div>`;
+}
+function toggleRegion(key, val, on){
+  const l = new Set(_regionList(key));
+  if(on) l.add(val); else l.delete(val);
+  $('s_'+key).value = REGION_DEFS.map(([v])=>v).filter(v=>l.has(v)).join(',');
+  renderRegions(key, key==='http_allow_regions' ? 'regions_http' : 'regions_port');
+}
+function setRegionPreset(key, val){
+  $('s_'+key).value = val;
+  renderRegions(key, key==='http_allow_regions' ? 'regions_http' : 'regions_port');
+}
+
+// ---------- 节点偏好（有序多选，两套偏好各一份）----------
+// 存库仍是 prefer_keywords / http_prefer_keywords 两个逗号分隔串，**顺序就是优先级**。
+// 真正的输入框是隐藏的 #s_<key> —— 这样上面 SET_KEYS 那套读 / 写设置的老逻辑
+// 一行都不用改，chips 只是它的可视化编辑器。
+let PREF_TAB = 'port';
+function _prefKey(){ return PREF_TAB==='http' ? 'http_prefer_keywords' : 'prefer_keywords'; }
+function switchPrefTab(kind){
+  PREF_TAB = (kind==='http') ? 'http' : 'port';
+  document.querySelectorAll('#prefTabs .act').forEach(b=>{
+    b.classList.toggle('on', b.dataset.kind === PREF_TAB);
+  });
+  renderPrefChips();
+}
 function prefList(){
-  return ($('s_prefer_keywords').value||'').split(',')
+  return ($('s_'+_prefKey()).value||'').split(',')
     .map(s=>s.trim()).filter((s,i,a)=>s && a.indexOf(s)===i);
 }
-function prefStore(list){ $('s_prefer_keywords').value = list.join(','); renderPrefChips(); }
+function prefStore(list){ $('s_'+_prefKey()).value = list.join(','); renderPrefChips(); }
 function addPref(){
   const el = $('prefNew'), k = el.value.trim().replace(/[，,]/g,'');
   if(!k) return;
@@ -1534,16 +1773,22 @@ function movePref(i,d){
   [l[i], l[j]] = [l[j], l[i]];      // 顺序 = 优先级，所以「上移/下移」是这功能的核心操作
   prefStore(l);
 }
-function resetPref(){ prefStore(['北京']); }
+function resetPref(){
+  // 默认值按口径分：TCP/UDP 用「北京」，HTTP 组不设默认（区域已经默认避开大陆了，
+  // 再塞一个「北京」反而自相矛盾）。
+  prefStore(PREF_TAB==='http' ? [] : ['北京']);
+}
 function renderPrefChips(){
   const l = prefList();
+  const hint = PREF_TAB==='http'
+    ? '<span class="muted">没有偏好 —— 所有节点同权，只按带宽 / 负载排。</span>'
+    : '<span class="muted">没有偏好 —— 所有节点同权，只按带宽 / 负载排。</span>';
   $('prefChips').innerHTML = l.length ? l.map((k,i)=>`<span class="chip">
       <b>${i+1}</b>${esc(k)}
       <button onclick="movePref(${i},-1)" ${i===0?'disabled':''} title="上移">↑</button>
       <button onclick="movePref(${i},1)" ${i===l.length-1?'disabled':''} title="下移">↓</button>
       <button onclick="delPref(${i})" title="删除">×</button>
-    </span>`).join('')
-    : '<span class="muted">没有偏好 —— 所有节点同权，只按带宽 / 负载排。</span>';
+    </span>`).join('') : hint;
   prefPreview();
 }
 // 预览走后端，复用 engine.keyword_rank —— 保证「预览看到的」和「真正择优用的」是同一份逻辑
@@ -1570,7 +1815,10 @@ async function loadSettings(){
   SET_KEYS.forEach(k=>{ const el = $('s_'+k); if(!el) return;
     if(el.type==='checkbox') el.checked = !!s[k]; else el.value = (s[k]===undefined||s[k]===null)?'':s[k]; });
   $('s_mefrp_token').value=''; $('s_cf_api_token').value=''; $('s_gotify_token').value='';
-  renderPrefChips();          // 节点偏好是 chips 编辑器，值灌进隐藏框后要重画一次
+  // 区域是复选框面板，隐藏框灌完值要重画；节点偏好是 chips 编辑器，同理。
+  renderRegions('allow_regions','regions_port');
+  renderRegions('http_allow_regions','regions_http');
+  renderPrefChips();
   $('pw_user').placeholder = SETTINGS.username || 'admin';
   renderPwdWarn();
 }

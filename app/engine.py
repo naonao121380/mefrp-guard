@@ -28,9 +28,10 @@ from typing import Any
 
 from . import frpc, frpcparse, store
 from .cloudflare import CloudflareClient, CloudflareError
-from .mefrp import MefrpApiError, MefrpClient, MefrpError, Node, Proxy
+from .mefrp import (MefrpApiError, MefrpClient, MefrpError, Node, Proxy,
+                    is_http_type, join_domains, kind_of, parse_domains)
 from .notifier import Notifier
-from .settings import BOOTSTRAP
+from .settings import BOOTSTRAP, pref_key
 
 
 # 哨兵：区分「调用方没传 current_proxy_id」与「明确要求不删任何 proxy」。
@@ -135,8 +136,79 @@ async def tcp_probe(host: str, port: int, timeout: float = 4.0) -> tuple[bool, s
         return False, f"连接 {host}:{port} 失败：{exc}"
 
 
+async def http_probe(url: str, timeout: float = 6.0) -> tuple[bool, str]:
+    """HTTP 层端到端探测：GET 一个 URL，**2xx/3xx 算通**。
+
+    这是 http/https 隧道唯一有意义的 L3 判据 —— 原因见 `probe_plan` 里那段
+    「为什么 http 不能做 TCP 探测」。
+
+    判定为什么这么定：
+      · **3xx 也算通** —— 本地服务在根路径上 302 跳登录页是极常见的，判成故障
+        会造成「健康隧道被反复切换」，而这是这套代码里最怕的事。
+      · **4xx/5xx 算不通** —— 多半意味着节点反代没匹配到这条隧道（返回了它自己
+        的 404 页），或者本地服务真的挂了。⚠️ 但「本地服务在探测路径上本来就
+        返回 4xx」的情况也存在（纯 API 服务、带鉴权的后台），所以文案里必须
+        带上状态码，并把「改探测路径」这条出路写出来 —— 否则用户只会看到一片红
+        却不知道是自己配的路径不对。
+
+    **不跟随重定向**：跟了之后最终状态码会变成目标页的，反而看不出中间那层是
+    不是通的，而且会平白多打好几个请求。
+
+    ⚠️ `import httpx` 放在函数里而不是模块顶层：engine 模块被「纯逻辑测试」导入
+    时是塞了假 httpx 的（见 tests 里 sys.modules 那套注入），顶层导入会把
+    `httpx.AsyncClient` 这类属性需求提前压到桩上。真跑 http 探测时拿到的才是真货。
+    """
+    if not url:
+        return False, "没有可用的绑定域名，无法做 HTTP 探测"
+    import httpx
+    try:
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as c:
+            r = await c.get(url)
+    except Exception as exc:                      # noqa: BLE001 —— 探测必须吞掉一切异常
+        # ⚠️ 必须带**异常类型名**：httpx 的超时类异常 `str()` 经常是空串，
+        #    只打 `{exc}` 会得到一条没有任何信息的事件（CF 客户端里踩过这个坑）。
+        return False, f"HTTP 探测失败（{type(exc).__name__}）：{exc or '无详情'}"
+    code = int(r.status_code)
+    if 200 <= code < 400:
+        return True, f"HTTP {code}"
+    return False, (f"HTTP {code} —— 链路是通的但服务返回了 {code}。"
+                   "若你的服务在这个路径上本来就返回 4xx/5xx，"
+                   "请到设置里把「HTTP 探测路径」改成能返回 2xx 的路径")
+
+
+def http_probe_url(proxy_type: str, domain: str, path: str = "/") -> str:
+    """拼出 HTTP 探测的 URL。
+
+    ⚠️ 用**绑定域名**而不是节点地址：这条隧道的身份就是域名，节点上的反代也是
+    按请求的 Host 头分流的。拿节点 IP 去请求只会拿到反代的默认页，探不出任何
+    有用的东西 —— 那还不如不探。
+
+    scheme 按**隧道类型**定，不是按本地服务：
+      · `http` 隧道对外就是明文，哪怕本地服务是 HTTPS（那是 `http2https`
+        插件在节点侧做的一次转换）；
+      · `https` 隧道对外是 TLS（节点侧拿你给的证书终结）。
+    """
+    host = parse_domains(domain)
+    if not host:
+        return ""
+    scheme = "https" if str(proxy_type or "").strip().lower() == "https" else "http"
+    p = (path or "/").strip() or "/"
+    if not p.startswith("/"):
+        p = "/" + p
+    return f"{scheme}://{host[0]}{p}"
+
+
 # 端到端探测模式，与 settings.DEFAULT_SETTINGS["probe_mode"] 的取值一致。
-PROBE_MODES = ("auto", "tcp", "none")
+#   auto —— tcp 走 TCP 探测；udp 与 http/https 都**跳过**（各有各的理由，见 probe_plan）
+#   tcp  —— 一律 TCP 探测（逃生口；对 http 隧道是假阳性）
+#   http —— 按类型各用各的：tcp 走 TCP，http/https 走真实 HTTP 请求
+#   none —— 全关
+PROBE_MODES = ("auto", "tcp", "http", "none")
+
+# 探测种类。`probe_plan` 返回这三个值之一，调用方按它分流。
+PROBE_NONE = "none"
+PROBE_TCP = "tcp"
+PROBE_HTTP = "http"
 
 # ★ 连续失败**多久**才升级成 error 告警（秒）。默认 30 分钟。
 #
@@ -183,33 +255,56 @@ def _fmt_span(seconds: float) -> str:
     return f"{s} 秒"
 
 
-def probe_plan(proxy_type: str, mode: str) -> tuple[bool, str]:
-    """决定这条隧道要不要做 TCP 端到端探测。返回 (是否探测, 不探测的原因)。
+def probe_plan(proxy_type: str, mode: str) -> tuple[str, str]:
+    """决定这条隧道这一轮该做哪种端到端探测。返回 (探测种类, 不做探测的原因)。
 
-    ⚠️ 为什么 udp 隧道默认不探测 —— 这是个会主动造成破坏的坑，不是洁癖：
+    探测种类是 `"tcp"` / `"http"` / `"none"` 三者之一，调用方（`_probe_cached`）
+    按它分流。
 
-    mefrp 的 udp 隧道在节点上监听的是 **UDP** 端口，没有 TCP 监听。
-    对它做 `asyncio.open_connection`（TCP 三次握手）**必然失败**，
+    ⚠️ 这里每一条「跳过」都是踩出来的，不是洁癖：
+
+    **udp 不能做 TCP 探测** —— mefrp 的 udp 隧道在节点上监听的是 **UDP** 端口，
+    没有 TCP 监听。对它做 `asyncio.open_connection`（三次握手）**必然失败**，
     于是这条完全健康的隧道会被永久判成「异常」：
 
         fail_streak 一路涨 → 到阈值 → 自动切换被触发
         → 隧道被搬到另一个节点 → 地址变了、DNS 要改、下游要改
         → 新节点上依然是 udp，依然探不通 → 再切换 …… 无限循环。
 
-    UDP 没有连接语义，「可达」只能靠应用层握手来证明（比如 OpenVPN 的
-    控制通道、WireGuard 的握手包）。那属于业务侧的事，不是这个工具该做的，
-    所以这里诚实地**跳过**，并在 UI 上明说「不适用」，而不是假装探测失败。
+    **http/https 也不能做 TCP 探测**，但原因跟 udp 正好相反 —— 不是「探不到」，
+    而是「**探了也白探，而且是假阳性**」：
+
+        节点上跑着反代，它对**任何** Host 都会接受 TCP 连接并回一个页面。
+        所以 `connect(节点:80)` 永远成功 —— 哪怕这条隧道根本没建起来、
+        哪怕绑定域名还解析在别的节点上。拿它当健康判据等于没判。
+
+    那 http 隧道怎么探？用**真的 HTTP 请求**（`mode="http"` 时）：GET 绑定域名，
+    看能不能拿到 2xx/3xx。这是唯一能验到「域名解析对不对、链路通不通」的办法。
+    ⚠️ 但它有个前提：域名必须**已经**解析到当前节点，而 DNS 生效是异步的，
+    所以刚切换完的那一小段时间会误报 —— 这是默认不启用它的原因。
     """
     pt = (proxy_type or "tcp").strip().lower()
     m = (mode or "auto").strip().lower()
     if m == "none":
-        return False, "已按设置关闭端到端探测（probe_mode = none）"
+        return PROBE_NONE, "已按设置关闭端到端探测（probe_mode = none）"
     if m == "tcp":
-        return True, ""
-    # auto：只有 tcp 隧道才做 TCP 探测
+        # 逃生口：所有隧道一律 TCP 探。⚠️ 对 http 隧道来说这是**假阳性**，
+        # 页面上要提示，别让用户以为「探通了就没事」。
+        return PROBE_TCP, ""
+    if m == "http":
+        # 按类型各用各的：http 组走真 HTTP 请求，tcp 照旧，udp 仍然跳过
+        # （udp 那层协议不匹配跟探测方式无关，换什么方式都探不到）。
+        if pt == "udp":
+            return PROBE_NONE, "UDP 隧道不做端到端探测（协议不匹配，任何 TCP/HTTP 探测都不适用）"
+        return (PROBE_HTTP, "") if pt in ("http", "https") else (PROBE_TCP, "")
+    # auto（默认）
     if pt == "udp":
-        return False, "UDP 隧道不做 TCP 端到端探测（协议不匹配，探测必然失败）"
-    return True, ""
+        return PROBE_NONE, "UDP 隧道不做 TCP 端到端探测（协议不匹配，探测必然失败）"
+    if pt in ("http", "https"):
+        return PROBE_NONE, ("HTTP 隧道不做 TCP 探测：节点反代对任何 Host 都会握手成功，"
+                            "探出来永远是「通」（假阳性）。"
+                            "要真探请在设置里把探测模式改成「按类型（http）」")
+    return PROBE_TCP, ""
 
 
 def scope_key(manual_node_id: Any) -> int | None:
@@ -275,7 +370,13 @@ class GuardEngine:
         # (时间戳, 是否可达, 说明)。第二个元素是**三态**：True/False/None，
         # None 表示「协议不适用探测，已跳过」—— 和「探测失败」是两回事。
         self.probe_cache: dict[int, tuple[float, bool | None, str]] = {}
-        self.node_cooldown: dict[int, float] = {}
+
+        # 刚被切走的节点在冷却期内不再选它。★ 键是 **`(隧道类型组, node_id)`**，
+        # 不是单纯的 node_id —— 「port」和「http」是两套独立的偏好体系
+        # （见 settings.PREF_KEYS），同一台节点上，一条 TCP 隧道刚失败不代表
+        # 一条 HTTP 隧道也要躲开它（两者用到的能力根本不同：HTTP 靠节点反代 +
+        # 域名，TCP 靠裸端口）。所以冷却也要按类型分开记。
+        self.node_cooldown: dict[tuple[str, int], float] = {}
 
         # 外部节点的可达性缓存：node_id -> (时间戳, 是否可达, 说明)。
         # 探的是 frps 的**控制端口**（serverAddr:serverPort），和隧道的
@@ -895,7 +996,11 @@ class GuardEngine:
 
         verdict = self._evaluate(tunnel, proxy)
 
-        # 第三层：端到端 TCP 探测（带缓存，避免每个 tick 都探）
+        # 第三层：端到端探测（带缓存，避免每个 tick 都探）。
+        # ⚠️ 探测方式由隧道类型决定，见 probe_plan：
+        #   · TCP/UDP 隧道 —— 探节点地址 + 远程端口
+        #   · HTTP/HTTPS 隧道 —— 探「绑定域名」（节点反代按 Host 头分流），
+        #     而且 auto 模式下默认跳过（TCP 层探不出问题，见 probe_plan 注释）
         if verdict.ok and proxy is not None:
             host = await self.node_address(proxy.node_id)
             if not host:
@@ -906,8 +1011,14 @@ class GuardEngine:
                     "address",
                 )
             else:
-                ok, why = await self._probe_cached(tid, host, proxy.remote_port,
-                                                   tunnel.get("proxy_type", "tcp"))
+                # ★ domain 优先取 mefrp 上**实际**绑定的域名（proxy.domain），
+                #   退回库里记的 current_domain —— 两者理论上一致，但 proxy 是
+                #   权威来源（刚刚从 API 拉回来的）。
+                ok, why = await self._probe_cached(
+                    tid, host, proxy.remote_port or 0,
+                    tunnel.get("proxy_type", "tcp"),
+                    domain=str(proxy.domain or tunnel.get("current_domain") or ""),
+                )
                 # 只有明确的 False 才算故障；None 表示「不适用，已跳过」（udp 隧道）。
                 if ok is False:
                     verdict = Verdict(False, why, "probe")
@@ -992,15 +1103,28 @@ class GuardEngine:
             return
 
         host = str(node["server_addr"] or "").strip()
-        port = int(tunnel.get("current_remote_port") or 0)
-        if not port:
-            store.update_tunnel(tid, {
-                "last_error": "这条隧道没有远程端口，无法探测"
-                              "（导入配置时该段没写 remotePort）"})
-            return
+        ptype = tunnel.get("proxy_type", "tcp")
+        # ★ HTTP/HTTPS 隧道没有远程端口（mefrp 侧 remotePort 恒为 null），
+        #   探测靠绑定域名。所以「没有远程端口」这条报错只对 port 组成立。
+        if is_http_type(ptype):
+            if not parse_domains(tunnel.get("current_domain") or ""):
+                store.update_tunnel(tid, {
+                    "last_error": "这条 HTTP 隧道没有绑定域名，无法探测"
+                                  "（导入配置时该段没写 domain）"})
+                return
+            port = 0
+        else:
+            port = int(tunnel.get("current_remote_port") or 0)
+            if not port:
+                store.update_tunnel(tid, {
+                    "last_error": "这条隧道没有远程端口，无法探测"
+                                  "（导入配置时该段没写 remotePort）"})
+                return
 
-        ok, why = await self._probe_cached(tid, host, port,
-                                           tunnel.get("proxy_type", "tcp"))
+        ok, why = await self._probe_cached(
+            tid, host, port, ptype,
+            domain=str(tunnel.get("current_domain") or ""),
+        )
 
         if ok is True:
             if tunnel["fail_streak"]:
@@ -1083,19 +1207,24 @@ class GuardEngine:
         return Verdict(True)
 
     async def _probe_cached(self, tunnel_id: int, host: str, port: int,
-                            proxy_type: str = "tcp") -> tuple[bool | None, str]:
+                            proxy_type: str = "tcp",
+                            domain: str = "") -> tuple[bool | None, str]:
         """端到端探测（带缓存）。返回 (是否可达, 说明)。
 
         ⚠️ 第一个返回值是**三态**，调用方必须区分开，否则会误伤：
 
           True  —— 探测通过
           False —— 探测失败（真故障）
-          None  —— **不适用，已跳过**（比如 udp 隧道）。这不是失败，
-                   绝不能拿它去涨 fail_streak，否则健康隧道会被反复切换。
+          None  —— **不适用，已跳过**（比如 udp 隧道，或者 auto 模式下的 http
+                   隧道）。这不是失败，绝不能拿它去涨 fail_streak，
+                   否则健康隧道会被反复切换。
+
+        `host`/`port` 给 TCP 探测用；`domain` 给 HTTP 探测用 —— 两者不可能同时
+        需要（`probe_plan` 已经按隧道类型分好流了）。
         """
         mode = str(store.get_setting("probe_mode", "auto") or "auto")
-        do_probe, skip_why = probe_plan(proxy_type, mode)
-        if not do_probe:
+        kind, skip_why = probe_plan(proxy_type, mode)
+        if kind == PROBE_NONE:
             self.probe_cache[tunnel_id] = (time.time(), None, skip_why)
             return None, skip_why
 
@@ -1105,7 +1234,20 @@ class GuardEngine:
         cached = self.probe_cache.get(tunnel_id)
         if cached and now - cached[0] < interval:
             return cached[1], cached[2]
-        ok, why = await tcp_probe(host, port, timeout)
+
+        if kind == PROBE_HTTP:
+            url = http_probe_url(proxy_type, domain,
+                                 str(store.get_setting("http_probe_path", "/") or "/"))
+            if not url:
+                why = "这条 HTTP 隧道没有绑定域名，无法做 HTTP 探测"
+                self.probe_cache[tunnel_id] = (now, None, why)
+                return None, why
+            # HTTP 比 TCP 多一次 TLS 握手 + 一个来回，超时给宽一点，
+            # 但至少 6 秒 —— 用 probe_timeout 那种 4 秒在海外节点上容易误判。
+            ok, why = await http_probe(url, max(timeout, 6.0))
+        else:
+            ok, why = await tcp_probe(host, port, timeout)
+
         self.probe_cache[tunnel_id] = (now, ok, why)
         return ok, why
 
@@ -1132,15 +1274,22 @@ class GuardEngine:
             就永远走不通。硬约束不过则直接失败，并把原因回给调用方。
           * soft_prefer=True（隧道里配的「锁定节点」）—— 硬约束不过就静默退回
             自动择优（由调用方决定要不要记事件）。
+
+        ★ **软偏好按隧道类型分组**：tcp/udp 用 `allow_regions` / `min_bandwidth_mbps`
+        / `max_load_percent` / `prefer_keywords` 那一套；http/https 用 `http_*`
+        那一套（见 settings.PREF_KEYS）。两类的约束来源不同 —— 最典型的是
+        http 受「备案」限制，默认就排除了大陆节点 —— 所以不能共用一份阈值。
+        分组只发生在**取键名**这一步，下面的筛选逻辑一份都不用改。
         """
         exclude = set(exclude or set())
+        kind = kind_of(proxy_type)
         now = time.time()
         s = store.get_settings()
-        min_bw = float(s.get("min_bandwidth_mbps", 25) or 0)
-        max_load = int(s.get("max_load_percent", 90) or 100)
+        min_bw = float(s.get(pref_key(kind, "min_bandwidth"), 25) or 0)
+        max_load = int(s.get(pref_key(kind, "max_load"), 90) or 100)
         regions = {r.strip().lower() for r in
-                   str(s.get("allow_regions") or "").split(",") if r.strip()}
-        keywords = normalize_keywords(s.get("prefer_keywords"))
+                   str(s.get(pref_key(kind, "regions")) or "").split(",") if r.strip()}
+        keywords = normalize_keywords(s.get(pref_key(kind, "keywords")))
         prefs = store.list_node_prefs()
 
         stats = {"total": len(self.nodes), "offline": 0, "disabled": 0,
@@ -1189,7 +1338,11 @@ class GuardEngine:
             if node.node_id in exclude:
                 stats["excluded"] += 1
                 continue
-            if node.node_id in self.node_cooldown and self.node_cooldown[node.node_id] > now:
+            # ⚠️ 冷却期按 (隧道类型组, 节点) 记，**不是只按节点**：
+            #    同一个节点对 tcp 掉链子，不代表它的 HTTP 反代也不行；反过来
+            #    也一样。共用一个冷却表会让「刚被 TCP 切走的节点」连带被 HTTP
+            #    隧道躲开，而两条隧道的 `node_cooldown` 时长本来就配得不一样。
+            if self.node_cooldown.get((kind, node.node_id), 0) > now:
                 stats["cooldown"] += 1
                 continue
 
@@ -1255,13 +1408,17 @@ class GuardEngine:
           * warnings   —— 软偏好不满足，**手动可以覆盖**（带宽 / 负载 / 区域 / 排除 / 冷却）
           * selectable —— 没有 blockers，页面上允许手动指定
           * eligible   —— 两组都空，自动择优会用它
+
+        ★ 软偏好按隧道类型分组（同 `pick_node`）—— 传 `proxy_type="http"` 拿到的
+        就是「按 HTTP 那套偏好算出来的」排名，页面上的节点表要跟着隧道类型切。
         """
+        kind = kind_of(proxy_type)
         s = store.get_settings()
-        min_bw = float(s.get("min_bandwidth_mbps", 25) or 0)
-        max_load = int(s.get("max_load_percent", 90) or 100)
+        min_bw = float(s.get(pref_key(kind, "min_bandwidth"), 25) or 0)
+        max_load = int(s.get(pref_key(kind, "max_load"), 90) or 100)
         regions = {r.strip().lower() for r in
-                   str(s.get("allow_regions") or "").split(",") if r.strip()}
-        keywords = normalize_keywords(s.get("prefer_keywords"))
+                   str(s.get(pref_key(kind, "regions")) or "").split(",") if r.strip()}
+        keywords = normalize_keywords(s.get(pref_key(kind, "keywords")))
         prefs = store.list_node_prefs()
         now = time.time()
 
@@ -1287,9 +1444,14 @@ class GuardEngine:
                 warnings.append(f"负载 > {max_load}%")
             if regions and (node.region or "").lower() not in regions:
                 warnings.append(f"区域 {node.region or '未知'} 不在允许列表")
+            # ★ 备案提醒：只对 http 组、且只在大陆节点上出现。**是 warning 不是
+            #   blocker** —— 手动锁一个大陆节点是完全合法的选择（域名已经报备过），
+            #   引擎不该替用户否决它，只该把代价说清楚。
+            if kind == "http" and (node.region or "").lower() == "cn":
+                warnings.append("大陆节点建 HTTP/S 站需先向管理员报备域名")
             if pref and pref.get("excluded"):
                 warnings.append("已排除")
-            cd = self.node_cooldown.get(node.node_id, 0)
+            cd = self.node_cooldown.get((kind, node.node_id), 0)
             if cd > now:
                 warnings.append(f"冷却 {int(cd - now)}s")
 
@@ -1317,6 +1479,9 @@ class GuardEngine:
                 "keyword_hit": rank < len(keywords),
                 "priority": int(pref["priority"]) if pref else 100,
                 "excluded": bool(pref and pref.get("excluded")),
+                # 这个节点对外提供 HTTP(S) 的入口地址（域名或 IP），http 隧道用它
+                # 做 DNS 目标；留空则退回「A 记录指向节点 IP」。见 store.node_prefs。
+                "http_entry": (pref or {}).get("http_entry", "") or "",
                 "blockers": blockers,
                 "warnings": warnings,
                 "selectable": not blockers,
@@ -1527,11 +1692,14 @@ class GuardEngine:
                 # 回滚也是在原节点**重新建了一个 proxy**，id 和端口都可能变 ——
                 # 不写回数据库的话，库里存的还是那个已经被删掉的旧 id，
                 # 下一轮 _reconcile 就会拿一个不存在的 proxyId 去比对。
-                store.update_tunnel(mtid, {
+                back_upd: dict[str, Any] = {
                     "current_proxy_id": back["new_proxy_id"],
                     "current_node_id": old_node.node_id,
                     "current_remote_port": back["new_port"],
-                })
+                }
+                if is_http_type(t.get("proxy_type")):
+                    back_upd["current_domain"] = back.get("new_domain") or ""
+                store.update_tunnel(mtid, back_upd)
                 self.probe_cache.pop(mtid, None)
 
             bad = failed[0]
@@ -1575,17 +1743,23 @@ class GuardEngine:
         for r in moved:
             t = r["tunnel"]
             mtid = int(t["id"])
-            store.update_tunnel(mtid, {
+            upd = {
                 "current_proxy_id": r["new_proxy_id"],
                 "current_node_id": node.node_id,
                 "current_remote_port": r["new_port"],
                 "last_failover_at": int(now),
                 "fail_streak": 0,
-            })
+            }
+            # ★ HTTP 隧道要落的是域名（端口对它是空的，落进去只会把旧值覆盖成 0）
+            if is_http_type(t.get("proxy_type")):
+                upd["current_domain"] = r.get("new_domain") or ""
+            store.update_tunnel(mtid, upd)
             self.probe_cache.pop(mtid, None)
 
-        self.node_cooldown[node.node_id] = now + float(
-            store.get_setting("node_cooldown", 1800) or 1800
+        # 冷却按 (隧道类型组, 节点) 记 —— 见 node_cooldown 字段的注释。
+        ckind = kind_of(tunnel.get("proxy_type", "tcp"))
+        self.node_cooldown[(ckind, node.node_id)] = now + float(
+            store.get_setting(pref_key(ckind, "node_cooldown"), 1800) or 1800
         )
 
         # ---- 重建配置 + 重启（整组只做一次）----
@@ -1595,19 +1769,32 @@ class GuardEngine:
         # ---- 等触发的那条隧道上线，再做端到端验证 ----
         online = await self._await_online(tunnel["proxy_name"], timeout=45)
         node_addr = await self.node_address(node.node_id)
-        new_port = (store.get_tunnel(tid) or tunnel)["current_remote_port"]
+        cur_t = store.get_tunnel(tid) or tunnel
+        new_port = cur_t["current_remote_port"]
+        new_domain = str(cur_t.get("current_domain") or "")
+        http_like = is_http_type(tunnel.get("proxy_type"))
 
         # 三态探测：True 通过 / False 未通过 / None 不适用（udp 隧道等）。
         # 这里必须和 _reconcile 用同一套判定，否则会出现「引擎认为健康、
         # 但切换后立刻报 error」的自相矛盾。
+        #
+        # ⚠️ probe_plan 的返回值在 1.0.2 从 (bool, why) 改成了 (种类, why)，
+        #    调用方必须按种类分三条路走（tcp / http / none），不能再写 `if not do_probe`。
         mode = str(store.get_setting("probe_mode", "auto") or "auto")
-        do_probe, skip_why = probe_plan(tunnel.get("proxy_type", "tcp"), mode)
+        pkind, skip_why = probe_plan(tunnel.get("proxy_type", "tcp"), mode)
         probe_ok: bool | None = False
         probe_why = "未验证"
-        if not do_probe:
+        if pkind == PROBE_NONE:
             probe_ok, probe_why = None, skip_why
         elif not online:
             probe_why = "隧道尚未上线，跳过端到端验证"
+        elif pkind == PROBE_HTTP:
+            url = http_probe_url(tunnel.get("proxy_type", "tcp"), new_domain,
+                                 str(store.get_setting("http_probe_path", "/") or "/"))
+            if not url:
+                probe_ok, probe_why = None, "这条 HTTP 隧道没有绑定域名，无法做 HTTP 探测"
+            else:
+                probe_ok, probe_why = await http_probe(url)
         elif not node_addr:
             probe_why = f"拿不到节点「{node.name}」的公网地址，无法验证"
         else:
@@ -1634,10 +1821,16 @@ class GuardEngine:
                     dns_msgs.append(msg if len(moved) == 1
                                     else f"{cur['name']}：{msg}")
 
-        # 端口变了 → 标记下游待办（整组都要判，各条端口可能都变了）
+        # 端口变了 → 标记下游待办（整组都要判，各条端口可能都变了）。
+        # ⚠️ HTTP 隧道**没有端口**，这个待办对它不适用：它的对外入口是域名，
+        #    域名不变（本来就是沿用同一个），下游 DNS 不用动。所以 http 组
+        #    直接清 0，避免给用户一个「去改下游」的假待办。
         changed_names: list[str] = []
         for r in moved:
             mtid = int(r["tunnel"]["id"])
+            if is_http_type(r["tunnel"].get("proxy_type")):
+                store.update_tunnel(mtid, {"needs_downstream_review": 0})
+                continue
             pc = bool(r["old_port"]) and int(r["old_port"]) != int(r["new_port"])
             store.update_tunnel(mtid, {"needs_downstream_review": 1 if pc else 0})
             if pc:
@@ -1653,11 +1846,17 @@ class GuardEngine:
         else:
             probe_line = f"未通过 —— {probe_why}"
 
+        # 对外入口那一行：HTTP 隧道写域名，TCP/UDP 写端口。
+        if http_like:
+            entry_line = f"绑定域名：{new_domain or '（未指定）'}"
+        else:
+            entry_line = f"端口：{old_port or '—'} → {new_port}"
+
         lines = [
             f"隧道：{tunnel['name']}",
             f"原因：{reason}",
             f"新节点：{node.name}（{node_addr or '地址未知'}）",
-            f"端口：{old_port or '—'} → {new_port}",
+            entry_line,
         ]
         if len(moved) > 1:
             lines.append(f"连带切换：同实例另外 {len(moved) - 1} 条隧道一起搬走")
@@ -1740,6 +1939,8 @@ class GuardEngine:
         old_proxy_id = (tunnel["current_proxy_id"] if current_proxy_id is _UNSET
                         else current_proxy_id)
         old_port = tunnel["current_remote_port"]
+        ptype = str(tunnel.get("proxy_type") or "tcp")
+        http_like = is_http_type(ptype)
 
         # ---- 1. 先删旧的，腾出 proxyName ----
         if old_proxy_id:
@@ -1761,47 +1962,88 @@ class GuardEngine:
                 )
 
         # ---- 2. 再建新的 ----
-        # 端口优先级：期望端口 → 当前端口 → 让服务端分配。
-        # 用户显式写了「期望远程端口」时以它为准（这是他的意图），否则尽量保住现有端口，
-        # 因为端口一变就得去改下游配置。端口被占用时靠 proxy_create 报错自然落到下一档。
-        want_ports: list[int | None] = []
-        for cand in (tunnel.get("desired_remote_port"), old_port):
-            if cand and int(cand) not in want_ports and node.port_allowed(int(cand)):
-                want_ports.append(int(cand))
-        want_ports.append(None)
-
+        # ⚠️ 这里按隧道类型分成两条完全不同的路：
+        #
+        #   · TCP/UDP —— 争端口。优先级：期望端口 → 当前端口 → 让服务端分配。
+        #     用户显式写了「期望远程端口」时以它为准（这是他的意图），否则尽量
+        #     保住现有端口，因为端口一变就得去改下游配置。端口被占用时靠
+        #     proxy_create 报错自然落到下一档。
+        #
+        #   · HTTP/HTTPS —— **没有端口这回事**（mefrp 侧 remotePort 恒为 null），
+        #     要保住的是**绑定域名**。域名对用户来说更稳定：换节点后域名不变，
+        #     下游（DNS / Cloudflare）不用动 —— 这也正是 HTTP 隧道相对 TCP 的
+        #     最大好处。所以这里直接沿用期望域名（没有就用库里的当前域名）。
         last_err = ""
         created = False
-        for rp in want_ports:
+
+        if http_like:
+            want_domain = (tunnel.get("desired_domain")
+                           or tunnel.get("current_domain") or "")
             try:
                 await self.client.proxy_create(
                     node_id=node.node_id,
                     proxy_name=tunnel["proxy_name"],
                     local_ip=tunnel["local_ip"],
                     local_port=int(tunnel["local_port"]),
-                    proxy_type=tunnel["proxy_type"],
-                    remote_port=rp,
+                    proxy_type=ptype,
+                    domain=want_domain,
+                    locations=str(tunnel.get("route_locations") or ""),
+                    http_plugin=str(tunnel.get("http_plugin") or ""),
+                    crt_path=str(tunnel.get("crt_path") or ""),
+                    key_path=str(tunnel.get("key_path") or ""),
                 )
                 created = True
                 store.add_event(
                     "info", "failover",
-                    f"已在节点「{node.name}」创建隧道「{tunnel['name']}」"
-                    f"（请求端口 {rp or '自动'}）",
+                    f"已在节点「{node.name}」创建 HTTP 隧道「{tunnel['name']}」"
+                    f"（域名 {want_domain or '未指定'}）",
                     tunnel_id=tid,
                 )
-                break
-            except MefrpApiError as exc:
+            except MefrpError as exc:
                 last_err = str(exc)
                 store.add_event(
-                    "warn", "failover",
-                    f"在节点「{node.name}」用端口 {rp or '自动'} 创建"
+                    "error", "failover",
+                    f"在节点「{node.name}」创建 HTTP 隧道"
                     f"「{tunnel['name']}」失败：{exc}",
                     tunnel_id=tid,
                 )
-                continue
-            except MefrpError as exc:
-                last_err = str(exc)
-                break
+        else:
+            want_ports: list[int | None] = []
+            for cand in (tunnel.get("desired_remote_port"), old_port):
+                if cand and int(cand) not in want_ports and node.port_allowed(int(cand)):
+                    want_ports.append(int(cand))
+            want_ports.append(None)
+
+            for rp in want_ports:
+                try:
+                    await self.client.proxy_create(
+                        node_id=node.node_id,
+                        proxy_name=tunnel["proxy_name"],
+                        local_ip=tunnel["local_ip"],
+                        local_port=int(tunnel["local_port"]),
+                        proxy_type=ptype,
+                        remote_port=rp,
+                    )
+                    created = True
+                    store.add_event(
+                        "info", "failover",
+                        f"已在节点「{node.name}」创建隧道「{tunnel['name']}」"
+                        f"（请求端口 {rp or '自动'}）",
+                        tunnel_id=tid,
+                    )
+                    break
+                except MefrpApiError as exc:
+                    last_err = str(exc)
+                    store.add_event(
+                        "warn", "failover",
+                        f"在节点「{node.name}」用端口 {rp or '自动'} 创建"
+                        f"「{tunnel['name']}」失败：{exc}",
+                        tunnel_id=tid,
+                    )
+                    continue
+                except MefrpError as exc:
+                    last_err = str(exc)
+                    break
 
         if not created:
             return {"ok": False, "tunnel": tunnel, "error": last_err or "创建失败"}
@@ -1818,8 +2060,11 @@ class GuardEngine:
             "proxy": new_proxy,
             "old_proxy_id": old_proxy_id,
             "old_port": old_port,
+            # ★ HTTP 隧道没有端口，这两项恒为 0/空；域名才是它要保住的东西。
+            "old_domain": tunnel.get("current_domain") or "",
             "new_proxy_id": new_proxy.proxy_id,
             "new_port": new_proxy.remote_port,
+            "new_domain": ",".join(new_proxy.domains) if http_like else "",
         }
 
     async def _await_proxy(self, proxy_name: str, timeout: float = 20) -> Proxy | None:
@@ -2119,10 +2364,23 @@ class GuardEngine:
             node = self.nodes.get(proxy.node_id)
             if node is None:
                 return ""
-            # 节点地址只能从「该节点上已有隧道的官方配置」里反推（非管理员账号下
-            # /auth/node/list 的 hostname 是空串），所以这里必须走解析器而不是
-            # 直接读 node.hostname。
-            host = (await self.node_address(proxy.node_id)).strip()
+            # ★ HTTP/HTTPS 隧道优先解析到「节点 HTTP 入口域名」。
+            #   官方文档要求「把绑定域名 CNAME 到节点域名」，但非管理员账号看不到
+            #   hostname（/auth/node/list 脱敏成空串），所以只能让用户在节点偏好里
+            #   手填一个 http_entry。填了就 CNAME 过去 —— 比写死 IP 更抗节点换 IP；
+            #   没填就退回节点 IP 走 A 记录（实测节点反代按 Host 头分流，A 记录也能通）。
+            if is_http_type(tunnel.get("proxy_type")):
+                pref = store.list_node_prefs().get(int(proxy.node_id)) or {}
+                entry = str(pref.get("http_entry") or "").strip()
+                if entry:
+                    host = entry
+                else:
+                    host = (await self.node_address(proxy.node_id)).strip()
+            else:
+                # 节点地址只能从「该节点上已有隧道的官方配置」里反推（非管理员账号下
+                # /auth/node/list 的 hostname 是空串），所以这里必须走解析器而不是
+                # 直接读 node.hostname。
+                host = (await self.node_address(proxy.node_id)).strip()
         else:
             host = str(host).strip()
 
@@ -2389,6 +2647,14 @@ class GuardEngine:
             missing: list[str] = []
             for t in store.list_tunnels_of_frpc(iid):
                 upd: dict[str, Any] = {"manual_node_id": int(node["id"])}
+                # ⚠️ HTTP 隧道在 frpc 配置里没有 remotePort（恒为 null），
+                #    拿它去查「新配置里有没有这条隧道」会永远落进 missing ——
+                #    那是误报。http 组直接跳过端口刷新与 missing 判定。
+                if is_http_type(t.get("proxy_type")):
+                    store.update_tunnel(int(t["id"]), upd)
+                    self.probe_cache.pop(int(t["id"]), None)
+                    moved.append(store.get_tunnel(int(t["id"])) or t)
+                    continue
                 new_port = ports.get(str(t["proxy_name"]))
                 if new_port:
                     upd["current_remote_port"] = new_port

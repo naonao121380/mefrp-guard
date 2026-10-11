@@ -85,21 +85,40 @@ DEFAULT_SETTINGS: dict[str, object] = {
     "probe_interval": 60,           # 单个隧道端到端 TCP 探测的最短间隔（秒）
     "probe_timeout": 4,             # TCP 探测超时（秒）
     # 端到端探测模式：
-    #   auto —— 按隧道协议自动决定。tcp 隧道做 TCP 探测；udp 隧道**跳过** L3。
-    #           为什么 udp 要跳过：mefrp 的 udp 隧道在节点上开的是 UDP 端口，
-    #           没有 TCP 监听，用 TCP 握手去探必然失败 → 健康隧道被永久误判成
-    #           故障 → fail_streak 涨到阈值后对好隧道发起无意义切换。
+    #   auto —— 按隧道协议自动决定。tcp 隧道做 TCP 探测；udp 隧道**跳过** L3；
+    #           **http/https 隧道也跳过**（理由见 engine.probe_plan：节点反代对
+    #           任何 Host 都会完成 TCP 握手，拿 TCP 去探永远是「通」，是假阳性）。
     #   tcp  —— 强制所有隧道都做 TCP 探测（逃生口，只在你明确知道后果时用）。
+    #   http —— 按类型各用各的：tcp 走 TCP 探测，http/https 走**真实 HTTP 请求**
+    #           （GET 绑定域名，2xx/3xx 算通）。这是 http 隧道唯一能真正验到
+    #           「域名解析对不对、链路通不通」的模式。
     #   none —— 完全关闭 L3 探测，只用 L1（mefrp 状态）+ L2（节点状态）判定。
     "probe_mode": "auto",
     "fail_threshold": 3,            # 连续失败多少次才判定为故障
     "failover_cooldown": 300,       # 一次切换之后多久内不再切换（秒）
     "node_cooldown": 1800,          # 节点被切换走之后多久内不再选它（秒）
-    # 节点择优
+    # ---- 节点择优：TCP/UDP（「端口型」隧道）----
+    # ⚠️ 下面这一组**只管 tcp/udp**。http/https 有自己的一套（见下一个 block）——
+    #    两类的约束根本不同，最典型的是 http 受「备案」限制：国内节点建站要报备，
+    #    所以 http 的默认区域刻意排除了大陆。捆在一起调一个必然误伤另一个。
     "min_bandwidth_mbps": 25,       # 节点带宽下限
     "prefer_keywords": "北京",       # 优先关键词，逗号分隔，命中即排在前面
     "allow_regions": "cn",          # 允许的区域，逗号分隔；留空表示不限
     "max_load_percent": 90,         # 节点负载上限
+    # ---- 节点择优：HTTP/HTTPS（「域名型」隧道）----
+    # ⚠️ 默认 `cnos,oversea` = 只用港澳台 + 海外节点。**这不是随手填的默认值**：
+    #    官方文档明说国内节点允许建 HTTP/S 站的话，域名需要向管理员报备（白名单），
+    #    云厂商节点还要求域名在服务商处接入备案。默认避开大陆能让新用户第一次
+    #    建 HTTP 隧道就成功，而不是建完发现打不开。要上大陆节点就显式把 cn 勾上。
+    "http_allow_regions": "cnos,oversea",
+    "http_min_bandwidth_mbps": 25,
+    "http_max_load_percent": 90,
+    "http_prefer_keywords": "",
+    "http_node_cooldown": 1800,
+    # HTTP 探测请求的路径。默认探根路径；如果你的服务在 `/` 上本来就会返回
+    # 4xx/5xx（比如 API 服务、带鉴权的后台），把它改成能返回 2xx 的路径，
+    # 否则开了 http 探测就会一路误报「不通」。
+    "http_probe_path": "/",
     # 行为开关
     "auto_failover": True,          # 总开关：是否允许自动切换
     "auto_dns_sync": True,          # 是否自动纠正漂移的 DNS 记录
@@ -135,6 +154,52 @@ READONLY_SETTINGS = frozenset({
 
 SECRET_KEYS = {"mefrp_token", "cf_api_token", "gotify_token",
                "web_password_hash", "web_password_salt"}
+
+
+# mefrp 节点区域的三档（官方 `/auth/createProxyData` 的 region 枚举，实测一致）。
+# ⚠️ 「备案」只跟**中国大陆**有关：cn 节点建 HTTP/S 站要报备域名白名单，cnos
+#    （港澳台）与 oversea 都不需要大陆备案。所以 http 组的默认区域是后两者。
+REGION_CHOICES: tuple[tuple[str, str], ...] = (
+    ("cn", "中国大陆"),
+    ("cnos", "港澳台"),
+    ("oversea", "海外"),
+)
+
+REGION_LABELS = dict(REGION_CHOICES)
+
+
+# ★ 「端口型」（tcp/udp）与「域名型」（http/https）**两套并存的节点择优偏好**。
+#
+# 为什么是两张表而不是一堆 if：这两类隧道的约束来源完全不同 ——
+#   · tcp/udp 只受节点性能与用户组限制，跟域名、备案都无关；
+#   · http/https 多了一层「备案」：国内节点要报备白名单，所以默认就该避开大陆。
+# 把键名集中在这里，`engine.pick_node` / `rank_nodes` 只要按隧道类型取一组键，
+# 择优逻辑本身**一份都不用改** —— 否则「按类型分叉」会渗进每个筛选条件里。
+PREF_KEYS: dict[str, dict[str, str]] = {
+    "port": {
+        "regions": "allow_regions",
+        "min_bandwidth": "min_bandwidth_mbps",
+        "max_load": "max_load_percent",
+        "keywords": "prefer_keywords",
+        "node_cooldown": "node_cooldown",
+    },
+    "http": {
+        "regions": "http_allow_regions",
+        "min_bandwidth": "http_min_bandwidth_mbps",
+        "max_load": "http_max_load_percent",
+        "keywords": "http_prefer_keywords",
+        "node_cooldown": "http_node_cooldown",
+    },
+}
+
+
+def pref_key(kind: str, name: str) -> str:
+    """取某类隧道（`"port"` / `"http"`）某个偏好项对应的设置键名。
+
+    认不出来的 kind 一律当 `port` —— 和 `mefrp.kind_of` 的保守方向一致。
+    """
+    table = PREF_KEYS.get(kind) or PREF_KEYS["port"]
+    return table.get(name) or PREF_KEYS["port"][name]
 
 
 def default_of(key: str):

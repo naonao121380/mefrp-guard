@@ -48,6 +48,20 @@ CREATE TABLE IF NOT EXISTS tunnels (
     enabled                  INTEGER NOT NULL DEFAULT 1,
     auto_failover            INTEGER NOT NULL DEFAULT 1,
 
+    -- ---- HTTP/HTTPS 隧道专用（tcp/udp 恒为空）----
+    -- 这一组字段存在的理由：http 组**没有远程端口**，它靠「绑定域名」工作 ——
+    -- 节点上跑着反代，按请求的 Host 头把流量分到不同隧道。所以它的「身份」
+    -- 是域名而不是端口，`desired_remote_port` 对它毫无意义。
+    desired_domain           TEXT NOT NULL DEFAULT '',   -- 想在 mefrp 上绑定的域名
+    current_domain           TEXT NOT NULL DEFAULT '',   -- mefrp 上实际绑定的（解析后，逗号分隔）
+    -- 「隧道类型 × 内网服务协议」的配对，四种合法组合见 mefrp.proxy_create：
+    --   http+内网HTTP→空 ｜ http+内网HTTPS→http2https
+    --   https+内网HTTP→https2http ｜ https+内网HTTPS→https2https（后两者要证书）
+    http_plugin              TEXT NOT NULL DEFAULT '',
+    route_locations          TEXT NOT NULL DEFAULT '',   -- 路径路由规则，逗号分隔
+    crt_path                 TEXT NOT NULL DEFAULT '',   -- https 隧道：节点侧证书路径
+    key_path                 TEXT NOT NULL DEFAULT '',   -- https 隧道：节点侧私钥路径
+
     -- 这条隧道由哪个 frpc 实例承载。NULL = 还没有挂接。
     -- 解析只有这一级：不兜底、不自动发现（见 engine.frpc_for_tunnel 的说明）。
     frpc_instance_id         INTEGER,
@@ -80,7 +94,14 @@ CREATE TABLE IF NOT EXISTS node_prefs (
     node_id  INTEGER PRIMARY KEY,
     priority INTEGER NOT NULL DEFAULT 100,   -- 越小越优先
     excluded INTEGER NOT NULL DEFAULT 0,
-    note     TEXT DEFAULT ''
+    note     TEXT DEFAULT '',
+    -- ★ 这个节点对外提供 HTTP(S) 服务的入口地址（域名或 IP），**只给 http/https
+    --   隧道用**。为什么需要它：官方要求把绑定域名 CNAME 到「节点域名」上，
+    --   但非管理员账号下 `/auth/node/list` 的 hostname 被脱敏成空串，我们唯一
+    --   能反推出来的是 frp 控制地址（实测是 IP，如 43.143.183.202）。
+    --   填了就按它做 CNAME；留空则退回「A 记录指向节点 IP」—— 节点反代是按
+    --   Host 头分流的，所以 A 记录通常也能通，只是不如 CNAME 抗 IP 漂移。
+    http_entry TEXT NOT NULL DEFAULT ''
 );
 
 -- frpc 实例。
@@ -194,6 +215,14 @@ def _migrate() -> None:
         ("tunnels", "manual_node_id", "INTEGER"),
         ("tunnels", "tag", "TEXT NOT NULL DEFAULT ''"),
         ("frpc_instances", "manual_node_id", "INTEGER"),
+        # ---- 1.0.2：HTTP/HTTPS 隧道 ----
+        ("tunnels", "desired_domain", "TEXT NOT NULL DEFAULT ''"),
+        ("tunnels", "current_domain", "TEXT NOT NULL DEFAULT ''"),
+        ("tunnels", "http_plugin", "TEXT NOT NULL DEFAULT ''"),
+        ("tunnels", "route_locations", "TEXT NOT NULL DEFAULT ''"),
+        ("tunnels", "crt_path", "TEXT NOT NULL DEFAULT ''"),
+        ("tunnels", "key_path", "TEXT NOT NULL DEFAULT ''"),
+        ("node_prefs", "http_entry", "TEXT NOT NULL DEFAULT ''"),
     )
     for table, col, decl in wanted:
         cols = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
@@ -465,6 +494,12 @@ TUNNEL_FIELDS = (
     "name", "proxy_name", "proxy_type", "local_ip", "local_port",
     "tag",
     "desired_remote_port", "pin_node_id", "enabled", "auto_failover",
+    # HTTP/HTTPS 专用（tcp/udp 恒为空）—— 见 SCHEMA 里那一节的说明。
+    #   desired_domain  用户想绑的域名（http 组的「身份」，等价于 port 组的期望端口）
+    #   current_domain  从 mefrp 同步回来的实际绑定域名
+    #   http_plugin     隧道类型 × 内网服务协议 的配对
+    "desired_domain", "current_domain", "http_plugin",
+    "route_locations", "crt_path", "key_path",
     "frpc_instance_id", "manual_node_id",
     "current_proxy_id", "current_node_id", "current_remote_port",
     "dns_zone_id", "dns_record_id", "dns_record_name", "dns_proxied",
@@ -869,17 +904,29 @@ def list_node_prefs() -> dict[int, dict[str, Any]]:
 
 
 def upsert_node_pref(node_id: int, priority: int | None = None,
-                     excluded: bool | None = None, note: str | None = None) -> None:
-    cur = list_node_prefs().get(node_id, {"priority": 100, "excluded": 0, "note": ""})
+                     excluded: bool | None = None, note: str | None = None,
+                     http_entry: str | None = None) -> None:
+    """写某个节点的偏好。`None` = 这一项不动（**不是**清空）。
+
+    ⚠️ 这个「None 表示不改」的约定是必须的：设置页只提交用户真正改过的那几项，
+    要是把 None 当成清空，改个优先级就会顺手把排除标记抹掉。
+
+    `http_entry` 见 SCHEMA 里 node_prefs 的注释 —— 只有 http/https 隧道会用它。
+    """
+    cur = list_node_prefs().get(
+        node_id, {"priority": 100, "excluded": 0, "note": "", "http_entry": ""})
     priority = cur["priority"] if priority is None else priority
     excluded = cur["excluded"] if excluded is None else int(bool(excluded))
     note = cur["note"] if note is None else note
+    http_entry = cur.get("http_entry", "") if http_entry is None else str(http_entry).strip()
     with _LOCK:
         _db().execute(
-            "INSERT INTO node_prefs(node_id, priority, excluded, note) VALUES (?,?,?,?) "
+            "INSERT INTO node_prefs(node_id, priority, excluded, note, http_entry) "
+            "VALUES (?,?,?,?,?) "
             "ON CONFLICT(node_id) DO UPDATE SET "
-            "priority = excluded.priority, excluded = excluded.excluded, note = excluded.note",
-            (node_id, priority, excluded, note),
+            "priority = excluded.priority, excluded = excluded.excluded, "
+            "note = excluded.note, http_entry = excluded.http_entry",
+            (node_id, priority, excluded, note, http_entry),
         )
         _db().commit()
 

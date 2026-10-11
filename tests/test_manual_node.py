@@ -541,8 +541,8 @@ udp_t = store.create_tunnel({
     "local_ip": "127.0.0.1", "local_port": 5000, "current_remote_port": 5000,
     "manual_node_id": mid, "enabled": 1, "auto_failover": 0,
 })
-do_probe, _why = probe_plan("udp", "auto")
-check("udp 在 auto 模式下不探测", do_probe is False)
+probe_kind, _why = probe_plan("udp", "auto")
+check("udp 在 auto 模式下不探测", probe_kind == "none")
 asyncio.run(eng._reconcile_manual(store.get_tunnel(udp_t)))
 after = store.get_tunnel(udp_t)
 check("★ UDP 不涨 fail_streak", after["fail_streak"] == 0, after["fail_streak"])

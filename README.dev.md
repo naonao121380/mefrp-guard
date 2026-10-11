@@ -295,13 +295,13 @@ WireGuard 的握手包）。那属于业务侧的事，不是这个工具该做�
 ```bash
 cp .env.example .env
 vim .env                 # 至少填 MEFRP_TOKEN、MG_WEB_PASSWORD、FRPC_PATH
-docker build -t mefrp-guard:v1.0.1 .
+docker build -t mefrp-guard:v1.0.2 .
 docker compose up -d
 ```
 
 > 也可以一步做完：`docker compose up -d --build`，两者等价。
 >
-> 镜像 tag 固定成 `v1.0.1` 而不是 `latest` —— `latest` 会让「现在跑的是哪一版」
+> 镜像 tag 固定成 `v1.0.2` 而不是 `latest` —— `latest` 会让「现在跑的是哪一版」
 > 变成一个回答不了的问题，回滚时也没有可指的目标。改了代码就 build 成 `v1.0.2`
 > 之类的新 tag，`docker compose up -d` 会自动用新镜像重建容器。
 
@@ -588,9 +588,9 @@ mefrp-guard/
 │       ├── index.html  主单页 UI（自包含，无外部依赖）
 │       ├── favicon.svg 站点图标（`/favicon.svg`，不需登录即可取）
 │       └── favicon.ico 老浏览器 / Safari / webview 的回落图标（`/favicon.ico`）
-├── tests/              十个测试文件（鉴权 / 纯逻辑 / CF 客户端 / 外部节点逻辑 / API /
-│                       外部节点 API / 标签 / 作用域 / 故障转移 / 多容器挂接），
-│                       共 981 条断言
+├── tests/              十一个测试文件（鉴权 / 纯逻辑 / CF 客户端 / 外部节点逻辑 / API /
+│                       外部节点 API / 标签 / 作用域 / 故障转移 / HTTP 隧道 / 多容器挂接），
+│                       共 1107 条断言
 ├── run_local.sh        本地试跑脚本（不依赖 Docker，用沙箱 frpc 配置）
 ├── Dockerfile
 ├── docker-compose.yml
@@ -650,6 +650,46 @@ mefrp-guard/
    于是同一个地址只因引号风格不同就被判成「跨节点」，`merge_configs` 直接拒绝生成配置。
    正确做法是先把整个值捕获下来再统一剥引号。
 
+6. **★★ HTTP/HTTPS 隧道与 TCP/UDP 只差两个字段，但两个都很反直觉。**
+
+   | 字段 | TCP / UDP | HTTP / HTTPS |
+   |---|---|---|
+   | `remotePort` | `8000`（必填） | **`null`** —— 必须**显式传 null**，不是「省略这个键」 |
+   | `domain` | `''` | **`'["example.com"]'`** —— 一个「**文本化的 JSON 数组**」**字符串** |
+
+   `domain` 这个形状是最大的坑：它是 `str` 类型，内容是 JSON 数组的**文本**。官方 schema
+   的原话是「列表被文本化，需要额外处理，如 `["mefrp.com"]`」。**官方自己的 Python SDK
+   里 `domain` 也是 `str`** —— 它自己都没解析。照字面 `str(item.get("domain") or "")`
+   存下来的话，显示给用户看的是 `["a.com"]` 这种带方括号引号的鬼东西，跟用户填的
+   `a.com` 比对永远不相等，故障转移的「域名变没变」判断直接失效。
+
+   本程序的做法：`mefrp.parse_domains()` 做**宽容解析**（JSON 数组 / 逗号分隔 / 分号 /
+   空格 / 单个裸域名都认），`mefrp.join_domains()` 严格按官方示例序列化回去。
+   两个函数都做了「已经是 JSON 数组文本就归一化」的处理，避免双重编码。
+
+   **`httpPlugin` 的四种组合**（隧道类型 × 内网服务协议）：
+
+   | `proxyType` | 内网服务 | `httpPlugin` | `crtPath` / `keyPath` |
+   |---|---|---|---|
+   | `http` | HTTP | 留空 | — |
+   | `http` | HTTPS | `http2https` | — |
+   | `https` | HTTP | `https2http` | **需要** |
+   | `https` | HTTPS | `https2https` | **需要** |
+
+   ⚠️ `https` 那两个组合的证书路径是**节点侧**的（示例 `/etc/crt/example.com.crt`），
+   免费用户基本拿不到节点文件系统 —— **实用组合是 `http` + Cloudflare 终结 TLS**（橙云）。
+
+   另外 `httpUser`/`httpPassword` 和 `accessKey` **不能同时存在**（后端会拒）。
+   spec 里还有本程序尚未支持的字段：`locations`（路径路由，逗号分隔）、`responseHeaders`、
+   `transportProtocol` —— 其中 `locations` 已经透传。
+
+7. **`domain` 只对 HTTP/HTTPS 有意义，`remotePort` 只对 TCP/UDP 有意义。**
+   互串着传不是「被忽略」而是语义错乱：TCP 隧道带上 `domain`、HTTP 隧道带上端口，
+   都是错的。本程序在**两个入口**都做了硬校验（`POST /api/tunnels` 与
+   `PATCH /api/tunnels/{id}`）：HTTP 缺域名 → 400、HTTP 填端口 → 400、TCP 绑域名 → 400。
+   在 `proxy_create` 里还做了一层强制（TCP 组的 `domain`/`locations`/证书路径一律清空），
+   防止调用方漏改。
+
 用到的端点：
 
 | 用途 | 端点 | 方法 | 备注 |
@@ -657,11 +697,101 @@ mefrp-guard/
 | 节点列表 | `/auth/node/list` | GET | 非管理员 `hostname` 为空串 |
 | 节点状态 | `/auth/node/status` | GET | |
 | 隧道列表 | `/auth/proxy/list` | GET | **`nodes` 子数组带真实 hostname** |
-| 创建隧道 | `/auth/proxy/create` | POST | |
+| 创建隧道 | `/auth/proxy/create` | POST | **HTTP/S 的 `domain` 是文本化 JSON 数组、`remotePort` 必须显式 null** |
 | 删除隧道 | `/auth/proxy/delete` | POST | |
 | 生成单隧道配置 | `/auth/proxy/config` | POST | 里面的 `serverAddr` 是节点地址 |
 | **当前用户信息 / 用户组** | **`/auth/user/info`** | GET | 用 `group` + `friendlyGroup` |
 | ~~当前用户组~~ | ~~`/auth/user/group`~~ | — | **不存在，404** |
+
+官方 Python SDK 里还有几个本程序**没用**的端点，将来可能有用：
+`POST /auth/proxy/update`（改隧道）、`/auth/proxy/toggle`（启用禁用）、
+`/auth/proxy/kick`（强制下线）、`POST /auth/node/freePort`（`{nodeId, protocol}`
+让节点给个空闲端口）、`POST /auth/easyStartup`（`{proxyId}` → `nodeAddr`/`nodePort`/`nodeToken`）、
+`GET /auth/node/nameList`、`GET /auth/user/groups`。
+
+## HTTP / HTTPS 隧道（1.0.2）
+
+两类隧道**不是一个东西**，所以从数据模型到择优逻辑到前端表单全部**分了两套**。
+
+### 为什么必须分开
+
+| | TCP / UDP | HTTP / HTTPS |
+|---|---|---|
+| 对外入口 | **端口**（`节点IP:41234`） | **域名**（`http://nas.example.com`） |
+| 节点侧机制 | 裸端口转发 | 节点**反代**，按 Host 头分流到不同后端 |
+| 主要限制 | 端口是否被占、节点是否支持该协议 | **域名备案**（大陆节点）、需报备（白名单） |
+| 切换节点后 | 端口可能变 → 要去改下游 | **域名不变** → 下游什么都不用动 |
+| 可探测性 | 探端口，可靠 | **TCP 层探不出问题**（反代对任何 Host 都握手成功） |
+
+### 两套偏好体系
+
+`settings.PREF_KEYS` 是这套设计的核心 —— 把「隧道类型组」映射到对应的设置键：
+
+```python
+PREF_KEYS = {
+    "port": {"regions": "allow_regions",      "min_bandwidth": "min_bandwidth_mbps",
+             "max_load": "max_load_percent",  "keywords": "prefer_keywords",
+             "node_cooldown": "node_cooldown"},
+    "http": {"regions": "http_allow_regions", "min_bandwidth": "http_min_bandwidth_mbps",
+             "max_load": "http_max_load_percent", "keywords": "http_prefer_keywords",
+             "node_cooldown": "http_node_cooldown"},
+}
+```
+
+`mefrp.kind_of(proxy_type)` 把类型归成 `"port"` / `"http"` 两组，**认不出来的类型一律
+当 `port`** —— 那是保守的一侧（旧的默认值就是 TCP 那一套）。`settings.pref_key()` 同理。
+
+⚠️ **冷却表因此是复合键 `(类型组, node_id)`**，不是裸 `node_id`。理由：同一台节点上，
+一条 TCP 隧道刚失败不代表一条 HTTP 隧道也要躲开它 —— 两者用到的能力根本不同
+（HTTP 靠节点反代 + 域名，TCP 靠裸端口）。只按节点记冷却会让两类互相误伤。
+
+### 默认只用港澳台 + 海外
+
+`http_allow_regions` 的默认值是 **`cnos,oversea`**（`cnos` = 港澳台），**不是随手填的**：
+官方文档明说大陆节点建 HTTP/S 站需要**向管理员报备域名**（白名单处理），
+腾讯云/阿里云/华为云等节点还要求域名**在服务商处接入备案**。默认避开大陆，
+能让新用户第一次建 HTTP 隧道就成功，而不是建完发现打不开。
+`rank_nodes(proxy_type="http")` 会给大陆节点挂一条「需先报备」的 **warning**（不是 blocker）
+—— 手动锁一个大陆节点是完全合法的选择（域名已经报备过）。
+
+`region` 只有三个值：**`cn` / `cnos`（港澳台）/ `oversea`**。
+
+### 探测：auto 下**故意跳过** HTTP 隧道
+
+`probe_plan(proxy_type, mode)` 返回 `(种类, 原因)`，种类是 `"tcp"` / `"http"` / `"none"`。
+两种「不探」的原因**正好相反**，注释里写清楚了：
+
+- **udp** —— 节点上只有 UDP 监听，TCP 握手必然失败 → 探了必**假阴性**。
+- **http/https（auto 模式）** —— 节点反代对**任何** Host 都会握手成功，
+  TCP 层探出来永远是「通」→ 探了必**假阳性**。要真探得把 `probe_mode` 改成 `http`。
+
+`probe_mode = http` 时，HTTP 隧道走 `http_probe()`：GET 绑定域名，**2xx/3xx 算通**
+（本地服务在根路径上 302 跳登录页极常见），4xx/5xx 算不通（多半意味着节点反代没匹配到
+这条隧道）。**不跟随重定向**。请求路径由 `http_probe_path` 控制（默认 `/`）——
+如果服务在根路径上本来就返回 4xx/5xx，得把这个改成能返回 2xx 的路径。
+
+⚠️ `http_probe` 里的 `import httpx` **放在函数内部**而不是模块顶层 —— engine 被
+「纯逻辑测试」导入时会被塞一个假的 httpx。
+
+### DNS：CNAME 到节点入口域名，或退回 A 记录
+
+官方要求「把绑定域名 CNAME 到**节点域名**」，但非管理员账号看不到 `hostname`
+（见上面第 4 条），实测能拿到的 `serverAddr` 是 **IP**。所以：
+
+- 节点偏好里的 **`http_entry`**（可选，手填）就是「这个节点的 HTTP 入口域名」。
+  填了 → DNS 记录走 **CNAME** 到它（抗节点换 IP）；没填 → 退回节点 **IP 的 A 记录**。
+- 实测 A 记录也能通 —— 节点反代按 Host 头分流，不挑地址形式，CNAME 只是更稳。
+
+### 前端
+
+- 隧道对话框按类型**切换字段**：TCP/UDP 显示「期望远程端口」，HTTP/S 显示「绑定域名 +
+  内网服务协议（httpPlugin）+ 路径路由」；`https` 才显示节点侧证书路径。
+- 设置页把节点择优拆成 **「TCP/UDP」** 和 **「HTTP/HTTPS」** 两块；区域从输入框改成
+  **复选框 + 快捷选择**（含「所有海外节点 = `cnos,oversea`」）；节点偏好 chips 编辑器
+  上面加了个 **TCP/UDP ↔ HTTP/S 页签**。
+- 节点页也加了同样的页签 —— 同一个节点在两套口径下的可用性可能不同。
+- ⚠️ 节点列表按类型**分别缓存**（`NODES_BY_KIND`），不能混用，否则会把按 A 口径算出来的
+  可用性画到 B 口径的页签上。
 
 ## 排错
 
@@ -800,12 +930,12 @@ PYTHONPATH=$PWD/.devdeps PY=$PY ./tests/run_all.sh
 > ⚠️ `run_all.sh` **自己不设 `PYTHONPATH`** —— 不带上的话会在第一个需要依赖的文件上
 > 报 `No module named 'fastapi'`。
 
-十个文件，共 **981 条断言**（59 + 141 + 22 + 137 + 196 + 183 + 30 + 47 + 73 + 93）：
+十一个文件，共 **1107 条断言**（59 + 149 + 22 + 137 + 196 + 183 + 30 + 47 + 75 + 116 + 93）：
 
 | 文件 | 覆盖 | 需要第三方库 |
 |---|---|---|
 | `tests/test_auth.py` | **密码哈希（随机盐/迭代数/异常输入安全降级）、默认密码识别、会话令牌、登录防爆破、来源 IP 解析** | 否 |
-| `tests/test_logic.py` | frpc TOML 合并与跨节点校验、**单引号字面量解析**、配置备份/恢复/路径穿越、SQLite 持久化与字段白名单、Node/Proxy 字段解析、`pick_node` 择优调度、**节点偏好的有序语义与归一化**、**`probe_plan` 探测适用性** | 否 |
+| `tests/test_logic.py` | frpc TOML 合并与跨节点校验、**单引号字面量解析**、配置备份/恢复/路径穿越、SQLite 持久化与字段白名单、Node/Proxy 字段解析、`pick_node` 择优调度、**节点偏好的有序语义与归一化**、**`probe_plan` 探测适用性（四种模式 × 四种隧道类型，含「http 在 auto 下是假阳性」）** | 否 |
 | `tests/test_cfclient.py` | **Cloudflare 客户端的 httpx 交互**：传输层退避重试、重试耗尽后 `transient=True` 与异常类型名、非传输层错误不重试、**连接池复用（3 个请求只建 1 个）与跨事件循环重建**、`upsert(existing=…)` 省掉两次自查、没配 token 一个请求都不发 | httpx |
 | `tests/test_manual_node.py` | **frpc 配置解析（TOML / INI）、`patch_server` 文本级改写的保真与合法性、外部节点数据层 CRUD、1.0.0 老库补列迁移、引擎对外部隧道的分支（含「不适用探测」的三态、UDP 的 DNS 同步）、★ **mefrp 拉取失败与 DNS 同步失败「满 `alert_after_seconds` 才告警」的完整口径**（一条 warn → 静默 → 满阈值 error → 每再满一个阈值补报 → 恢复 success / 短抖不记 / force 与静态问题立刻报）** | 否 |
 | `tests/test_api.py` | FastAPI 全端点：**登录页/会话 Cookie/登出作废/改密码/CSRF/防爆破/只读设置保护**、鉴权、CRUD、密钥打码、错误码、枚举字段校验、引擎生命周期、**frpc 实例 CRUD 与挂接 API**、**`/api/tunnels` 与 `/api/overview` 的挂接字段口径一致**、**节点偏好预览（含路由遮蔽回归）** | fastapi / httpx / pydantic |
@@ -813,12 +943,17 @@ PYTHONPATH=$PWD/.devdeps PY=$PY ./tests/run_all.sh
 | `tests/test_tags.py` | 隧道标签：默认打 `mefrp`、归一化与截断、`?tag=` 筛选（**空串 = 筛未打标的**）、`/api/tags` 计数与排序、显式清空、**老库只回填一次** | fastapi / httpx / pydantic |
 | `tests/test_scope.py` | **隧道名的唯一性作用域**：同名隧道跨运营商并存、展示名重名不报错、mefrp 作用域内仍唯一、`/api/orphans` 与 `probe` 按作用域分流、**老库整表重建去掉 UNIQUE** | fastapi / httpx / pydantic |
 | `tests/test_failover.py` | 完整故障转移流水线（mefrp / CF / Gotify / Docker 全部打桩），含**节点地址取址路径**与 **UDP 跳过探测** | fastapi / httpx / pydantic |
+| `tests/test_http_tunnel.py` | **1.0.2 HTTP/HTTPS 隧道**：`domain` 字段的「文本化 JSON 数组」解析与序列化（含畸形输入兜底）、`proxy_create` 两类隧道的请求体差异（`remotePort` 必须显式 null、TCP 侧 domain 强制清空）、**HTTP 探测的 URL 构造与返回码三态（2xx/3xx 通、4xx/5xx 不通）**、**按类型校验（HTTP 缺域名 / 填端口、TCP 绑域名都是 400）**、**两套偏好体系的隔离（同一节点在两组口径下选出不同结果）**、**冷却表的 `(类型组, 节点)` 复合键**、**DNS 走 `http_entry` 时是 CNAME、否则退回节点 IP 的 A 记录** | fastapi / httpx / pydantic |
 | `tests/test_frpc_multi.py` | **多容器挂接：不自动播种、只认显式挂接、未挂接拒绝切换、按容器重建、成组切换、跨容器隔离、失败回滚、自动发现** | 否 |
 
 `test_auth` / `test_logic` / `test_failover` / `test_frpc_multi` / `test_manual_node`
 用 `sys.modules` 注入假的 `httpx`（或在桩里补齐 `TransportError` 等属性），在
-**没装任何依赖**的环境里也能跑。其余五个需要依赖（装到 `.devdeps` 即可，不污染环境）。
+**没装任何依赖**的环境里也能跑。其余六个需要依赖（装到 `.devdeps` 即可，不污染环境）。
 ⚠️ `test_cfclient` 反过来 —— 它要验的**就是** httpx 交互本身，所以**必须用真的 httpx**。
+⚠️ `test_http_tunnel` 是**混合**的：FastAPI 的 `TestClient` 依赖真实的 `httpx.Response`，
+所以它**不能**整个替换 `sys.modules["httpx"]`（会在 import 阶段就炸）—— 正确做法是
+拿到真模块、只把 `AsyncClient` 换成假的；`engine.http_probe` 在函数内部 `import httpx`，
+拿到的就是同一个已打补丁的模块对象。
 
 `test_failover.py` 里最关键的几条用例（都是踩过的坑）：
 

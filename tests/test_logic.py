@@ -392,7 +392,9 @@ def test_pick_node() -> None:
 
     eng.nodes = {1: N(1, "北京-A"), 2: N(2, "北京-B")}
     check("exclude 生效", eng.pick_node(exclude={1})[0].node_id == 2)
-    eng.node_cooldown = {2: time.time() + 9999}
+    # ⚠️ 1.0.2 起冷却表的键是 **(隧道类型组, node_id)**，不是裸 node_id ——
+    #    「port」和「http」两套偏好体系各自独立记冷却。
+    eng.node_cooldown = {("port", 2): time.time() + 9999}
     check("冷却期节点被跳过", eng.pick_node()[0].node_id == 1)
     eng.node_cooldown = {}
 
@@ -405,7 +407,7 @@ def test_pick_node() -> None:
     eng.nodes = {1: N(1, "北京-A", region="oversea")}
     check("手动选中区域外节点", eng.pick_node(prefer_node_id=1)[0] is not None)
     eng.nodes = {1: N(1, "北京-A")}
-    eng.node_cooldown = {1: time.time() + 9999}
+    eng.node_cooldown = {("port", 1): time.time() + 9999}
     check("手动选中冷却期节点", eng.pick_node(prefer_node_id=1)[0] is not None)
     eng.node_cooldown = {}
     store.upsert_node_pref(1, excluded=True)
@@ -460,37 +462,67 @@ def test_pick_node() -> None:
 def test_probe_plan() -> None:
     """端到端探测的适用性判定。
 
-    这是防「健康的 UDP 隧道被反复误判成故障、进而被无意义地反复切换」的闸门。
-    udp 隧道在节点上只有 UDP 监听，TCP 握手必然失败 —— 所以 auto 模式必须跳过。
+    这是防「健康的隧道被反复误判成故障、进而被无意义地反复切换」的闸门。
+    两类都要拦：
+
+    * **udp** —— 节点上只有 UDP 监听，TCP 握手必然失败 → 探了必假阴性。
+    * **http/https（1.0.2 新增）** —— 反过来了：节点反代对**任何** Host 都会
+      接受 TCP 连接，TCP 层探出来永远是「通」→ 探了必假阳性。要真探就得走
+      HTTP 层（探测模式改成 http）。
+
+    ⚠️ 1.0.2 起返回值从 `(bool, why)` 改成 `(种类, why)`，种类是
+    `"tcp"` / `"http"` / `"none"` 三者之一（见 engine.PROBE_* 常量）。
     """
-    from app.engine import probe_plan, PROBE_MODES
+    from app.engine import (PROBE_HTTP, PROBE_MODES, PROBE_NONE, PROBE_TCP,
+                            probe_plan)
 
     print("[probe_plan] 端到端探测适用性")
-    check("PROBE_MODES 只含 auto/tcp/none", set(PROBE_MODES) == {"auto", "tcp", "none"},
-          PROBE_MODES)
+    check("PROBE_MODES 只含 auto/tcp/http/none",
+          set(PROBE_MODES) == {"auto", "tcp", "http", "none"}, PROBE_MODES)
+    check("三种探测种类常量齐备",
+          (PROBE_TCP, PROBE_HTTP, PROBE_NONE) == ("tcp", "http", "none"))
 
-    # auto：按协议分流
-    check("auto + tcp -> 探测", probe_plan("tcp", "auto")[0] is True)
-    check("auto + http -> 探测", probe_plan("http", "auto")[0] is True)
-    check("auto + https -> 探测", probe_plan("https", "auto")[0] is True)
-    check("★ auto + udp -> 不探测", probe_plan("udp", "auto")[0] is False)
+    # auto：按协议分流。tcp → 探端口；udp → 不探；http/https → 不探（假阳性）
+    check("auto + tcp -> TCP 探测", probe_plan("tcp", "auto")[0] == PROBE_TCP)
+    check("★ auto + http -> 不探测（假阳性）",
+          probe_plan("http", "auto")[0] == PROBE_NONE)
+    check("★ auto + https -> 不探测（假阳性）",
+          probe_plan("https", "auto")[0] == PROBE_NONE)
+    check("★ auto + udp -> 不探测", probe_plan("udp", "auto")[0] == PROBE_NONE)
     check("不探测时必须给出原因", bool(probe_plan("udp", "auto")[1]),
           probe_plan("udp", "auto"))
-    check("原因里点明是协议不匹配",
+    check("udp 原因里点明是协议不匹配",
           "UDP" in probe_plan("udp", "auto")[1], probe_plan("udp", "auto")[1])
+    check("http 原因里点明是假阳性",
+          "假阳性" in probe_plan("http", "auto")[1], probe_plan("http", "auto")[1])
 
     # 大小写与空白容错
-    check("UDP 大写也认", probe_plan("UDP", "auto")[0] is False)
-    check("类型带空格也认", probe_plan(" udp ", "auto")[0] is False)
-    check("模式大写也认", probe_plan("udp", "AUTO")[0] is False)
-    check("类型为空按 tcp 处理（默认探测）", probe_plan("", "auto")[0] is True)
-    check("模式为空按 auto 处理", probe_plan("udp", "")[0] is False)
+    check("UDP 大写也认", probe_plan("UDP", "auto")[0] == PROBE_NONE)
+    check("类型带空格也认", probe_plan(" udp ", "auto")[0] == PROBE_NONE)
+    check("模式大写也认", probe_plan("udp", "AUTO")[0] == PROBE_NONE)
+    check("类型为空按 tcp 处理（默认 TCP 探测）",
+          probe_plan("", "auto")[0] == PROBE_TCP)
+    check("模式为空按 auto 处理", probe_plan("udp", "")[0] == PROBE_NONE)
+
+    # ★ http 模式：http/https 隧道走 HTTP 层探测，其余照旧
+    check("http 模式 + http 隧道 -> HTTP 探测",
+          probe_plan("http", "http")[0] == PROBE_HTTP)
+    check("http 模式 + https 隧道 -> HTTP 探测",
+          probe_plan("https", "http")[0] == PROBE_HTTP)
+    check("http 模式 + tcp 隧道 -> 仍是 TCP 探测",
+          probe_plan("tcp", "http")[0] == PROBE_TCP)
+    check("http 模式 + udp 隧道 -> 不探测",
+          probe_plan("udp", "http")[0] == PROBE_NONE)
+    check("http 模式 + udp 也给原因", bool(probe_plan("udp", "http")[1]),
+          probe_plan("udp", "http"))
 
     # 逃生口与总开关
-    check("tcp 模式强制探测 udp（逃生口）", probe_plan("udp", "tcp")[0] is True)
-    check("tcp 模式强制探测 tcp", probe_plan("tcp", "tcp")[0] is True)
-    check("none 模式关闭 tcp 探测", probe_plan("tcp", "none")[0] is False)
-    check("none 模式关闭 udp 探测", probe_plan("udp", "none")[0] is False)
+    check("tcp 模式强制探测 udp（逃生口）", probe_plan("udp", "tcp")[0] == PROBE_TCP)
+    check("tcp 模式对 http 隧道也强制 TCP 探测",
+          probe_plan("http", "tcp")[0] == PROBE_TCP)
+    check("none 模式关闭 tcp 探测", probe_plan("tcp", "none")[0] == PROBE_NONE)
+    check("none 模式关闭 udp 探测", probe_plan("udp", "none")[0] == PROBE_NONE)
+    check("none 模式关闭 http 探测", probe_plan("http", "none")[0] == PROBE_NONE)
     check("none 模式也给出原因", "关闭" in probe_plan("tcp", "none")[1],
           probe_plan("tcp", "none")[1])
 

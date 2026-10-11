@@ -20,10 +20,25 @@ Base URL：https://api.mefrp.com/api
      `servicePort` 也是 0、`token` 是空串）。真实节点公网地址只出现在
      `/auth/proxy/list` 返回的 `nodes` 子数组里，或 `/auth/proxy/config` 生成的
      TOML 的 `serverAddr` 里。所以 `proxy_list()` 的第二个返回值**不能丢**。
+
+  5. **`domain` 是一个「文本化的 JSON 数组」字符串** —— 这个字段的格式是 HTTP/HTTPS
+     隧道里最容易踩错的一处。官方 schema 的原话是「列表被文本化，需要额外处理，
+     如 `["mefrp.com"]`」，创建隧道的示例里写的是 `domain: '["example.com"]'`。
+     也就是说它既不是裸域名、也不是真的 JSON 数组，而是**JSON 数组的文本**。
+     读回来是同一个形式。见下面的 `parse_domains` / `join_domains`。
+
+  HTTP/HTTPS 隧道与 TCP/UDP 的差别**只有两个字段**（官方创建隧道 spec 原文）：
+
+     · `remotePort` —— TCP/UDP 必填；HTTP/HTTPS **必须显式传 `null`**（不是省略）；
+     · `domain`     —— TCP/UDP 传 `""`；HTTP/HTTPS 传上面那个文本化数组。
+
+  这两处传错的后果不是「报错」而是「隧道建出来不通」，所以 `proxy_create`
+  里按类型强制分支，不给调用方自由发挥的余地。
 """
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass, field
 from typing import Any
@@ -53,6 +68,93 @@ class MefrpApiError(MefrpError):
         super().__init__(f"[{code}] {message}")
         self.code = code
         self.message = message
+
+
+# ---------------------------------------------------------------------------
+# 隧道类型
+# ---------------------------------------------------------------------------
+
+# mefrp 支持的四类隧道。**分成两组**不是洁癖 —— 它们在创建参数、端到端探测、
+# 节点择优偏好、DNS 语义上全都不一样，代码里到处都要按这个分叉：
+#
+#   · port 组（tcp / udp）—— 有「远程端口」，用户直连 `节点:端口`，
+#     **不依赖域名**，所以 DNS 是可选的锦上添花。
+#   · http 组（http / https）—— **没有远程端口**，靠「绑定域名」工作；
+#     节点上跑着反代，按请求的 Host 头把流量分到不同隧道。
+#     域名必须解析到承载它的那个节点，否则这条隧道对外**根本不可达** ——
+#     所以对 http 组来说 DNS 不是可选项，是生命线。
+PORT_TYPES = ("tcp", "udp")
+HTTP_TYPES = ("http", "https")
+ALL_TYPES = PORT_TYPES + HTTP_TYPES
+
+
+def is_http_type(proxy_type: Any) -> bool:
+    """这条隧道是不是「靠域名工作」的那一类（http / https）。"""
+    return str(proxy_type or "").strip().lower() in HTTP_TYPES
+
+
+def kind_of(proxy_type: Any) -> str:
+    """把隧道类型归成两组之一：`"http"` 或 `"port"`。
+
+    认不出来的类型一律当 `port` 处理 —— 那是**保守**的一侧：port 组会去要
+    远程端口、会做端口探测，行为跟这个工具 1.0.1 之前对「所有隧道」的做法
+    一致。反过来把未知类型当 http 会让它拿不到端口、还可能去绑域名。
+    """
+    return "http" if is_http_type(proxy_type) else "port"
+
+
+# ---------------------------------------------------------------------------
+# domain 字段的解析 / 序列化
+# ---------------------------------------------------------------------------
+
+def parse_domains(raw: Any) -> list[str]:
+    """把 mefrp 的 `domain` 字段解析成域名列表。
+
+    ⚠️ 这个字段**不是**一眼能看出来的那种格式。官方 schema 的原文是
+    「列表被文本化，需要额外处理，如 `["mefrp.com"]`」，创建隧道的示例里
+    写的是 `domain: '["example.com"]'` —— 它是一个**字符串**，内容是
+    JSON 数组的文本：
+
+        '["a.example.com"]'                 → ['a.example.com']
+        '["a.example.com","b.example.com"]' → ['a.example.com', 'b.example.com']
+
+    这里刻意做得**宽容**：JSON 数组、逗号/分号分隔的裸串、单个裸域名都认。
+    理由是 1.0.2 开发时账号上还没有 HTTP 隧道可以实测，官方文档也只是
+    「如 `["mefrp.com"]`」这种举例 —— 宽容解析至少不会把将来某天格式
+    变体的数据读坏。序列化那一侧（`join_domains`）则**严格**照官方示例来。
+    """
+    if raw is None:
+        return []
+    if isinstance(raw, (list, tuple, set)):
+        return [str(x).strip() for x in raw if str(x).strip()]
+
+    s = str(raw).strip()
+    if not s:
+        return []
+    if s.startswith("[") and s.endswith("]"):
+        try:
+            data = json.loads(s)
+        except ValueError:
+            data = None
+        if isinstance(data, list):
+            return [str(x).strip() for x in data if str(x).strip()]
+        # 解析不动就往下走按分隔符切 —— 别把整串 `["a"` 当成一个域名
+    return [p.strip() for p in re.split(r"[,;\s]+", s) if p.strip()]
+
+
+def join_domains(names: Any) -> str:
+    """把域名列表序列化成 mefrp 的 `domain` 字段要的形式。
+
+    严格照官方创建隧道示例：`'["example.com"]'` —— JSON 数组的**文本**。
+    传裸域名 `example.com` 会被后端拒绝；传真的数组则不是字符串类型。
+
+    空列表返回 `""` —— TCP/UDP 隧道的 `domain` 就是这个值。
+    """
+    if names is None:
+        return ""
+    items = parse_domains(names) if isinstance(names, str) else \
+        [str(x).strip() for x in names if str(x).strip()]
+    return json.dumps(items, ensure_ascii=False) if items else ""
 
 
 # ---------------------------------------------------------------------------
@@ -165,6 +267,19 @@ class Proxy:
     last_close_time: int = 0
     client_version: str = ""
     username: str = ""
+    # HTTP/HTTPS 隧道才有意义：路径路由规则（逗号分隔）与传输层协议。
+    locations: str = ""
+    transport_protocol: str = ""
+
+    @property
+    def domains(self) -> list[str]:
+        """绑定的域名列表。⚠️ 原始字段是「文本化 JSON 数组」，见 parse_domains。"""
+        return parse_domains(self.domain)
+
+    @property
+    def is_http(self) -> bool:
+        """是不是靠域名工作的那一类（http / https）。"""
+        return is_http_type(self.proxy_type)
 
     @property
     def healthy_flags(self) -> bool:
@@ -322,6 +437,8 @@ class MefrpClient:
                 last_close_time=_to_int(item.get("lastCloseTime")),
                 client_version=str(item.get("clientVersion") or ""),
                 username=str(item.get("username") or ""),
+                locations=str(item.get("locations") or ""),
+                transport_protocol=str(item.get("transportProtocol") or ""),
             ))
         nodes: dict[int, dict[str, Any]] = {}
         for item in (data.get("nodes") or []):
@@ -335,30 +452,73 @@ class MefrpClient:
                            local_ip: str, local_port: int,
                            proxy_type: str = "tcp",
                            remote_port: int | None = None,
-                           domain: str = "",
+                           domain: Any = "",
+                           locations: str = "",
+                           http_plugin: str = "",
+                           crt_path: str = "",
+                           key_path: str = "",
+                           request_headers: dict | None = None,
+                           response_headers: dict | None = None,
+                           proxy_protocol_version: str = "",
+                           transport_protocol: str = "",
                            use_encryption: bool = False,
                            use_compression: bool = False) -> None:
+        """在 mefrp 上创建一条隧道。
+
+        ⚠️ **HTTP/HTTPS 与 TCP/UDP 的差别就落在两个字段上**（官方创建隧道
+        spec 原文，五组示例）：
+
+          · `remotePort` —— TCP/UDP 传端口号；HTTP/HTTPS **必须显式传 `null`**
+            （示例里写的是 `remotePort: null`，**不是省略这个键**）。
+          · `domain`     —— TCP/UDP 传 `""`；HTTP/HTTPS 传**文本化的 JSON
+            数组**，形如 `'["example.com"]'`（见 `join_domains`）。
+
+        传错的后果不是「接口报错」而是**隧道建出来不通**：给了端口的 http
+        隧道在节点上不会被反代接管；`domain` 传成裸域名则绑定不上，隧道
+        永远没有 Host 能匹配到它。所以这里按类型强制分支，调用方不用（也
+        不该）自己判断该传什么。
+
+        `http_plugin` 是「隧道类型 × 内网服务协议」的配对，四种合法组合：
+
+            http  + 内网 HTTP  → 留空
+            http  + 内网 HTTPS → "http2https"
+            https + 内网 HTTP  → "https2http"（需要 crt_path / key_path）
+            https + 内网 HTTPS → "https2https"（需要 crt_path / key_path）
+
+        ⚠️ `https` 的证书路径是**节点侧**的路径（官方示例 `/etc/crt/example.com.crt`），
+        对免费用户基本用不上 —— 想给站点上 TLS，实用做法是用 `http` 隧道
+        再让 Cloudflare 在前面终结 TLS（DNS 记录 proxied=on）。
+        """
+        pt = str(proxy_type or "tcp").strip().lower()
+        http_like = is_http_type(pt)
+
         body: dict[str, Any] = {
             "nodeId": int(node_id),
             "proxyName": proxy_name,
             "localIp": local_ip,
             "localPort": int(local_port),
-            "proxyType": proxy_type,
-            "domain": domain,
+            "proxyType": pt,
+            # ★ HTTP/HTTPS 恒为 null；TCP/UDP 没指定期望端口时也传 null
+            #   （让节点自己分配），而不是把这个键省掉 —— spec 里它是必填项。
+            "remotePort": None if http_like else (int(remote_port) if remote_port else None),
+            # ★ 只有 http 组才带域名相关的这些字段，port 组一律清空，
+            #   免得把上一次的残留带进一条 TCP 隧道。
+            "domain": join_domains(domain) if http_like else "",
+            "locations": (locations or "").strip() if http_like else "",
+            "httpPlugin": (http_plugin or "").strip() if http_like else "",
+            "crtPath": (crt_path or "").strip() if http_like else "",
+            "keyPath": (key_path or "").strip() if http_like else "",
             "accessKey": "",
             "hostHeaderRewrite": "",
-            "httpPlugin": "",
-            "requestHeaders": {},
+            "requestHeaders": dict(request_headers or {}),
+            "responseHeaders": dict(response_headers or {}),
             "httpUser": "",
             "httpPassword": "",
-            "crtPath": "",
-            "keyPath": "",
-            "proxyProtocolVersion": "",
+            "proxyProtocolVersion": proxy_protocol_version or "",
+            "transportProtocol": transport_protocol or "",
             "useEncryption": bool(use_encryption),
             "useCompression": bool(use_compression),
         }
-        if remote_port:
-            body["remotePort"] = int(remote_port)
         await self._request("POST", "/auth/proxy/create", body)
 
     async def proxy_delete(self, proxy_id: int) -> None:
