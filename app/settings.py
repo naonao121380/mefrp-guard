@@ -105,6 +105,11 @@ DEFAULT_SETTINGS: dict[str, object] = {
     "auto_dns_sync": True,          # 是否自动纠正漂移的 DNS 记录
     "auto_restart_frpc": True,      # 改完配置是否自动重启 frpc
     "notify_on_probe_fail": False,  # 探测失败但未达阈值时是否也推送（默认不推，避免刷屏）
+    # ★ 连续失败**多久**才把「mefrp 拉取失败 / DNS 同步失败」升级成 error 告警（秒）。
+    #   ⚠️ 按时间不按次数：巡检 20 秒一轮，「连续 3 次」只有 1 分钟 —— 移动宽带的
+    #   间歇性抽风会一路刷满红字（实测三天 122+64 条，没有一条是源站真挂了）。
+    #   默认 1800（30 分钟）：之前只留一条 warn，满 30 分钟才告警。设 0 = 立刻告警。
+    "alert_after_seconds": 1800,
     # 网络
     "user_agent": "MefrpGuard/1.0 (homelab)",
     "mefrp_base": "https://api.mefrp.com/api",

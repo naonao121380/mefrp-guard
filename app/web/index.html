@@ -232,6 +232,10 @@ dialog h3{margin-top:0;color:var(--text);font-size:15px}
       <div><label>切换后冷却（秒）</label><input id="s_failover_cooldown" type="number" min="0"></div>
       <div><label>节点冷却（秒）</label><input id="s_node_cooldown" type="number" min="0"></div>
     </div>
+    <div class="row3">
+      <div><label>连续失败多久才告警（秒）</label><input id="s_alert_after_seconds" type="number" min="0"></div>
+    </div>
+    <div class="note">网络抖一下不该惊动你。<b>连续失败满这个时长</b>，才把「拉取 mefrp 状态失败 / DNS 同步失败」升成红色告警；在那之前只在事件里留一条黄色 warn，中途自愈就不再记了。默认 1800（30 分钟）。填 0 = 一失败就告警。</div>
 
     <h2>节点择优</h2>
     <div class="row3">
@@ -1506,7 +1510,7 @@ async function loadEvents(){
 }
 
 // ---------- 设置 ----------
-const SET_KEYS = ['mefrp_token','cf_api_token','gotify_url','gotify_token','engine_interval','probe_interval','probe_timeout','probe_mode','fail_threshold','failover_cooldown','node_cooldown','min_bandwidth_mbps','max_load_percent','allow_regions','prefer_keywords','auto_failover','auto_dns_sync','auto_restart_frpc','notify_on_probe_fail','session_ttl_hours','login_max_attempts','login_lockout_seconds'];
+const SET_KEYS = ['mefrp_token','cf_api_token','gotify_url','gotify_token','engine_interval','probe_interval','probe_timeout','probe_mode','fail_threshold','failover_cooldown','node_cooldown','alert_after_seconds','min_bandwidth_mbps','max_load_percent','allow_regions','prefer_keywords','auto_failover','auto_dns_sync','auto_restart_frpc','notify_on_probe_fail','session_ttl_hours','login_max_attempts','login_lockout_seconds'];
 // ---------- 节点偏好（有序多选）----------
 // 存库仍是 prefer_keywords 一个逗号分隔串，**顺序就是优先级**。
 // 真正的输入框是隐藏的 #s_prefer_keywords —— 这样上面 SET_KEYS 那套

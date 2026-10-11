@@ -138,18 +138,49 @@ async def tcp_probe(host: str, port: int, timeout: float = 4.0) -> tuple[bool, s
 # 端到端探测模式，与 settings.DEFAULT_SETTINGS["probe_mode"] 的取值一致。
 PROBE_MODES = ("auto", "tcp", "none")
 
-# 传输层（瞬时）DNS 失败连续多少次才升成 error。
+# ★ 连续失败**多久**才升级成 error 告警（秒）。默认 30 分钟。
 #
-# ⚠️ 为什么要这个数：巡检每 20 秒一轮，每轮都会顺手同步一次 DNS。网络抖一下
-#    （尤其本机还挂着 `http_proxy=127.0.0.1:51140` 这样的本地代理时）就会失败
-#    一次，而下一轮立刻又好了。原来失败一律记 `error` —— 事件日志里就出现
-#    一条条红色的「更新 DNS 失败」，看起来像 DNS 功能坏了，实际上 90% 的轮次
-#    都是成功的（成功且记录已对时是静默的）。用户就是这么报的「好像没自动解析」。
-#    所以：低于这个数只记 warn，连续到数了才升 error。
+# ⚠️ 为什么按**时间**、不按次数：巡检每 20 秒一轮。原来的口径是「连续 N 次」，
+#    3 次 = 1 分钟 —— 移动宽带那种「抖两三分钟就自愈」的间歇性抽风，会一路
+#    记满一屏红字。实测 10-08~10-10 三天：mefrp 报了 122 条 error、Cloudflare
+#    64 条，全是这种 2~9 分钟的短窗口，**没有一条是源站真挂了**。用户明确要求：
+#    **连续半小时连不上才告警**；mefrp 的状态本来就不要求时效性，DNS 也一样。
 #
-# 刻意**不复用** `fail_threshold`：那个管的是「连续探测失败几次才触发切换」，
-# 把两个语义捆在一起，以后调其中一个必然误伤另一个。
-DNS_FAIL_ESCALATE = 3
+# 现在的规则（mefrp 与 DNS 完全一致）：
+#   · 刚开始失败 → 记**一条** warn 留痕（不告警），之后保持安静
+#   · 连续失败满 `alert_after_seconds` → 记一条 error（这才是告警）
+#   · 之后每再满一个 `alert_after_seconds` → 补一条（长时间断网不漏报）
+#   · 恢复 → 状态清零；**告过警**的才记一条 success（短抖自愈不再记，免得吵）
+#   · 静态问题（zone 找不到这种，重试不会好）不套这套，立刻记 error
+#
+# 可在「设置」页改（`alert_after_seconds`）。刻意**不复用** `fail_threshold`：
+# 那个管的是「连续探测失败几次才触发切换」，捆在一起以后调一个必然误伤另一个。
+ALERT_AFTER_SECONDS = 1800
+
+
+def alert_after_seconds() -> float:
+    """读「连续失败多久才告警」。设置页可改；脏值/缺值一律回落到默认。
+
+    ⚠️ 每次现读、不缓存：改设置不用重启（`PUT /api/settings` 之后下一轮巡检
+    就该按新口径走）。设成 0 或负数视为「立刻告警」，等价于关掉这层缓冲。
+    """
+    try:
+        v = float(store.get_setting("alert_after_seconds", ALERT_AFTER_SECONDS))
+    except (TypeError, ValueError):
+        return float(ALERT_AFTER_SECONDS)
+    return max(0.0, v)
+
+
+def _fmt_span(seconds: float) -> str:
+    """把秒数写成「X 分 Y 秒」/「X 小时 Y 分」，给事件文案用。"""
+    s = int(max(0.0, seconds))
+    if s >= 3600:
+        h, m = divmod(s // 60, 60)
+        return f"{h} 小时 {m} 分" if m else f"{h} 小时"
+    if s >= 60:
+        m, r = divmod(s, 60)
+        return f"{m} 分 {r} 秒" if r else f"{m} 分"
+    return f"{s} 秒"
 
 
 def probe_plan(proxy_type: str, mode: str) -> tuple[bool, str]:
@@ -251,10 +282,14 @@ class GuardEngine:
         # 端到端探测是两件事：这个说明「节点本身还在不在」。
         self.manual_probe: dict[int, tuple[float, bool, str]] = {}
 
-        # 每条隧道**连续**几次 DNS 同步失败（tunnel_id -> 次数）。只用于决定
-        # 这条失败该记 warn 还是 error，成功一次就清零。内存态即可 —— 重启
-        # 之后从头数没有副作用（最多是第一轮多记一条 warn）。
-        self.dns_fail_streak: dict[int, int] = {}
+        # ★ 连续失败的**起点时间戳**（None / 缺键 = 当前没在失败）与**已发过几次
+        #   告警**。只用来决定这条失败该记 warn 还是 error，成功一次就清零。
+        #   内存态即可 —— 重启之后从头计时没有副作用（最多多记一条 warn）。
+        #   口径见 `ALERT_AFTER_SECONDS`：满 30 分钟才告警，之前只留一条 warn。
+        self.dns_fail_since: dict[int, float] = {}
+        self.dns_alert_count: dict[int, int] = {}
+        self.mefrp_fail_since: float | None = None
+        self.mefrp_alert_count: int = 0
 
         self.last_error: str = ""
         self.tick_count: int = 0
@@ -662,13 +697,13 @@ class GuardEngine:
                 # 1. 拉全量状态
                 try:
                     await self._refresh_remote()
-                    self.last_error = ""
+                    self._note_mefrp_ok()
                 except MefrpError as exc:
                     self.last_error = str(exc)
                     # 拉取失败了 → 用户组自然也拿不到，如实记下原因。
                     if not self.user_group:
                         self.user_group_error = str(exc)
-                    store.add_event("error", "system", f"拉取 mefrp 状态失败：{exc}")
+                    self._note_mefrp_fail(str(exc))
                     remote_ok = False
 
             # 2. 逐隧道对账
@@ -688,6 +723,51 @@ class GuardEngine:
                     )
 
             store.prune_events()
+
+    # -- 连续失败计时（mefrp 与 DNS 共用同一套口径，见 ALERT_AFTER_SECONDS）---
+
+    def _note_mefrp_fail(self, msg: str) -> None:
+        """记一次 mefrp 拉取失败。
+
+        ⚠️ **不要**在这里按轮记 error。巡检 20 秒一轮，移动宽带抖两分钟就会自愈，
+        按轮记 error 等于把事件日志刷满红字（实测三天 122 条），而里面没有一条
+        是源站真挂了。现在的口径：刚开始失败只记**一条** warn 留痕，中间保持
+        安静，连续满 `alert_after_seconds` 才升 error。
+        """
+        now = time.time()
+        if self.mefrp_fail_since is None:
+            self.mefrp_fail_since = now
+            self.mefrp_alert_count = 0
+            store.add_event(
+                "warn", "system",
+                f"拉取 mefrp 状态失败：{msg}"
+                f"（连续失败满 {_fmt_span(alert_after_seconds())} 才告警；"
+                "中途自愈不再记录）",
+            )
+            return
+        down = now - self.mefrp_fail_since
+        # 每再满一个阈值补一条 —— 断一整天也只有 48 条，不会漏报也不会刷屏。
+        if down >= alert_after_seconds() * (self.mefrp_alert_count + 1):
+            self.mefrp_alert_count += 1
+            store.add_event(
+                "error", "system",
+                f"拉取 mefrp 状态已连续失败 {_fmt_span(down)}：{msg}",
+            )
+
+    def _note_mefrp_ok(self) -> None:
+        """mefrp 这一轮成功了。清 `last_error`；真告过警的才记一条恢复事件。"""
+        self.last_error = ""
+        if self.mefrp_fail_since is None:
+            return
+        down = time.time() - self.mefrp_fail_since
+        alerted = self.mefrp_alert_count
+        self.mefrp_fail_since = None
+        self.mefrp_alert_count = 0
+        if alerted:
+            store.add_event(
+                "success", "system",
+                f"mefrp 状态已恢复（此前连续失败 {_fmt_span(down)}）",
+            )
 
     async def _refresh_remote(self) -> None:
         assert self.client is not None
@@ -2083,7 +2163,7 @@ class GuardEngine:
                     and target.content == host:
                 if not tunnel.get("dns_record_id"):
                     store.update_tunnel(tunnel["id"], {"dns_record_id": target.record_id})
-                self.dns_fail_streak.pop(tid, None)
+                self._note_dns_ok(tid)
                 return ""
 
             proxied = bool(tunnel.get("dns_proxied"))
@@ -2105,24 +2185,62 @@ class GuardEngine:
             msg = f"{record_name} → {want_type} {host}"
             store.add_event("success", "dns", f"DNS 已更新：{msg}",
                             tunnel_id=tunnel["id"])
-            self.dns_fail_streak.pop(tid, None)
+            self._note_dns_ok(tid)
             return msg
         except CloudflareError as exc:
             msg = f"更新 DNS 失败：{exc}"
-            n = self.dns_fail_streak.get(tid, 0) + 1
-            self.dns_fail_streak[tid] = n
-            # 传输层瞬时失败先记 warn，连续到 DNS_FAIL_ESCALATE 次才升 error。
-            # 用户明确点的动作（force：导入 / 立即探测 / 切换后同步）不看这个 ——
-            # 那是他站在页面前等着要结果，必须如实报。
-            if exc.transient and not force and n < DNS_FAIL_ESCALATE:
+            if force:
+                # 用户明确点的动作（导入 / 立即探测 / 切换后同步）—— 他正站在
+                # 页面前等结果，必须如实报，不套「等半小时」那层缓冲。
+                store.add_event("error", "dns", msg, tunnel_id=tid)
+            else:
+                # `transient=False`（zone 找不到这种静态问题，重试一万次也不会好）
+                # → 立刻记 error，没有「等半小时」的道理。
+                self._note_dns_fail(tid, msg, transient=bool(exc.transient))
+            return msg
+
+    def _note_dns_fail(self, tid: int, msg: str, transient: bool) -> None:
+        """记一次 DNS 同步失败。口径与 mefrp 完全一致（见 ALERT_AFTER_SECONDS）。
+
+        ⚠️ 原来这里是「连续 N 次」的计数，N=3 → 1 分钟就升 error。巡检 20 秒一轮、
+        每轮都顺手同步一次 DNS，于是移动宽带抖两三分钟就能刷出一屏红字。现在改成
+        按时间：只留一条 warn，满 `alert_after_seconds` 才告警。
+        """
+        now = time.time()
+        if tid not in self.dns_fail_since:
+            self.dns_fail_since[tid] = now
+            if transient:
+                self.dns_alert_count[tid] = 0
                 store.add_event(
                     "warn", "dns",
-                    f"{msg}（连续第 {n} 次，多半是瞬时网络问题，下一轮会自动重试）",
+                    f"{msg}（连续失败满 {_fmt_span(alert_after_seconds())} 才告警；"
+                    "中途自愈不再记录）",
                     tunnel_id=tid,
                 )
             else:
+                # 静态问题：立刻报。但仍按同一个节奏补报，不每轮刷。
+                self.dns_alert_count[tid] = 1
                 store.add_event("error", "dns", msg, tunnel_id=tid)
-            return msg
+            return
+        down = now - self.dns_fail_since[tid]
+        if down >= alert_after_seconds() * (self.dns_alert_count[tid] + 1):
+            self.dns_alert_count[tid] += 1
+            store.add_event(
+                "error", "dns",
+                f"{msg}（已连续失败 {_fmt_span(down)}）",
+                tunnel_id=tid,
+            )
+
+    def _note_dns_ok(self, tid: int) -> None:
+        """这条隧道的 DNS 同步这一轮成功了。清连续失败状态。
+
+        ⚠️ 只有**告过警**的才记一条恢复事件 —— 抖动一下马上自愈的，前面那条
+        warn 已经留过痕了，再记一条 success 纯属噪音。
+        """
+        if self.dns_fail_since.pop(tid, None) is None:
+            return
+        if self.dns_alert_count.pop(tid, 0):
+            store.add_event("success", "dns", "DNS 同步已恢复", tunnel_id=tid)
 
     # ------------------------------------------------------------------
     # 手动操作

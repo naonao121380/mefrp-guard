@@ -178,6 +178,22 @@ with TestClient(app) as c:
     r = c.put("/api/settings", headers=AUTH, json={"auto_failover": False})
     check("布尔能存", c.get("/api/settings", headers=AUTH).json()["settings"]["auto_failover"] is False)
 
+    # ★ 回归：新增的「连续失败多久才告警」必须真能通过设置接口读写 —— 它是 int
+    #   字段，靠 `SettingsIn(extra="allow")` + `DEFAULT_SETTINGS` 自动生效。哪天有人
+    #   把 extra 关掉、或者漏加默认值，这里就会红（前端那个输入框也就成了摆设）。
+    _st = c.get("/api/settings", headers=AUTH).json()
+    check("★ defaults 里有 alert_after_seconds=1800",
+          _st["defaults"].get("alert_after_seconds") == 1800,
+          _st["defaults"].get("alert_after_seconds"))
+    r = c.put("/api/settings", headers=AUTH, json={"alert_after_seconds": 600})
+    check("★ alert_after_seconds 能写", r.status_code == 200, r.text[:200])
+    check("★ alert_after_seconds 能读回",
+          c.get("/api/settings", headers=AUTH).json()["settings"]["alert_after_seconds"] == 600,
+          c.get("/api/settings", headers=AUTH).json()["settings"].get("alert_after_seconds"))
+    r = c.put("/api/settings", headers=AUTH, json={"alert_after_seconds": "x"})
+    check("★ alert_after_seconds 非法值 -> 400", r.status_code == 400, r.status_code)
+    c.put("/api/settings", headers=AUTH, json={"alert_after_seconds": 1800})
+
     print("[8] 连通性自检（未配置 token，应返回 ok=False 而不是 500）")
     r = c.post("/api/test/mefrp", headers=AUTH)
     check("test/mefrp 不抛 500", r.status_code == 200 and r.json()["ok"] is False, r.text[:200])

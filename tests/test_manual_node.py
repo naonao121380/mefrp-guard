@@ -23,6 +23,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import time
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
@@ -654,6 +655,79 @@ check("★ 引擎如实说清了 mefrp 侧为什么不可用",
       "Token" in (eng.last_error or ""), eng.last_error)
 
 
+print("  --- ★ mefrp 拉取失败：满 alert_after_seconds 才告警 ---")
+# 移动宽带抖两三分钟就自愈。原来每轮（20 秒）记一条 error —— 实测三天 122 条，
+# **没有一条是源站真挂了**。现在：刚开始失败只留**一条** warn，中间完全安静，
+# 连续满 30 分钟才升 error；恢复时（真告过警的）记一条 success。
+from app.engine import ALERT_AFTER_SECONDS           # noqa: E402
+from app.mefrp import MefrpError                     # noqa: E402
+
+
+class DeadMefrp:
+    """所有接口都拉不通的假客户端。`fail=False` 时返回空数据（= 恢复正常）。"""
+
+    def __init__(self) -> None:
+        self.fail = True
+
+    def _boom(self):
+        raise MefrpError("请求 mefrp 失败：All connection attempts failed")
+
+    async def node_list(self):
+        return self._boom() if self.fail else []
+
+    async def node_status(self):
+        return self._boom() if self.fail else {}
+
+    async def proxy_list(self):
+        return self._boom() if self.fail else ([], {})
+
+    async def user_info(self):
+        # 成败都抛 —— `_refresh_remote` 本来就 catch 它（当作「用户组暂不可知」），
+        # 不影响这一轮的成功/失败判定。
+        raise MefrpError("用户组暂不可用")
+
+
+def _sys() -> list[dict]:
+    return [e for e in store.list_events(limit=500) if e["kind"] == "system"]
+
+
+store.set_setting("mefrp_token", "fake-token-for-alert-test")
+_dm = DeadMefrp()
+eng.client = _dm
+eng.mefrp_fail_since = None
+eng.mefrp_alert_count = 0
+_n0 = len(_sys())
+
+asyncio.run(eng.tick())
+_e = _sys()[0]
+check("★ mefrp 刚开始失败只记一条 warn（不告警）", _e["level"] == "warn", _e)
+check("★ warn 文案说清了「满多久才告警、中途自愈不记录」",
+      "才告警" in _e["message"] and "自愈" in _e["message"], _e["message"])
+
+for _i in range(10):
+    asyncio.run(eng.tick())
+check("★ 未满阈值期间完全静默（再跑 10 轮一条都不记）",
+      len(_sys()) == _n0 + 1, (len(_sys()), _n0))
+
+eng.mefrp_fail_since = time.time() - (ALERT_AFTER_SECONDS + 1)
+asyncio.run(eng.tick())
+_e = _sys()[0]
+check("★ 连续满 30 分钟才升 error", _e["level"] == "error", _e)
+check("★ error 文案带上已断时长", "30 分" in _e["message"], _e["message"])
+
+_dm.fail = False
+asyncio.run(eng.tick())
+_e = _sys()[0]
+check("★ 告过警的恢复记一条 success",
+      _e["level"] == "success" and "恢复" in _e["message"], _e)
+check("★ 恢复后连续失败状态清零",
+      eng.mefrp_fail_since is None and eng.mefrp_alert_count == 0,
+      (eng.mefrp_fail_since, eng.mefrp_alert_count))
+
+store.set_setting("mefrp_token", "")
+eng.client = object()
+
+
 print("  --- ★ 没配 CF token：不能每轮记一条错误事件 ---")
 # 没配 token 是**静态配置问题**，不是「这条隧道此刻解析失败了」。照常往下走的话
 # `CloudflareAuthError` 会被 except 抓住、每轮巡检记一条 error 事件 ——
@@ -682,16 +756,24 @@ _n3 = len([e for e in store.list_events(limit=200) if e["kind"] == "dns"])
 check("★ 用户明确要求时（force）才记事件", _n3 == _n2 + 1, (_n2, _n3))
 eng.cf = _cft                              # 还原成能用的假客户端
 
-print("  --- ★ 瞬时 DNS 失败：先记 warn，连续才升 error ---")
-# 巡检每 20 秒一轮，每轮都顺手同步一次 DNS。网络抖一下（本机还挂着
-# `http_proxy=127.0.0.1:51140` 这种本地代理时更是必中）就会失败一次，下一轮立刻
-# 又好了。原来失败**一律记 error** —— 事件日志里就出现一条条红色的「更新 DNS
-# 失败」，看起来像 DNS 功能坏了，而实际上绝大多数轮次都是成功的（成功且记录
-# 已经对了时是静默的）。用户就是这么报的「好像没自动解析」。
-# 所以：传输层瞬时失败先记 warn，连续到 DNS_FAIL_ESCALATE 次才升 error；
-# 用户明确点的动作（force：导入 / 立即探测 / 切换后同步）不看这个，如实报。
-from app.cloudflare import CloudflareError           # noqa: E402
-from app.engine import DNS_FAIL_ESCALATE             # noqa: E402
+print("  --- ★ 瞬时 DNS 失败：满 alert_after_seconds 才升 error ---")
+# 巡检每 20 秒一轮，每轮都顺手同步一次 DNS。网络抖一下（移动宽带的间歇性抽风，
+# 或者本机挂着 `http_proxy=127.0.0.1:51140` 这种本地代理时）就会失败一次，下一轮
+# 立刻又好了。原来失败**一律记 error**；后来改成「连续 3 次」—— 但 3 次只有 1
+# 分钟，照样刷屏。实测三天：mefrp 122 条 + Cloudflare 64 条 error，全是 2~9 分钟
+# 的短窗口，**没有一条是源站真挂了**。
+# 现在按**时间**：满 30 分钟才告警，之前只留一条 warn，中途自愈不再记。
+from app.cloudflare import CloudflareError                        # noqa: E402
+from app.engine import ALERT_AFTER_SECONDS, alert_after_seconds   # noqa: E402
+
+check("★ 默认告警门槛是 30 分钟", ALERT_AFTER_SECONDS == 1800, ALERT_AFTER_SECONDS)
+store.set_setting("alert_after_seconds", 1800)
+check("设置项可读，且默认值与常量一致",
+      alert_after_seconds() == 1800.0, alert_after_seconds())
+store.set_setting("alert_after_seconds", 0)
+check("★ 设 0 = 立刻告警（关掉这层缓冲）", alert_after_seconds() == 0.0,
+      alert_after_seconds())
+store.set_setting("alert_after_seconds", 1800)
 
 
 class FlakyCF:
@@ -733,6 +815,7 @@ _fl = store.create_tunnel({
 })
 _cffl = FlakyCF()
 eng.cf = _cffl
+_fid = int(store.get_tunnel(_fl)["id"])
 
 
 def _newest_dns() -> dict:
@@ -740,34 +823,84 @@ def _newest_dns() -> dict:
     return [e for e in store.list_events(limit=50) if e["kind"] == "dns"][0]
 
 
-for _i in range(1, DNS_FAIL_ESCALATE + 1):
-    asyncio.run(eng._sync_dns(store.get_tunnel(_fl), None, host="127.0.0.1"))
-    _e = _newest_dns()
-    _want = "warn" if _i < DNS_FAIL_ESCALATE else "error"
-    check(f"★ 连续第 {_i} 次瞬时失败记 {_want}",
-          _e["level"] == _want, (_i, _e["level"], _e["message"]))
+def _sync_flaky():
+    return asyncio.run(eng._sync_dns(store.get_tunnel(_fl), None,
+                                     host="127.0.0.1"))
 
-asyncio.run(eng._sync_dns(store.get_tunnel(_fl), None, host="127.0.0.1"))
-check("★ 到阈值之后继续失败仍然是 error（不会又退回 warn）",
+
+_sync_flaky()
+_e = _newest_dns()
+check("★ 刚开始失败只记一条 warn（不告警）", _e["level"] == "warn", _e)
+check("★ warn 文案说清了「满多久才告警、中途自愈不记录」",
+      "才告警" in _e["message"] and "自愈" in _e["message"], _e["message"])
+
+# ★ 关键：没满阈值期间**一条都不记** —— 这就是「别吵」的本体。
+#   原来每轮一条 warn，90 轮就是 90 条。
+_n_before = len(store.list_events(limit=200))
+for _i in range(20):
+    _sync_flaky()
+check("★ 未满阈值期间完全静默（连跑 20 轮一条都不记）",
+      len(store.list_events(limit=200)) == _n_before,
+      (len(store.list_events(limit=200)), _n_before))
+
+# 把「连续失败起点」往前拨 30 分钟 —— 等价于真的断了半小时（比 sleep 靠谱，
+# 也不依赖真实时钟流逝）。
+eng.dns_fail_since[_fid] = time.time() - (ALERT_AFTER_SECONDS + 1)
+_sync_flaky()
+_e = _newest_dns()
+check("★ 连续满 30 分钟才升 error", _e["level"] == "error", _e)
+check("★ error 文案带上已断时长", "30 分" in _e["message"], _e["message"])
+
+# 再满一个阈值 → 补一条（断一整天也只有 48 条，既不漏报也不刷屏）
+eng.dns_fail_since[_fid] = time.time() - (ALERT_AFTER_SECONDS * 2 + 1)
+_sync_flaky()
+check("★ 再满一个阈值补一条 error（长时间断网不漏报）",
       _newest_dns()["level"] == "error", _newest_dns())
-check("★ warn 的文案说清了「多半是瞬时问题、会自动重试」",
-      "瞬时" in _newest_dns()["message"] or "重试" in _newest_dns()["message"],
-      _newest_dns()["message"])
 
-# 成功一次就把连续计数清零 —— 否则抖动会「攒」起来，隔几分钟突然升级成 error，
-# 那就成了另一种形式的误报。
+# 恢复：状态清零，且**告过警**的才记一条 success
 _cffl.fail = False
-asyncio.run(eng._sync_dns(store.get_tunnel(_fl), None, host="127.0.0.1"))
+_sync_flaky()
 check("恢复后记录同步成功（走了 upsert）", len(_cffl.upserts) == 1, _cffl.upserts)
+check("★ 告过警的恢复记一条 success",
+      "DNS 同步已恢复" in _newest_dns()["message"], _newest_dns()["message"])
+check("★ 恢复后连续失败状态清零",
+      _fid not in eng.dns_fail_since and _fid not in eng.dns_alert_count,
+      (eng.dns_fail_since, eng.dns_alert_count))
+
+# 短抖自愈**不**记「已恢复」 —— 前面那条 warn 已经留过痕了，再来一条纯属噪音
 _cffl.fail = True
-asyncio.run(eng._sync_dns(store.get_tunnel(_fl), None, host="127.0.0.1"))
-check("★ 成功一次就把连续计数清零（抖动不会攒成 error）",
+_sync_flaky()
+check("★ 恢复后再失败又从 warn 开始（短抖不会攒成 error）",
       _newest_dns()["level"] == "warn", _newest_dns())
+_cffl.fail = False
+_sync_flaky()
+check("★ 没告过警的短抖自愈不额外记「已恢复」（保持安静）",
+      "DNS 同步已恢复" not in _newest_dns()["message"], _newest_dns()["message"])
 
 # force = 用户明确点的动作，不看阈值，第一次就如实记 error。
+_cffl.fail = True
+_sync_flaky()                       # 先起一个 streak（记 warn）
 asyncio.run(eng._sync_dns(store.get_tunnel(_fl), None, force=True,
                           host="127.0.0.1"))
 check("★ force（导入 / 立即探测）时第一次就如实记 error",
+      _newest_dns()["level"] == "error", _newest_dns())
+
+
+# 静态问题（token 没权限这种，重试一万次也不会好）不套「等半小时」，立刻报。
+class StaticFailCF(FlakyCF):
+    async def list_records(self, zone_id: str, name: str | None = None):
+        raise CloudflareError("[10000] Authentication error", transient=False)
+
+
+eng.cf = StaticFailCF()
+_fl2 = store.create_tunnel({
+    "name": "静态错的隧道", "proxy_name": "staticfail-dns", "proxy_type": "tcp",
+    "local_ip": "127.0.0.1", "local_port": 5002, "current_remote_port": 5022,
+    "manual_node_id": mid, "enabled": 1, "auto_failover": 0,
+    "dns_record_name": "staticfail.example.net",
+})
+asyncio.run(eng._sync_dns(store.get_tunnel(_fl2), None, host="127.0.0.1"))
+check("★ 静态问题（重试不会好）第一次就记 error，不等半小时",
       _newest_dns()["level"] == "error", _newest_dns())
 eng.cf = _cft
 

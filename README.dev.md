@@ -237,13 +237,26 @@ WireGuard 的握手包）。那属于业务侧的事，不是这个工具该做�
   现在只对 `httpx.TransportError`（连不上 / 超时 / 连接被重置 / 代理挂了）退避重试 2 次；
   HTTP 状态错误**不重试**（401/403/5xx 是请求本身的问题，再打十次也一样）。
   重试耗尽后抛的 `CloudflareError` 带 `transient=True`，调用方据此决定记 warn 还是 error。
-- **★ 瞬时失败不能一律记 error** —— 巡检每 20 秒一轮，每轮都同步一次 DNS。抖一下失败、
-  下一轮立刻就好，而日志里留下的是**红色「更新 DNS 失败」** —— 用户会以为 DNS 功能坏了
-  （他确实这么报过）。现在连续 `< DNS_FAIL_ESCALATE`（3）次只记 `warn`，到阈值才升
-  `error`，成功一次就清零（**清零很重要**：否则抖动会攒起来，隔几分钟突然升级成 error，
-  变成另一种误报）。`force`（用户明确点的动作）不看阈值，第一次就如实记 `error`。
+- **★ 瞬时失败不能一律记 error，而且门槛要按「时间」、不是「次数」** —— 巡检每 20 秒
+  一轮，每轮都同步一次 DNS。抖一下失败、下一轮立刻就好，而日志里留下的是**红色
+  「更新 DNS 失败」** —— 用户会以为 DNS 功能坏了（他确实这么报过）。一开始的修法是
+  「连续 `< DNS_FAIL_ESCALATE` 次只记 warn」—— 但 3 次只有 1 分钟，**照样刷屏**：
+  实测三天里 mefrp 报了 122 条 error、Cloudflare 64 条，全是 2~9 分钟的短窗口，
+  **没有一条是源站真挂了**（根因是移动宽带的间歇性抖动，源站侧只有 10-09 上午那段
+  `响应不是合法 JSON` 是真的）。
+  现在按**时间**（`alert_after_seconds`，默认 1800 = 30 分钟）：
+  · 刚开始失败 → 只留**一条** warn，中间完全安静（原来 90 轮就是 90 条）
+  · 连续满阈值 → 升 `error`；之后每再满一个阈值补一条（断一整天也只有 48 条）
+  · 恢复 → 状态清零；**告过警的**才记一条恢复事件，短抖自愈不记（前面那条 warn
+    已经留过痕了，再来一条纯属噪音）
+  成功一次就清零（**清零很重要**：否则抖动会攒起来，隔几分钟突然升级成 error，
+  变成另一种误报）。`force`（用户明确点的动作）和**静态问题**（zone 找不到、token
+  没权限这类，重试一万次也不会好）不看阈值，第一次就如实记 `error`。
   阈值刻意**不复用** `fail_threshold` —— 那个管的是「连续探测失败几次才触发切换」，
   捆在一起以后调其中一个必然误伤另一个。
+- ★ **mefrp 拉取失败与 DNS 同步失败共用同一套口径** —— 见 `ALERT_AFTER_SECONDS` 与
+  `_note_mefrp_fail` / `_note_dns_fail`。两处原来各写各的（一处「每轮一条 error」、
+  一处「连续 3 次」），调了一个忘了另一个。现在都是「一条 warn + 满阈值才 error」。
 
 ### 相关的巡检坑：mefrp 挂了不该连累外部节点
 
@@ -577,7 +590,7 @@ mefrp-guard/
 │       └── favicon.ico 老浏览器 / Safari / webview 的回落图标（`/favicon.ico`）
 ├── tests/              十个测试文件（鉴权 / 纯逻辑 / CF 客户端 / 外部节点逻辑 / API /
 │                       外部节点 API / 标签 / 作用域 / 故障转移 / 多容器挂接），
-│                       共 962 条断言
+│                       共 981 条断言
 ├── run_local.sh        本地试跑脚本（不依赖 Docker，用沙箱 frpc 配置）
 ├── Dockerfile
 ├── docker-compose.yml
@@ -787,14 +800,14 @@ PYTHONPATH=$PWD/.devdeps PY=$PY ./tests/run_all.sh
 > ⚠️ `run_all.sh` **自己不设 `PYTHONPATH`** —— 不带上的话会在第一个需要依赖的文件上
 > 报 `No module named 'fastapi'`。
 
-十个文件，共 **962 条断言**（59 + 141 + 22 + 122 + 192 + 183 + 30 + 47 + 73 + 93）：
+十个文件，共 **981 条断言**（59 + 141 + 22 + 137 + 196 + 183 + 30 + 47 + 73 + 93）：
 
 | 文件 | 覆盖 | 需要第三方库 |
 |---|---|---|
 | `tests/test_auth.py` | **密码哈希（随机盐/迭代数/异常输入安全降级）、默认密码识别、会话令牌、登录防爆破、来源 IP 解析** | 否 |
 | `tests/test_logic.py` | frpc TOML 合并与跨节点校验、**单引号字面量解析**、配置备份/恢复/路径穿越、SQLite 持久化与字段白名单、Node/Proxy 字段解析、`pick_node` 择优调度、**节点偏好的有序语义与归一化**、**`probe_plan` 探测适用性** | 否 |
 | `tests/test_cfclient.py` | **Cloudflare 客户端的 httpx 交互**：传输层退避重试、重试耗尽后 `transient=True` 与异常类型名、非传输层错误不重试、**连接池复用（3 个请求只建 1 个）与跨事件循环重建**、`upsert(existing=…)` 省掉两次自查、没配 token 一个请求都不发 | httpx |
-| `tests/test_manual_node.py` | **frpc 配置解析（TOML / INI）、`patch_server` 文本级改写的保真与合法性、外部节点数据层 CRUD、1.0.0 老库补列迁移、引擎对外部隧道的分支（含「不适用探测」的三态、UDP 的 DNS 同步、瞬时失败 warn→error 的升级与清零）** | 否 |
+| `tests/test_manual_node.py` | **frpc 配置解析（TOML / INI）、`patch_server` 文本级改写的保真与合法性、外部节点数据层 CRUD、1.0.0 老库补列迁移、引擎对外部隧道的分支（含「不适用探测」的三态、UDP 的 DNS 同步）、★ **mefrp 拉取失败与 DNS 同步失败「满 `alert_after_seconds` 才告警」的完整口径**（一条 warn → 静默 → 满阈值 error → 每再满一个阈值补报 → 恢复 success / 短抖不记 / force 与静态问题立刻报）** | 否 |
 | `tests/test_api.py` | FastAPI 全端点：**登录页/会话 Cookie/登出作废/改密码/CSRF/防爆破/只读设置保护**、鉴权、CRUD、密钥打码、错误码、枚举字段校验、引擎生命周期、**frpc 实例 CRUD 与挂接 API**、**`/api/tunnels` 与 `/api/overview` 的挂接字段口径一致**、**节点偏好预览（含路由遮蔽回归）** | fastapi / httpx / pydantic |
 | `tests/test_manual_api.py` | 外部节点全部 HTTP 端点：导入 / 更新 / 删除 / 改连 / 探测、token 不回明文、**「地址已导入过」的 409 契约与「覆盖重建空节点」**、**导入时顺手同步 DNS 与 udp 隧道的探测端点**、**DNS 记录名查重的 409 契约（含编辑自己 / 导入时只放弃那一个字段）**、删掉最后一条隧道自动清理空节点 | fastapi / httpx / pydantic |
 | `tests/test_tags.py` | 隧道标签：默认打 `mefrp`、归一化与截断、`?tag=` 筛选（**空串 = 筛未打标的**）、`/api/tags` 计数与排序、显式清空、**老库只回填一次** | fastapi / httpx / pydantic |
