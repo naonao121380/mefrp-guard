@@ -44,11 +44,6 @@
   > UDP 探了必**假阴性**（没有 TCP 监听），HTTP 探了必**假阳性**（反代对任何 Host 都握手成功）。
   > `probe_plan()` 的返回值也因此从 `(bool, why)` 改成了 `(种类, why)`。
 
-- **节点「HTTP 入口域名」。** 官方要求把绑定域名 CNAME 到**节点域名**，但非管理员账号
-  看不到 `hostname`（`/auth/node/list` 脱敏成空串），实测能拿到的是 IP。所以节点页加了
-  一个手填入口：填了 → DNS 记录走 **CNAME**（抗节点换 IP）；不填 → 退回**节点 IP 的
-  A 记录**（实测也能通，节点反代按 Host 头分流）。
-
 - **区域改成多选。** 从逗号分隔输入框换成**复选框 + 快捷选择**，快捷项里有
   **「所有海外节点（港澳台+海外）」= `cnos,oversea`**。两套偏好各一个面板。
 
@@ -62,8 +57,7 @@
 ### 内部
 
 - `tunnels` 表新增 6 列（`desired_domain` / `current_domain` / `http_plugin` /
-  `route_locations` / `crt_path` / `key_path`），`node_prefs` 新增 `http_entry` ——
-  都走既有的 `_migrate()` 自动补列。
+  `route_locations` / `crt_path` / `key_path`）—— 走既有的 `_migrate()` 自动补列。
 - 故障转移、手动切换、DNS 同步、外部节点切换、批量端口刷新**逐条按类型分流**；
   HTTP 组不做端口分配、不写端口回写、不产生「下游待办」（它的域名不变，下游不用动）。
 

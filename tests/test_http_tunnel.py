@@ -7,7 +7,7 @@
 分三段：
   [A] 纯逻辑：domain 字段的解析 / 序列化（mefrp 的坑最多的一段）
   [B] 探测分流：HTTP 探测的 URL 构造与三态判定
-  [C] API 与引擎：按类型校验、偏好分组、冷却复合键、DNS 走 http_entry
+  [C] API 与引擎：按类型校验、偏好分组、冷却复合键、DNS 走节点 IP
 
 ⚠️ 全程不碰外网：httpx 是桩，节点地址是 127.0.0.1。
 """
@@ -332,16 +332,14 @@ with TestClient(app) as c:
     r = c.put("/api/settings", headers=AUTH, json={"probe_mode": "bogus"})
     check("probe_mode 非法值 -> 400", r.status_code == 400, r.status_code)
 
-    # --- 节点偏好支持 http_entry ---
+    # --- 「HTTP 入口」已移除：节点偏好只剩 priority / excluded / note ---
     r = c.post("/api/nodes/91/pref", headers=AUTH,
                json={"http_entry": "node91.example.net"})
-    check("节点偏好写 http_entry -> 200", r.status_code == 200, r.text[:200])
+    check("提交已废弃的 http_entry -> 仍 200（未知字段被忽略，不报错）",
+          r.status_code == 200, r.text[:200])
     prefs = c.get("/api/settings", headers=AUTH).json()["node_prefs"]
-    check("http_entry 落库", prefs.get("91", {}).get("http_entry") == "node91.example.net",
-          prefs.get("91"))
-    check("/api/nodes 的 prefs 也带 http_entry",
-          c.get("/api/nodes", headers=AUTH).json()["prefs"].get("91", {}).get("http_entry")
-          == "node91.example.net")
+    check("★ 已废弃的 http_entry 不会落库",
+          prefs.get("91", {}).get("http_entry") in (None, ""), prefs.get("91"))
 
 print("[C] 引擎：偏好分组 / 冷却复合键 / DNS 入口域名")
 
@@ -400,8 +398,8 @@ check("★ rank_nodes(http): 大陆节点带「需报备」警告",
       any("报备" in w for w in rows_http[91]["warnings"]), rows_http[91]["warnings"])
 check("rank_nodes(tcp): 大陆节点没有报备警告（那只对 http 组有意义）",
       not any("报备" in w for w in rows_port[91]["warnings"]), rows_port[91]["warnings"])
-check("rank_nodes 透传 http_entry 字段",
-      "http_entry" in rows_http[91], list(rows_http[91]))
+check("★ rank_nodes 不再透传已废弃的 http_entry",
+      "http_entry" not in rows_http[91], list(rows_http[91]))
 
 # ---- 冷却表是 (类型组, 节点) 复合键 ----
 eng.node_cooldown = {("port", 91): 9e9}
@@ -414,8 +412,10 @@ check("http 组冷却：http 挑不到 237",
 check("★ http 组冷却不影响 port 组", eng.pick_node(proxy_type="tcp")[0] is not None)
 eng.node_cooldown = {}
 
-# ---- _sync_dns 走 http_entry（CNAME）而不是节点 IP（A 记录）----
-print("  --- DNS 入口域名 ---")
+# ---- DNS 目标：两类隧道都走节点 IP 的 A 记录 ----
+# （1.0.2 中途曾有过一个「HTTP 入口域名」让 HTTP 隧道走 CNAME，后来去掉了 ——
+#  官方要求 CNAME 到的那个「节点域名」对非管理员账号根本拿不到，用户无从填写。）
+print("  --- DNS 目标 ---")
 
 
 class _FakeCF:
@@ -455,24 +455,14 @@ proxy_a = Proxy(proxy_id=501, proxy_name="site-a", proxy_type="http", node_id=91
                 local_ip="127.0.0.1", local_port=8080, remote_port=None,
                 domain='["site-a.example.com"]', is_online=True)
 
-# 没有 http_entry -> 退回节点 IP，走 A 记录。
-# ⚠️ 前面的 API 段已经给 91 写过 http_entry，这里必须显式清掉再测。
-store.upsert_node_pref(91, http_entry="")
-msg = asyncio.run(eng._sync_dns(store.get_tunnel(h_http), proxy_a, force=True))
+# HTTP 隧道：DNS 目标是**节点 IP**，于是走 A 记录。
+asyncio.run(eng._sync_dns(store.get_tunnel(h_http), proxy_a, force=True))
 rec = eng.cf.upserts[-1]
-check("无 http_entry 时 HTTP 隧道 DNS 走节点 IP 的 A 记录",
+check("★ HTTP 隧道的 DNS 走节点 IP 的 A 记录",
       rec["record_type"] == "A" and rec["content"] == "203.0.113.10",
       (rec["record_type"], rec["content"]))
 
-# 填了 http_entry -> CNAME 到节点入口域名
-store.upsert_node_pref(91, http_entry="node91.example.net")
-msg = asyncio.run(eng._sync_dns(store.get_tunnel(h_http), proxy_a, force=True))
-rec = eng.cf.upserts[-1]
-check("★ 有 http_entry 时 HTTP 隧道 DNS 走 CNAME 到节点入口域名",
-      rec["record_type"] == "CNAME" and rec["content"] == "node91.example.net",
-      (rec["record_type"], rec["content"]))
-
-# TCP 隧道不受 http_entry 影响
+# TCP 隧道：口径完全一致（两类隧道在 DNS 目标上不再有分叉）
 h_tcp = store.create_tunnel({
     "name": "SSH", "proxy_name": "ssh-a", "proxy_type": "tcp",
     "local_ip": "127.0.0.1", "local_port": 22, "current_remote_port": 40022,
@@ -483,7 +473,7 @@ proxy_t = Proxy(proxy_id=502, proxy_name="ssh-a", proxy_type="tcp", node_id=91,
                 domain="", is_online=True)
 asyncio.run(eng._sync_dns(store.get_tunnel(h_tcp), proxy_t, force=True))
 rec = eng.cf.upserts[-1]
-check("TCP 隧道仍走节点 IP 的 A 记录（http_entry 与它无关）",
+check("TCP 隧道也是节点 IP 的 A 记录（两类口径一致）",
       rec["record_type"] == "A" and rec["content"] == "203.0.113.10",
       (rec["record_type"], rec["content"]))
 

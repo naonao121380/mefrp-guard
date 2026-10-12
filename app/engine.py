@@ -180,8 +180,8 @@ def http_probe_url(proxy_type: str, domain: str, path: str = "/") -> str:
     """拼出 HTTP 探测的 URL。
 
     ⚠️ 用**绑定域名**而不是节点地址：这条隧道的身份就是域名，节点上的反代也是
-    按请求的 Host 头分流的。拿节点 IP 去请求只会拿到反代的默认页，探不出任何
-    有用的东西 —— 那还不如不探。
+    按请求的 Host 头分流的。拿节点地址去请求（不管它是 IP 还是域名）只会拿到
+    反代的默认页，探不出任何有用的东西 —— 那还不如不探。
 
     scheme 按**隧道类型**定，不是按本地服务：
       · `http` 隧道对外就是明文，哪怕本地服务是 HTTPS（那是 `http2https`
@@ -942,7 +942,11 @@ class GuardEngine:
           3. **该节点上任一隧道的官方配置里的 serverAddr** —— 非管理员唯一可行的一条路
 
         第 3 条为什么可行：`/auth/proxy/config` 返回的配置里 serverAddr 就是节点地址，
-        实测与 proxy_list 里的 hostname 完全一致（同一个节点的两个接口给出同一个 IP）。
+        实测与 proxy_list 里的 hostname 完全一致（同一个节点的两个接口给出同一个值）。
+
+        ⚠️ 返回值**不保证是 IP** —— 各节点给的 serverAddr 格式并不统一，有的是 IP、
+        有的是域名（实测我们手上这几个是 IP）。调用方要自己判形态（见 `_sync_dns`
+        里的 `_IPV4_RE`），别假设它一定是 IP。
 
         节点上一个隧道都没有时返回空串 —— 这不是 bug，是 mefrp 对非管理员的限制，
         地址只有在那个节点上建了隧道之后才能拿到。
@@ -1479,9 +1483,6 @@ class GuardEngine:
                 "keyword_hit": rank < len(keywords),
                 "priority": int(pref["priority"]) if pref else 100,
                 "excluded": bool(pref and pref.get("excluded")),
-                # 这个节点对外提供 HTTP(S) 的入口地址（域名或 IP），http 隧道用它
-                # 做 DNS 目标；留空则退回「A 记录指向节点 IP」。见 store.node_prefs。
-                "http_entry": (pref or {}).get("http_entry", "") or "",
                 "blockers": blockers,
                 "warnings": warnings,
                 "selectable": not blockers,
@@ -2364,23 +2365,18 @@ class GuardEngine:
             node = self.nodes.get(proxy.node_id)
             if node is None:
                 return ""
-            # ★ HTTP/HTTPS 隧道优先解析到「节点 HTTP 入口域名」。
-            #   官方文档要求「把绑定域名 CNAME 到节点域名」，但非管理员账号看不到
-            #   hostname（/auth/node/list 脱敏成空串），所以只能让用户在节点偏好里
-            #   手填一个 http_entry。填了就 CNAME 过去 —— 比写死 IP 更抗节点换 IP；
-            #   没填就退回节点 IP 走 A 记录（实测节点反代按 Host 头分流，A 记录也能通）。
-            if is_http_type(tunnel.get("proxy_type")):
-                pref = store.list_node_prefs().get(int(proxy.node_id)) or {}
-                entry = str(pref.get("http_entry") or "").strip()
-                if entry:
-                    host = entry
-                else:
-                    host = (await self.node_address(proxy.node_id)).strip()
-            else:
-                # 节点地址只能从「该节点上已有隧道的官方配置」里反推（非管理员账号下
-                # /auth/node/list 的 hostname 是空串），所以这里必须走解析器而不是
-                # 直接读 node.hostname。
-                host = (await self.node_address(proxy.node_id)).strip()
+            # 节点地址只能从「该节点上已有隧道的官方配置」里反推（非管理员账号下
+            # /auth/node/list 的 hostname 是空串），所以这里必须走解析器而不是
+            # 直接读 node.hostname。
+            #
+            # ⚠️ HTTP/HTTPS 隧道走的是**同一条路**。反推出来的地址**可能是 IP，
+            #    也可能是域名** —— mefrp 各节点给的 serverAddr 并不统一（实测我们
+            #    手上这几个是 IP）。下面的 `_IPV4_RE` 会据此自动选 A 记录还是 CNAME，
+            #    两种情况都覆盖。
+            #    官方建议把绑定域名 CNAME 到「节点域名」，那个域名对非管理员账号拿不到
+            #    （hostname 被脱敏成空串），用户无从填写，所以不做「HTTP 入口」输入框：
+            #    节点给的是域名就自动 CNAME，给的是 IP 就写 A 记录，不需要人插手。
+            host = (await self.node_address(proxy.node_id)).strip()
         else:
             host = str(host).strip()
 

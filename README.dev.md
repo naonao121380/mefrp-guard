@@ -717,7 +717,7 @@ mefrp-guard/
 
 | | TCP / UDP | HTTP / HTTPS |
 |---|---|---|
-| 对外入口 | **端口**（`节点IP:41234`） | **域名**（`http://nas.example.com`） |
+| 对外入口 | **端口**（`节点地址:41234`） | **域名**（`http://nas.example.com`） |
 | 节点侧机制 | 裸端口转发 | 节点**反代**，按 Host 头分流到不同后端 |
 | 主要限制 | 端口是否被占、节点是否支持该协议 | **域名备案**（大陆节点）、需报备（白名单） |
 | 切换节点后 | 端口可能变 → 要去改下游 | **域名不变** → 下游什么都不用动 |
@@ -773,14 +773,17 @@ PREF_KEYS = {
 ⚠️ `http_probe` 里的 `import httpx` **放在函数内部**而不是模块顶层 —— engine 被
 「纯逻辑测试」导入时会被塞一个假的 httpx。
 
-### DNS：CNAME 到节点入口域名，或退回 A 记录
+### DNS：两类隧道都指向节点地址（IP → A，域名 → CNAME）
 
 官方要求「把绑定域名 CNAME 到**节点域名**」，但非管理员账号看不到 `hostname`
-（见上面第 4 条），实测能拿到的 `serverAddr` 是 **IP**。所以：
+（见上面第 4 条），只能从 `serverAddr` 反推节点地址。
 
-- 节点偏好里的 **`http_entry`**（可选，手填）就是「这个节点的 HTTP 入口域名」。
-  填了 → DNS 记录走 **CNAME** 到它（抗节点换 IP）；没填 → 退回节点 **IP 的 A 记录**。
-- 实测 A 记录也能通 —— 节点反代按 Host 头分流，不挑地址形式，CNAME 只是更稳。
+⚠️ **那个地址不保证是 IP** —— 各节点给的不统一，有的是 IP、有的是域名（我们手上
+这几个目前都是 IP）。`_sync_dns` 用 `_IPV4_RE` 判形态：IP 写 **A 记录**，域名写
+**CNAME**。所以「节点给的是域名」这种情况其实是被自动覆盖的，不需要用户插手。
+
+**因此不做那个「HTTP 入口域名」的手填框** —— 用户根本无从知道该填什么，留着只会是
+一个填不出内容的空框。HTTP 隧道和 TCP/UDP 走同一条路：程序按节点地址自动选记录类型。
 
 ### 前端
 
@@ -943,7 +946,7 @@ PYTHONPATH=$PWD/.devdeps PY=$PY ./tests/run_all.sh
 | `tests/test_tags.py` | 隧道标签：默认打 `mefrp`、归一化与截断、`?tag=` 筛选（**空串 = 筛未打标的**）、`/api/tags` 计数与排序、显式清空、**老库只回填一次** | fastapi / httpx / pydantic |
 | `tests/test_scope.py` | **隧道名的唯一性作用域**：同名隧道跨运营商并存、展示名重名不报错、mefrp 作用域内仍唯一、`/api/orphans` 与 `probe` 按作用域分流、**老库整表重建去掉 UNIQUE** | fastapi / httpx / pydantic |
 | `tests/test_failover.py` | 完整故障转移流水线（mefrp / CF / Gotify / Docker 全部打桩），含**节点地址取址路径**与 **UDP 跳过探测** | fastapi / httpx / pydantic |
-| `tests/test_http_tunnel.py` | **1.0.2 HTTP/HTTPS 隧道**：`domain` 字段的「文本化 JSON 数组」解析与序列化（含畸形输入兜底）、`proxy_create` 两类隧道的请求体差异（`remotePort` 必须显式 null、TCP 侧 domain 强制清空）、**HTTP 探测的 URL 构造与返回码三态（2xx/3xx 通、4xx/5xx 不通）**、**按类型校验（HTTP 缺域名 / 填端口、TCP 绑域名都是 400）**、**两套偏好体系的隔离（同一节点在两组口径下选出不同结果）**、**冷却表的 `(类型组, 节点)` 复合键**、**DNS 走 `http_entry` 时是 CNAME、否则退回节点 IP 的 A 记录** | fastapi / httpx / pydantic |
+| `tests/test_http_tunnel.py` | **1.0.2 HTTP/HTTPS 隧道**：`domain` 字段的「文本化 JSON 数组」解析与序列化（含畸形输入兜底）、`proxy_create` 两类隧道的请求体差异（`remotePort` 必须显式 null、TCP 侧 domain 强制清空）、**HTTP 探测的 URL 构造与返回码三态（2xx/3xx 通、4xx/5xx 不通）**、**按类型校验（HTTP 缺域名 / 填端口、TCP 绑域名都是 400）**、**两套偏好体系的隔离（同一节点在两组口径下选出不同结果）**、**冷却表的 `(类型组, 节点)` 复合键**、**DNS 目标一律是节点地址（IP→A、域名→CNAME，两类隧道口径一致）**、**已废弃的 `http_entry` 不再落库也不再透传** | fastapi / httpx / pydantic |
 | `tests/test_frpc_multi.py` | **多容器挂接：不自动播种、只认显式挂接、未挂接拒绝切换、按容器重建、成组切换、跨容器隔离、失败回滚、自动发现** | 否 |
 
 `test_auth` / `test_logic` / `test_failover` / `test_frpc_multi` / `test_manual_node`

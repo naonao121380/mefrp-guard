@@ -468,10 +468,6 @@ class NodePrefIn(BaseModel):
     priority: int | None = None
     excluded: bool | None = None
     note: str | None = None
-    # HTTP/HTTPS 隧道用：这个节点的「HTTP 入口域名」。
-    # 官方要求把绑定域名 CNAME 到「节点域名」，但非管理员账号看不到 hostname，
-    # 所以只能手填。填了 DNS 就 CNAME 过去，不填就退回节点 IP 走 A 记录。
-    http_entry: str | None = None
 
 
 class PrefPreviewIn(BaseModel):
@@ -1242,8 +1238,7 @@ async def nodes_pref_preview(payload: PrefPreviewIn,
 async def set_node_pref(node_id: int, payload: NodePrefIn,
                         _: None = Auth) -> dict[str, Any]:
     store.upsert_node_pref(
-        int(node_id), payload.priority, payload.excluded, payload.note,
-        http_entry=payload.http_entry,
+        int(node_id), payload.priority, payload.excluded, payload.note
     )
     return {"ok": True}
 
@@ -2187,8 +2182,8 @@ async def get_settings(_: None = Auth) -> dict[str, Any]:
         "config_path": str(BOOTSTRAP.frpc_config_path),
         "auth_enabled": auth_enabled(),
         "username": str(store.get_setting("web_user") or ""),
-        # 节点偏好（含 HTTP 入口域名）。节点页要用它来显示/编辑 http_entry ——
-        # 那个字段不参与择优，是给 DNS 用的，所以不放 /api/nodes 的 nodes 数组里。
+        # 节点偏好（手工优先级 / 排除 / 备注）。它不参与择优打分，是给节点页
+        # 显示和编辑用的，所以单独放这里、不混进 /api/nodes 的 nodes 数组里。
         "node_prefs": store.list_node_prefs(),
     }
 
