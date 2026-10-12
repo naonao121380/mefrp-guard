@@ -590,7 +590,7 @@ mefrp-guard/
 │       └── favicon.ico 老浏览器 / Safari / webview 的回落图标（`/favicon.ico`）
 ├── tests/              十一个测试文件（鉴权 / 纯逻辑 / CF 客户端 / 外部节点逻辑 / API /
 │                       外部节点 API / 标签 / 作用域 / 故障转移 / HTTP 隧道 / 多容器挂接），
-│                       共 1107 条断言
+│                       共 1105 条断言
 ├── run_local.sh        本地试跑脚本（不依赖 Docker，用沙箱 frpc 配置）
 ├── Dockerfile
 ├── docker-compose.yml
@@ -933,7 +933,7 @@ PYTHONPATH=$PWD/.devdeps PY=$PY ./tests/run_all.sh
 > ⚠️ `run_all.sh` **自己不设 `PYTHONPATH`** —— 不带上的话会在第一个需要依赖的文件上
 > 报 `No module named 'fastapi'`。
 
-十一个文件，共 **1107 条断言**（59 + 149 + 22 + 137 + 196 + 183 + 30 + 47 + 75 + 116 + 93）：
+十一个文件，共 **1105 条断言**（59 + 149 + 22 + 137 + 196 + 183 + 30 + 47 + 75 + 114 + 93）：
 
 | 文件 | 覆盖 | 需要第三方库 |
 |---|---|---|
