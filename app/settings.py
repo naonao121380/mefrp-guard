@@ -84,6 +84,19 @@ DEFAULT_SETTINGS: dict[str, object] = {
     "engine_interval": 20,          # 主循环间隔（秒）
     "probe_interval": 60,           # 单个隧道端到端 TCP 探测的最短间隔（秒）
     "probe_timeout": 4,             # TCP 探测超时（秒）
+    # ★ DNS 记录**核对**间隔（秒）。默认 900（15 分钟）。
+    #
+    # 为什么不是每轮都核对：地址是很少变的，而原来每个 tick（20 秒）都要为每条配了
+    # DNS 的隧道打一次 `list_records`，只为确认「记录没变」—— 等于拿 Cloudflare API
+    # 当心跳。实测那个 API 从家宽出去时通时不通（打三次挂两次），这些「没事找事」的
+    # 请求换来的就是一屏 `ConnectTimeout`，还把巡检周期从 20 秒拖到分钟级（一次失败的
+    # DNS 请求最坏要 47 秒 = 15 秒超时 × 3 次尝试）。
+    #
+    # 现在的规则（见 `engine._dns_check_due`）：
+    #   · **地址变了 → 立刻同步**，不等间隔（记录指错比「晚一点发现被外部改过」严重得多）
+    #   · 地址没变 → 到点才核对一次；成功失败都算核对过，下次隔一个间隔再来
+    # 设 0 或负数 = 退回「每轮都核对」（逃生口）。
+    "dns_check_interval": 900,
     # 端到端探测模式：
     #   auto —— 按隧道协议自动决定。tcp 隧道做 TCP 探测；udp 隧道**跳过** L3；
     #           **http/https 隧道也跳过**（理由见 engine.probe_plan：节点反代对
@@ -145,27 +158,19 @@ DEFAULT_SETTINGS: dict[str, object] = {
     "login_lockout_seconds": 300,   # 锁定时长（秒）
 }
 
-# ★ 出站连接**强制走 IPv4**（`local_address="0.0.0.0"`）。
+# ⚠️ 这里曾经有一个 `FORCE_IPV4_LOCAL_ADDRESS = "0.0.0.0"`（1.0.3 中途加、随即撤掉）。
 #
-# 为什么需要它：不少内网小机器 / 家宽环境下，域名会**优先解析出 IPv6**
-# （`/etc/gai.conf` 的 precedence 规则），但那条 IPv6 路由是个**黑洞** —— 包发出去
-# 没有回音。`getaddrinfo` 把 IPv6 排在前面，httpx / anyio 就去连它，一路挂到
-# connect 超时。实测现象：DNS 同步和 mefrp 拉取**同时**报 `ConnectTimeout`，
-# 而同一台机器上 `curl -4` 秒连成功。
+# 思路是：有些环境里域名**优先解析出 IPv6**、而那条路由是个**黑洞**，anyio 又
+# **主动**把 IPv6 重排到候选列表首位（`anyio/_core/_sockets.py` 里那句 "Organize
+# the list so that the first address is an IPv6 address"），于是 httpx 一头撞进去
+# 挂到 connect 超时；传 `local_address="0.0.0.0"` 能把解析锁在 `AF_INET`。
 #
-# 为什么这样能绕过：httpcore 把 `local_address` 传给 anyio 的 `local_host`，anyio
-# 又拿它去调 `getaddrinfo(..., family=<local_host 的地址族>)` —— 传 `"0.0.0.0"`
-# 等于**把解析限制在 AF_INET**，IPv6 地址压根不会进候选列表。
+# 做法本身有效，**但它治的不是我们的病**：实测 guard 宿主所在网段 IPv6 **根本没有
+# 路由** —— 连 IPv6 是**秒失败**而不是挂起，anyio 立刻就落到 IPv4 了；而真正在抖的是
+# IPv4 到 Cloudflare anycast（104.19.192.x）的路径。那是运营商侧的特性，程序里绕不过去。
+# 既然没用，就别让「永远不用 IPv6」这个代价白付。
 #
-# ⚠️ 别指望 anyio 的 happy eyeballs 自己绕过去：它**主动**把 IPv6 重排到候选列表
-# 第一位（`anyio/_core/_sockets.py` 里那句 "Organize the list so that the first
-# address is an IPv6 address"），所以哪怕系统层面 IPv4 优先，它也会先试 IPv6。
-#
-# 代价是永远不用 IPv6。对这个工具（只连 Cloudflare API 和 mefrp API）完全够用，
-# 而且远比「连不上」好。根治办法在系统层（`/etc/gai.conf` 里加
-# `precedence ::ffff:0:0/96 100` 让 IPv4 优先），这里只是程序侧的兜底，
-# 不去动用户的系统配置。
-FORCE_IPV4_LOCAL_ADDRESS = "0.0.0.0"
+# 真把程序搬到「IPv6 是黑洞」的机器上（比如那台 `ubuntu2204`）再加回来 —— 那时它有用。
 
 # ★ DNS「站点已恢复」的迟滞窗口（秒）。站点必须**连续干净满这个窗口**才算恢复。
 #

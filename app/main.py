@@ -1059,12 +1059,18 @@ async def _sync_dns_after_probe(tunnel: dict[str, Any], mn: dict[str, Any] | Non
     域名却还指着旧地址，等于没修好。而且在这里同步一次，用户能**当场**在弹窗里
     看到 DNS 的结果（成功 / 找不到 zone / token 没权限），不必去翻事件日志。
 
-    失败只回一句话，不抛 —— DNS 挂了不该把探测结果一起吞掉。
+    ⚠️ **必须 `force=True`**：DNS 平时有核对节流（`dns_check_interval`，默认 15 分钟，
+    见 `engine._dns_check_due`），但那节流是给**引擎自动巡检**用的 —— 省掉「地址没变
+    还每轮去打一次 CF」。而这里是人**刚刚按了按钮**，他要的就是「现在核对一次」。
+    不加 `force` 的话，用户点了「立即探测」，弹窗里 DNS 那行会是空的（地址没变、
+    还没到点），恰好违背上面那句「让这条隧道现在就是对的」。
+    切换节点（`engine`）和导入外部节点（`main`）两条路都传了 `force`，这里必须一致。
     """
     try:
         return await engine._sync_dns(
             tunnel,
             None if mn is not None else engine.proxies.get(tunnel["proxy_name"]),
+            force=True,
             host=host,
         )
     except Exception as exc:  # noqa: BLE001 - 单条 DNS 失败不拖垮这次探测

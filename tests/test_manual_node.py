@@ -788,12 +788,15 @@ class FlakyCF:
         self.token = "fake-cf-token"
         self.fail = True
         self.upserts: list[dict] = []
+        # 打了几次 `list_records` —— 用来验 DNS 核对节流（地址没变就不该打）。
+        self.list_calls = 0
 
     async def resolve_zone(self, name: str):
         from app.cloudflare import Zone
         return Zone(zone_id="ZFL", name="example.com")
 
     async def list_records(self, zone_id: str, name: str | None = None):
+        self.list_calls += 1
         if self.fail:
             raise CloudflareError(
                 "请求 Cloudflare 失败（已重试 2 次）：ConnectTimeout: ",
@@ -829,7 +832,10 @@ def _sync_flaky():
 
     ⚠️ 必须带上 `_flush_dns_alerts()` —— DNS 的 warn / error 事件是在**轮末**
     按站点聚合出来的，`_sync_dns` 自己只负责把失败登记进 `dns_fail_round`。
+    ⚠️ 还要清掉 `dns_checked`：那个节流管的是「地址没变就别每轮都打 CF」，而这里
+    要测的是**告警口径** —— 得让每一轮都真的去打一次 CF。
     """
+    eng.dns_checked.clear()
     r = asyncio.run(eng._sync_dns(store.get_tunnel(_fl), None,
                                   host="127.0.0.1"))
     eng._flush_dns_alerts()
@@ -938,10 +944,16 @@ def _reset_dns_state() -> None:
     eng.dns_fail_tunnels.clear()
     eng.dns_fail_round.clear()
     eng.dns_ok_round = 0
+    eng.dns_checked.clear()
 
 
 def _run_round(*tids) -> None:
-    """模拟一轮巡检：逐条同步，最后聚合一次（和 `tick()` 里的顺序一致）。"""
+    """模拟一轮巡检：逐条同步，最后聚合一次（和 `tick()` 里的顺序一致）。
+
+    ⚠️ 每轮开头清 `dns_checked`：理由同 `_sync_flaky` —— 这里测的是聚合口径，
+    不是节流。不清的话第二轮的同步会被「地址没变」直接跳过。
+    """
+    eng.dns_checked.clear()
     for _tid in tids:
         asyncio.run(eng._sync_dns(store.get_tunnel(_tid), None,
                                   host="127.0.0.1"))
@@ -1006,6 +1018,17 @@ eng._flush_dns_alerts()
 check("★ 本轮没发任何 CF 请求 → 不算干净（无证据，状态保持）",
       eng.dns_fail_since is not None and eng.dns_ok_since is None,
       (eng.dns_fail_since, eng.dns_ok_since))
+
+# ★★ 但「没问」也**不能**把已经攒起来的干净计时清零 —— 加了核对节流（默认 15 分钟
+#   才核对一次）之后，「这一轮没去问 CF」是**绝大多数轮次**的常态。要是这种轮次也
+#   把 `dns_ok_since` 归零，恢复计时就永远攒不满：站点早就好了，error 却还会每
+#   30 分钟补一条，越积越多。所以「没问」= 没有信息 → 不推进、也不清零。
+eng.dns_ok_round = 0
+eng.dns_ok_since = time.time() - 100
+eng._flush_dns_alerts()
+check("★ 没问 CF 的轮次不清零已攒的干净计时（否则恢复永远攒不满）",
+      eng.dns_ok_since is not None and eng.dns_fail_since is not None,
+      (eng.dns_ok_since, eng.dns_fail_since))
 
 # 真去问了、且没失败 → 干净。但**一次干净不算恢复**，要连续满宽限期。
 eng.dns_ok_round = 1
@@ -1076,6 +1099,107 @@ check("★ error 文案说的是「持续异常」而不是「连续失败」"
       "（中途确实通了几次，说「连续失败」是假的）",
       "已持续异常" in _newest_dns()["message"], _newest_dns()["message"])
 
+# ★ DNS 核对节流：地址没变就别每轮都去打 CF。
+#   原来每个 tick（20 秒）都要为每条配了 DNS 的隧道打一次 `list_records`，只为确认
+#   「记录没变」—— 等于拿一个时通时不通的 API 当心跳。现在：地址变了立刻同步，
+#   没变就按 `dns_check_interval`（默认 900 秒）核对。
+print("  --- ★ DNS 核对节流（地址变了才立刻同步）---")
+_reset_dns_state()
+_cffl.fail = False
+store.set_setting("dns_check_interval", 900)
+
+_n0 = _cffl.list_calls
+asyncio.run(eng._sync_dns(store.get_tunnel(_fl), None, host="10.0.0.1"))
+check("★ 没核对过 → 真的去问 CF", _cffl.list_calls - _n0 == 1,
+      _cffl.list_calls - _n0)
+
+_n0 = _cffl.list_calls
+asyncio.run(eng._sync_dns(store.get_tunnel(_fl), None, host="10.0.0.1"))
+check("★ 地址没变、没到间隔 → 一个 CF 请求都不发（省掉的就是这些）",
+      _cffl.list_calls - _n0 == 0, _cffl.list_calls - _n0)
+
+_n0 = _cffl.list_calls
+asyncio.run(eng._sync_dns(store.get_tunnel(_fl), None, host="10.0.0.2"))
+check("★ 地址变了 → 立刻同步，不等间隔", _cffl.list_calls - _n0 == 1,
+      _cffl.list_calls - _n0)
+
+eng.dns_checked[_fid] = ("10.0.0.2", time.time() - 1)
+_n0 = _cffl.list_calls
+asyncio.run(eng._sync_dns(store.get_tunnel(_fl), None, host="10.0.0.2"))
+check("★ 到间隔 → 核对一次", _cffl.list_calls - _n0 == 1,
+      _cffl.list_calls - _n0)
+
+_n0 = _cffl.list_calls
+asyncio.run(eng._sync_dns(store.get_tunnel(_fl), None, force=True,
+                          host="10.0.0.2"))
+check("★ force（切换 / 导入 / 手动探测）不看节流",
+      _cffl.list_calls - _n0 == 1, _cffl.list_calls - _n0)
+
+store.set_setting("dns_check_interval", 0)
+_n0 = _cffl.list_calls
+for _i in range(3):
+    asyncio.run(eng._sync_dns(store.get_tunnel(_fl), None, host="10.0.0.2"))
+check("★ 设 0 = 退回「每轮都核对」（逃生口）",
+      _cffl.list_calls - _n0 == 3, _cffl.list_calls - _n0)
+store.set_setting("dns_check_interval", 900)
+
+# 失败也要推进「下次核对」—— 否则一个正在挂的 API 会被每轮都撞一次
+# （一次最坏 47 秒 = 15 秒超时 × 3 次尝试），把巡检周期整个拖垮。
+_cffl.fail = True
+eng.dns_checked[_fid] = ("10.0.0.2", time.time() + 900)
+_n0 = _cffl.list_calls
+asyncio.run(eng._sync_dns(store.get_tunnel(_fl), None, host="10.0.0.2"))
+check("★ 没到点就压根不打（连「撞一个正在挂的 API」都省了）",
+      _cffl.list_calls - _n0 == 0, _cffl.list_calls - _n0)
+
+eng.dns_checked[_fid] = ("10.0.0.2", time.time() - 1)
+asyncio.run(eng._sync_dns(store.get_tunnel(_fl), None, host="10.0.0.2"))
+check("★ 失败后把「下次核对」推到下一个间隔",
+      eng.dns_checked[_fid][1] > time.time() + 800, eng.dns_checked[_fid])
+check("★ 失败时保留上一次的 host（地址再变仍会立刻触发同步）",
+      eng.dns_checked[_fid][0] == "10.0.0.2", eng.dns_checked[_fid])
+_cffl.fail = False
+_reset_dns_state()
+
+# ★★ 节流 × 迟滞的交互：被节流**跳过**的那几轮（`ok_round == 0`）不该把已经攒起来的
+#   「干净计时」清零。默认 15 分钟才核对一次，20 秒一轮的巡检里绝大多数轮次都不去
+#   问 CF —— 要是那些轮次也清零，恢复就永远判不出来：站点早就好了，error 还会每
+#   30 分钟补一条。这条是加节流时差点漏掉的回归。
+
+
+def _n_recovered() -> int:
+    """记过几条「DNS 同步已恢复」。"""
+    return len([e for e in store.list_events(limit=1000)
+                if e["kind"] == "dns" and "DNS 同步已恢复" in e["message"]])
+
+
+_reset_dns_state()
+_cffl.fail = False
+store.set_setting("dns_check_interval", 900)
+# 已经告过警的站点，现在真的问一次 CF（成功）
+eng.dns_fail_since = time.time() - (ALERT_AFTER_SECONDS + 1)
+eng.dns_alert_count = 1
+asyncio.run(eng._sync_dns(store.get_tunnel(_fl), None, host="10.0.0.3"))
+eng._flush_dns_alerts()
+check("★ 真问成功 → 开始计「干净」", eng.dns_ok_since is not None,
+      eng.dns_ok_since)
+# 接下来 5 轮都会被节流跳过（地址没变、没到间隔）
+for _i in range(5):
+    asyncio.run(eng._sync_dns(store.get_tunnel(_fl), None, host="10.0.0.3"))
+    eng._flush_dns_alerts()
+check("★ 被节流跳过的轮次不清零「干净计时」（否则恢复永远攒不满）",
+      eng.dns_ok_since is not None and eng.dns_fail_since is not None,
+      (eng.dns_ok_since, eng.dns_fail_since))
+# 把干净起点拨过宽限期，再**真的**核对一次（成功）→ 这才该判恢复
+eng.dns_ok_since = time.time() - (DNS_RECOVER_GRACE_SECONDS + 1)
+eng.dns_checked.clear()
+_nrec0 = _n_recovered()
+asyncio.run(eng._sync_dns(store.get_tunnel(_fl), None, host="10.0.0.3"))
+eng._flush_dns_alerts()
+check("★ 节流下也能正常判恢复（再一次真问成功 + 满宽限期）",
+      eng.dns_fail_since is None, eng.dns_fail_since)
+check("★ 并且记一条「已恢复」", _n_recovered() - _nrec0 == 1,
+      _n_recovered() - _nrec0)
 _reset_dns_state()
 _cffl.fail = False
 

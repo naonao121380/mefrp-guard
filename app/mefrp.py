@@ -45,8 +45,6 @@ from typing import Any
 
 import httpx
 
-from app.settings import FORCE_IPV4_LOCAL_ADDRESS
-
 DEFAULT_BASE = "https://api.mefrp.com/api"
 DEFAULT_UA = "MefrpGuard/1.0 (homelab)"
 
@@ -338,9 +336,6 @@ class MefrpClient:
             async with httpx.AsyncClient(
                 timeout=self.timeout,
                 follow_redirects=True,
-                # **强制 IPv4** —— 见 `settings.FORCE_IPV4_LOCAL_ADDRESS`。
-                transport=httpx.AsyncHTTPTransport(
-                    local_address=FORCE_IPV4_LOCAL_ADDRESS),
             ) as client:
                 resp = await client.request(
                     method, url, headers=self._headers(), json=json_body

@@ -248,6 +248,20 @@ def alert_after_seconds() -> float:
     return max(0.0, v)
 
 
+# ★ DNS 记录**核对**间隔（秒）的兜底默认值。设置页可改（`dns_check_interval`）。
+#   理由与规则见 `settings.DEFAULT_SETTINGS["dns_check_interval"]` 的注释。
+DNS_CHECK_INTERVAL = 900
+
+
+def dns_check_interval() -> float:
+    """读「DNS 记录多久核对一次」。设 0 或负数 = 每轮都核对（关掉节流）。"""
+    try:
+        v = float(store.get_setting("dns_check_interval", DNS_CHECK_INTERVAL))
+    except (TypeError, ValueError):
+        return float(DNS_CHECK_INTERVAL)
+    return max(0.0, v)
+
+
 def _fmt_span(seconds: float) -> str:
     """把秒数写成「X 分 Y 秒」/「X 小时 Y 分」，给事件文案用。"""
     s = int(max(0.0, seconds))
@@ -412,6 +426,10 @@ class GuardEngine:
         # 本轮**真的问到 CF 了**的次数（每个成功的请求 +1）。用来把「本轮没人失败」
         # 和「本轮压根没人去问」分开 —— 后者不能当恢复的证据，见 `_flush_dns_alerts`。
         self.dns_ok_round: int = 0
+        # ★ DNS 核对节流：tid -> (上次同步用的 host, 下次该核对的时间)。
+        #   地址没变就别每轮都去打 CF（见 `_dns_check_due`）。内存态即可 —— 重启
+        #   之后每条约多核对一次，没有副作用。
+        self.dns_checked: dict[int, tuple[str, float]] = {}
         # 这一次「连续失败」累计影响到的隧道 —— 只为了在告警文案里报影响面。
         self.dns_fail_tunnels: set[int] = set()
         self.mefrp_fail_since: float | None = None
@@ -2418,6 +2436,11 @@ class GuardEngine:
         is_ip = bool(_IPV4_RE.match(host))
         want_type = "A" if is_ip else "CNAME"
 
+        # ★ 地址没变就别每轮都去打 CF —— 见 `_dns_check_due`。
+        #   `force` 是用户明确点的动作（切换 / 导入 / 手动探测），一律不看节流。
+        if not force and not self._dns_check_due(tid, host):
+            return ""
+
         assert self.cf is not None
         try:
             zone_id = tunnel.get("dns_zone_id")
@@ -2455,6 +2478,7 @@ class GuardEngine:
                     store.update_tunnel(tunnel["id"], {"dns_record_id": target.record_id})
                 # 记录已经是对的 → 这一轮就是「干净」的。恢复与否由轮末的
                 # `_flush_dns_alerts` 判（而且要**连续**干净满宽限期才算）。
+                self._note_dns_check(tid, host, True)
                 return ""
 
             proxied = bool(tunnel.get("dns_proxied"))
@@ -2474,10 +2498,15 @@ class GuardEngine:
                 "dns_record_id": rec.record_id,
             })
             msg = f"{record_name} → {want_type} {host}"
+            self._note_dns_check(tid, host, True)
             store.add_event("success", "dns", f"DNS 已更新：{msg}",
                             tunnel_id=tunnel["id"])
             return msg
         except CloudflareError as exc:
+            # 失败也要把「下次核对」推到下一个间隔 —— 否则一个正在挂的 API 会被
+            # 每轮都撞一次（一次最坏 47 秒），把巡检周期整个拖垮。地址真变了的话，
+            # 下一轮仍会因为 host 不同而立刻重试（那才是必须尽快收敛的情况）。
+            self._note_dns_check(tid, host, False)
             msg = f"更新 DNS 失败：{exc}"
             if force:
                 # 用户明确点的动作（导入 / 立即探测 / 切换后同步）—— 他正站在
@@ -2492,6 +2521,47 @@ class GuardEngine:
                 # 而且重试一万次也不会好 —— 这类按隧道立刻报，不参与站点级聚合。
                 store.add_event("error", "dns", msg, tunnel_id=tid)
             return msg
+
+    # -- DNS 核对节流（地址不变就别每轮都去问 CF）---------------------------
+
+    def _dns_check_due(self, tid: int, host: str) -> bool:
+        """这条隧道这一轮要不要真的去问 Cloudflare。
+
+        · 没核对过 → 要；
+        · **地址和上次同步用的不一样 → 要**（记录指错了必须马上改，不能等间隔）；
+        · 否则到 `dns_check_interval` 才要。
+
+        ⚠️ 原来这里是「每轮都核对」（`engine_interval` = 20 秒）。地址很少变，那些
+        请求只是为了确认「没变」—— 而实测 CF API 从家宽出去时通时不通，这些请求
+        换来一屏 `ConnectTimeout`，还把巡检周期拖到分钟级。详见
+        `settings.DEFAULT_SETTINGS["dns_check_interval"]`。
+        """
+        # 间隔设成 0/负数 = 关掉节流。**要在看记录之前判** —— 否则刚把设置改成 0，
+        # 还得等上一次排的那个（可能 15 分钟后的）核对时间到点才生效。
+        if dns_check_interval() <= 0:
+            return True
+        rec = self.dns_checked.get(tid)
+        if rec is None:
+            return True
+        prev_host, next_due = rec
+        if host != prev_host:
+            return True
+        return time.time() >= next_due
+
+    def _note_dns_check(self, tid: int, host: str, ok: bool) -> None:
+        """记下「这条隧道核对过了」，顺便安排下一次核对的时间。
+
+        ⚠️ **失败也要推进时间**：否则一个正在挂的 API 会被每一轮都撞一次（一次
+        最坏 47 秒 = 15 秒超时 × 3 次尝试），把巡检周期从 20 秒拖到分钟级。但失败时
+        **保留上一次成功用的 host** —— 地址真变了的话，下一轮 `_dns_check_due`
+        仍会因为 host 不同而立刻重试，那才是必须尽快收敛的情况。
+        """
+        rec = self.dns_checked.get(tid)
+        prev_host = rec[0] if rec else None
+        self.dns_checked[tid] = (
+            host if (ok or prev_host is None) else prev_host,
+            time.time() + dns_check_interval(),
+        )
 
     def _flush_dns_alerts(self) -> None:
         """一轮巡检走完，把 DNS 同步的失败 / 恢复**按站点聚合成一条**事件。
@@ -2529,8 +2599,15 @@ class GuardEngine:
             #     （见那里的注释），三条隧道同时故障就一个请求都发不出去。
             #     这种「没问」不能当证据 —— 否则隧道长期故障时，DNS 的 episode
             #     会被悄悄判成「恢复」，等隧道回来再挂又记一条全新的 warn。
+            #
+            #     ★ 但「没问」也**不能当成失败去清零计时**：DNS 核对现在有节流
+            #     （`dns_check_interval`，默认 15 分钟），20 秒一轮的巡检里**绝大多数
+            #     轮次压根不会去问 CF**。要是这种轮次也把 `dns_ok_since` 归零，那
+            #     恢复计时就永远攒不满 —— 站点早就好了，error 还会每 30 分钟补一条。
+            #     所以「没问」= **没有信息**：不推进、也不清零，原样返回。
+            #     （真判「恢复」的那一步在下面，而它只会在 `ok_round > 0` 的轮次
+            #     到达 —— 也就是说恢复必须由**一次真的成功**来确认。）
             if not ok_round:
-                self.dns_ok_since = None
                 return
             if self.dns_fail_since is None:
                 # 一直是好的，没什么要清的。顺手把计时归零，免得残留。

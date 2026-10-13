@@ -34,31 +34,56 @@
   等隧道回来再挂又记一条全新的 warn。告警文案也随之从「已连续失败 X」改成
   「已持续异常 X」—— 中途确实通过几次，说「连续失败」是假的。
 
-- **出站连接强制走 IPv4**（`local_address="0.0.0.0"`）。有些环境里域名**优先解析出
-  IPv6**、而那条路由是**黑洞** —— 于是 DNS 同步和 mefrp 拉取会**同时**报
-  `ConnectTimeout`（而同一台机器上 `curl -4` 秒连成功）。⚠️ 别指望 anyio 的
-  happy eyeballs 自动绕过去：它**主动**把 IPv6 重排到候选列表第一位
-  （`_core/_sockets.py` 里那句 "Organize the list so that the first address is an
-  IPv6 address"），哪怕系统层面 IPv4 优先也会先试 IPv6。传 `local_address="0.0.0.0"`
-  之后，anyio 用它去调 `getaddrinfo(..., family=AF_INET)` —— **IPv6 压根不会进候选
-  列表**。代价是永远不用 IPv6（对只连两个 API 的工具完全够用）。
-  根治办法在系统层：`/etc/gai.conf` 里加一行 `precedence ::ffff:0:0/96 100`。
+- **DNS 记录的「核对」加了节流：地址没变就不每轮去打 Cloudflare。** 巡检是 20 秒
+  一轮，而 DNS 记录只在**节点地址变了**的时候才需要改 —— 地址很少变。原来每轮都为
+  每条隧道打一次 CF API（一条隧道一轮 1 个请求，写路径还要 2 个），纯属白费，而且
+  一次最坏要耗掉 47 秒（15 秒超时 × 3 次尝试），把巡检周期整个拖垮。
 
-  > ⚠️ 这条只是**去掉一个变量**，不是万能的。2026-10-13 下午那批 `ConnectTimeout`
-  > 就与 IPv6 无关：实测该出口到 `api.cloudflare.com` 的 IPv4（104.19.192.x）
-  > 本身就时通时不通（6 次探测里 2 次硬超时，成功的那几次也要 1.3~39 秒），
-  > 而 IPv6 是**没有路由**（秒失败，不会造成挂起）。真正的修法是上面第二条的迟滞。
+  现在默认 **`dns_check_interval = 900`（15 分钟）**核对一次；**地址一变立刻同步、
+  不等间隔**（那才是必须尽快收敛的情况）。填 `0` = 退回原来的「每轮都核对」。
+
+  > ⚠️ 四个坑：① 间隔判定要在**读核对记录之前**做，否则刚把设置改成 0 还得等上一次
+  > 排的那个 15 分钟到点才生效；② **失败也要推进下次核对时间**（否则一个正在挂的
+  > API 会被每轮都撞一次），但**保留上一次成功用的 host**（地址真变了下一轮仍会因
+  > host 不同而立刻重试）；③ `force` 必须覆盖**所有用户明确点的动作** —— 切换节点、
+  > 导入外部节点、以及**「立即探测」**（`main._sync_dns_after_probe` 一开始漏了这个，
+  > 用户点了按钮却在弹窗里看到 DNS 那行是空的）；④ **被节流跳过的轮次不能把上面
+  > 那条迟滞的「干净计时」清零** —— 加了节流之后「这一轮没去问 CF」是绝大多数轮次的
+  > 常态，清零的话恢复永远攒不满，站点早好了 error 还会每 30 分钟补一条。所以
+  > 「没问」只当**没有信息**：不推进、也不清零。
+
+- **撤销：出站连接不再强制走 IPv4。** 这一版一度加了 `local_address="0.0.0.0"`
+  （`FORCE_IPV4_LOCAL_ADDRESS`），做法本身是有效的 —— anyio 会**主动**把 IPv6 重排
+  到候选列表第一位（`_core/_sockets.py` 里那句 "Organize the list so that the first
+  address is an IPv6 address"），哪怕系统层面 IPv4 优先也会先试 IPv6；传了
+  `local_address` 之后 anyio 拿它去调 `getaddrinfo(..., family=AF_INET)`，
+  **IPv6 压根不会进候选列表**。
+
+  **但它治的不是我们的病**，所以撤掉了：实测本机的 IPv6 是**没有路由**（`curl -6`
+  秒失败，不会造成挂起），而真凶是该出口到 `api.cloudflare.com` 的 **IPv4
+  （104.19.192.x）本身就时通时不通**（容器内 `POST /api/test/cloudflare` 打 6 次，
+  2 次 40 秒硬超时，成功那 4 次也要 1.3 / 16.5 / 28.2 / 39.1 秒）。**CF 抖动是运营商
+  侧的网络特性，程序里解决不了** —— 该做的是让告警别被它刷屏（上面第二条的迟滞）。
+
+  > 留个后手：真把程序搬到「IPv6 是黑洞」的机器上（域名优先解析出 IPv6 而那条路由
+  > 不通，`curl -4` 却秒连成功），把这行加回去即可。根治办法在系统层：
+  > `/etc/gai.conf` 里加一行 `precedence ::ffff:0:0/96 100`。
 
 ### 内部
 
-- `settings.FORCE_IPV4_LOCAL_ADDRESS`；`CloudflareClient` 与 `MefrpClient` 的
-  transport 都带上它（CF 侧只在没有注入测试 transport 时生效）。
 - `settings.DNS_RECOVER_GRACE_SECONDS`（默认 600 秒）；`GuardEngine` 新增
   `dns_ok_since`（干净起点）与 `dns_ok_round`（本轮真问到 CF 的次数，每个成功的
   `list_records` +1）。
+- `settings.DEFAULT_SETTINGS["dns_check_interval"]`（默认 900 秒）+ `engine.DNS_CHECK_INTERVAL`
+  兜底 + `engine.dns_check_interval()`（每次现读，不缓存；`0` / 负数 = 关掉节流）；
+  `GuardEngine._dns_check_due()` / `_note_dns_check()` 与内存态 `dns_checked`
+  （`tid -> (上次同步用的 host, 下次该核对的时间)`）。
+- 设置页新增「DNS 记录核对间隔（秒）」输入框（`s_dns_check_interval`，进 `SET_KEYS`）。
 - DNS 连续失败状态从 `dict[tid, ...]` 收成单值，另加 `dns_fail_round`（本轮失败的
   隧道）与 `dns_fail_tunnels`（这次连续失败累计影响到的隧道）；事件记录从 `_sync_dns`
   里挪到轮末的 `_flush_dns_alerts()`，由 `tick()` 调用。
+- 外部节点：「立即探测」那条路（`main._sync_dns_after_probe`）补上 `force=True`，
+  与切换节点 / 导入两条路口径一致。
 
 ## 1.0.2
 

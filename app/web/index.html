@@ -282,7 +282,10 @@ dialog h3{margin-top:0;color:var(--text);font-size:15px}
       <div><label>切换后冷却（秒）</label><input id="s_failover_cooldown" type="number" min="0"></div>
       <div><label>连续失败多久才告警（秒）</label><input id="s_alert_after_seconds" type="number" min="0"></div>
     </div>
-    <div class="note">网络抖一下不该惊动你。<b>连续失败满这个时长</b>，才把「拉取 mefrp 状态失败 / DNS 同步失败」升成红色告警；在那之前只在事件里留一条黄色 warn，中途自愈就不再记了。默认 1800（30 分钟）。填 0 = 一失败就告警。</div>
+    <div class="note">网络抖一下不该惊动你。<b>连续失败满这个时长</b>，才把「拉取 mefrp 状态失败 / DNS 同步失败」升成红色告警；在那之前只在事件里留一条黄色 warn。<b>恢复</b>则要<b>连续正常满 10 分钟</b>才算数（抖动源下「一轮正常」不算恢复，否则告警永远攒不满）。默认 1800（30 分钟）。填 0 = 一失败就告警。</div>
+    <label>DNS 记录核对间隔（秒）</label>
+    <input id="s_dns_check_interval" type="number" min="0">
+    <div class="note">DNS 记录只在<b>节点地址变了</b>的时候需要改，而地址很少变 —— 所以平时按这个间隔核对一次就够（默认 900 = 15 分钟），<b>地址一变立刻同步、不等间隔</b>。原来的「每轮都核对」（20 秒一次）会为每条隧道持续打 Cloudflare API，纯属白费；填 0 = 退回那个行为。</div>
 
     <h2>节点择优 · TCP / UDP</h2>
     <div class="note">TCP/UDP 隧道靠<b>端口</b>工作，所以这套偏好只关心「节点能不能给一个可用的端口」。</div>
@@ -1739,7 +1742,7 @@ async function loadEvents(){
 }
 
 // ---------- 设置 ----------
-const SET_KEYS = ['mefrp_token','cf_api_token','gotify_url','gotify_token','engine_interval','probe_interval','probe_timeout','probe_mode','http_probe_path','fail_threshold','failover_cooldown','node_cooldown','alert_after_seconds','min_bandwidth_mbps','max_load_percent','allow_regions','prefer_keywords','http_min_bandwidth_mbps','http_max_load_percent','http_allow_regions','http_prefer_keywords','http_node_cooldown','auto_failover','auto_dns_sync','auto_restart_frpc','notify_on_probe_fail','session_ttl_hours','login_max_attempts','login_lockout_seconds'];
+const SET_KEYS = ['mefrp_token','cf_api_token','gotify_url','gotify_token','engine_interval','probe_interval','probe_timeout','probe_mode','http_probe_path','fail_threshold','failover_cooldown','node_cooldown','alert_after_seconds','dns_check_interval','min_bandwidth_mbps','max_load_percent','allow_regions','prefer_keywords','http_min_bandwidth_mbps','http_max_load_percent','http_allow_regions','http_prefer_keywords','http_node_cooldown','auto_failover','auto_dns_sync','auto_restart_frpc','notify_on_probe_fail','session_ttl_hours','login_max_attempts','login_lockout_seconds'];
 
 // ---------- 区域多选（两套偏好各一份）----------
 // 存库仍是逗号分隔串（cn / cnos / oversea），这里给它一个复选框 + 快捷选择的面板。

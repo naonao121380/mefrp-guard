@@ -277,6 +277,25 @@ WireGuard 的握手包）。那属于业务侧的事，不是这个工具该做�
   ⚠️ 文案随之从「已连续失败 X」改成「**已持续异常 X**」—— 抖动期间确实通过几次，
   说「连续失败」是假的。回归测试见 `test_manual_node.py` 里
   「★ 抖动型故障：一段故障只能有一条 warn」（反复抖动 6 个来回一条新告警都不记）。
+- ★ **DNS 记录只在地址变了的时候才需要改，所以「核对」要节流** —— 巡检 20 秒一轮，
+  而节点地址几乎不变。原来每轮都为每条隧道打一次 CF（写路径还要 2 个请求），
+  纯属白费；更糟的是一次最坏要耗 47 秒（`timeout=15` × `retries=2` + 退避），
+  一个正在挂的 API 会把巡检周期整个拖到分钟级。
+  现在 `dns_check_interval`（默认 **900 秒 = 15 分钟**）+ `engine._dns_check_due(tid, host)`
+  / `_note_dns_check(tid, host, ok)`，状态放内存态 `dns_checked: tid -> (host, next_due)`。
+  · **地址和上次同步用的不一样 → 立刻同步、不等间隔**（记录指错了必须马上改）
+  · 没核对过 → 要核对；否则到点才核对
+  · 设置填 `0` / 负数 = 退回「每轮都核对」（逃生口）
+  ⚠️ 四个坑：① 间隔判定要在**读核对记录之前**做，否则刚把设置改成 0 还得等上一次排的
+  那个 15 分钟到点才生效；② **失败也要推进 `next_due`**（否则一个正在挂的 API 会被每轮
+  都撞一次），但**保留上一次成功用的 host**（地址真变了下一轮仍会因 host 不同而立刻重试）；
+  ③ `force` 必须覆盖**所有用户明确点的动作** —— 切换节点、导入外部节点，以及
+  **「立即探测」**（`main._sync_dns_after_probe` 一开始漏了，用户点了按钮却在弹窗里
+  看到 DNS 那行是空的）；④ **被节流跳过的轮次不能把上面那条迟滞的「干净计时」清零** ——
+  加了节流之后「这一轮没去问 CF」是绝大多数轮次的常态，清零的话恢复永远攒不满，
+  站点早好了 error 还会每 30 分钟补一条。所以「没问」只当**没有信息**：不推进也不清零，
+  而真判「恢复」的那一步只会在 `ok_round > 0` 的轮次到达（恢复必须由一次真的成功来确认）。
+  回归测试见 `test_manual_node.py` 的「★ DNS 核对节流」段。
 - ★ **mefrp 拉取失败与 DNS 同步失败共用同一套口径** —— 见 `ALERT_AFTER_SECONDS` 与
   `_note_mefrp_fail` / `_flush_dns_alerts`。两处原来各写各的（一处「每轮一条 error」、
   一处「连续 3 次」），调了一个忘了另一个。现在都是「一条 warn + 满阈值才 error」。
@@ -613,7 +632,7 @@ mefrp-guard/
 │       └── favicon.ico 老浏览器 / Safari / webview 的回落图标（`/favicon.ico`）
 ├── tests/              十一个测试文件（鉴权 / 纯逻辑 / CF 客户端 / 外部节点逻辑 / API /
 │                       外部节点 API / 标签 / 作用域 / 故障转移 / HTTP 隧道 / 多容器挂接），
-│                       共 1126 条断言
+│                       共 1140 条断言
 ├── run_local.sh        本地试跑脚本（不依赖 Docker，用沙箱 frpc 配置）
 ├── Dockerfile
 ├── docker-compose.yml
@@ -838,16 +857,28 @@ curl -4 -sv https://api.cloudflare.com/client/v4/user -m 10   # 强制 IPv4 是�
 > IPv6 address"*）。所以**哪怕系统层面 IPv4 优先，它也会先试 IPv6**；改 `/etc/gai.conf`
 > 只影响 `getent` 那类调用，**管不住 anyio**。
 
-程序侧已兜底：`settings.FORCE_IPV4_LOCAL_ADDRESS`，两个客户端的 transport 都带
-`local_address="0.0.0.0"`。httpcore 会把它传成 anyio 的 `local_host`，anyio 再用它去调
-`getaddrinfo(target, port, family=<local_host 的地址族>)` —— 实测 `getaddrinfo("0.0.0.0",
-None)` 给的是 `AF_INET`，于是目标域名**只解析出 IPv4**，IPv6 压根不进候选列表。
-
-要彻底解决（也让机器上别的程序受益），在系统层关掉 IPv6 优先：
+> ⚠️ **先别急着按「IPv6 黑洞」下结论。** 1.0.3 一度加了 `FORCE_IPV4_LOCAL_ADDRESS`
+> （两个客户端的 transport 带 `local_address="0.0.0.0"`，httpcore 把它传成 anyio 的
+> `local_host`，anyio 再用它去调 `getaddrinfo(target, port, family=AF_INET)`，于是
+> **IPv6 压根不进候选列表**），但实测**它治的不是我们的病**，已经**撤销**：
+> 本机的 IPv6 是**没有路由**（`curl -6` 秒失败，不会造成挂起），而真凶是该出口到
+> `api.cloudflare.com` 的 **IPv4（104.19.192.x）本身就时通时不通**。
+>
+> **正确的判据是先分清「挂起」还是「秒失败」**：`curl -6` 若也是秒失败 → IPv6 不是
+> 原因，别加那个开关；只有「IPv6 挂起、IPv4 秒连」才是真的 IPv6 黑洞。
+> 那种情况把 `FORCE_IPV4_LOCAL_ADDRESS` 加回去（注释里留了后手），或者在系统层关掉
+> IPv6 优先（也让机器上别的程序受益）：
 
 ```bash
 echo 'precedence ::ffff:0:0/96  100' >> /etc/gai.conf
 ```
+
+**「CF 抖动导致 DNS 告警刷屏」**
+
+若两个 API 是**时通时不通**（而不是持续不通），那是运营商侧的网络特性，程序里解决不了 ——
+正确做法是让告警别被刷屏，也就是 `DNS_RECOVER_GRACE_SECONDS` 那条迟滞（见上文「告警」
+一节）。同时确认 `dns_check_interval` 没被设成 0：默认 15 分钟核对一次，既省请求，
+也让「一轮里撞上抖动的概率」降下来。
 
 **「`docker build` 失败，报 `json.decoder.JSONDecodeError: Unterminated string`」**
 
@@ -984,14 +1015,14 @@ PYTHONPATH=$PWD/.devdeps PY=$PY ./tests/run_all.sh
 > ⚠️ `run_all.sh` **自己不设 `PYTHONPATH`** —— 不带上的话会在第一个需要依赖的文件上
 > 报 `No module named 'fastapi'`。
 
-十一个文件，共 **1126 条断言**（59 + 149 + 22 + 158 + 196 + 183 + 30 + 47 + 75 + 114 + 93）：
+十一个文件，共 **1140 条断言**（59 + 149 + 22 + 172 + 196 + 183 + 30 + 47 + 75 + 114 + 93）：
 
 | 文件 | 覆盖 | 需要第三方库 |
 |---|---|---|
 | `tests/test_auth.py` | **密码哈希（随机盐/迭代数/异常输入安全降级）、默认密码识别、会话令牌、登录防爆破、来源 IP 解析** | 否 |
 | `tests/test_logic.py` | frpc TOML 合并与跨节点校验、**单引号字面量解析**、配置备份/恢复/路径穿越、SQLite 持久化与字段白名单、Node/Proxy 字段解析、`pick_node` 择优调度、**节点偏好的有序语义与归一化**、**`probe_plan` 探测适用性（四种模式 × 四种隧道类型，含「http 在 auto 下是假阳性」）** | 否 |
 | `tests/test_cfclient.py` | **Cloudflare 客户端的 httpx 交互**：传输层退避重试、重试耗尽后 `transient=True` 与异常类型名、非传输层错误不重试、**连接池复用（3 个请求只建 1 个）与跨事件循环重建**、`upsert(existing=…)` 省掉两次自查、没配 token 一个请求都不发 | httpx |
-| `tests/test_manual_node.py` | **frpc 配置解析（TOML / INI）、`patch_server` 文本级改写的保真与合法性、外部节点数据层 CRUD、1.0.0 老库补列迁移、引擎对外部隧道的分支（含「不适用探测」的三态、UDP 的 DNS 同步）、★ **mefrp 拉取失败与 DNS 同步失败「满 `alert_after_seconds` 才告警」的完整口径**（一条 warn → 静默 → 满阈值 error → 每再满一个阈值补报 → 恢复 success / 短抖不记 / force 与静态问题立刻报）、★ **DNS 告警按站点聚合**（一轮 N 条隧道失败只报一条、告警报出影响面）、★ **恢复的迟滞**（一次干净不算恢复、要连续干净满 `DNS_RECOVER_GRACE_SECONDS`；「本轮没发 CF 请求」不算干净；抖动 6 个来回复现「4 小时 62 条 warn」的 bug 且一条新告警都不记）** | 否 |
+| `tests/test_manual_node.py` | **frpc 配置解析（TOML / INI）、`patch_server` 文本级改写的保真与合法性、外部节点数据层 CRUD、1.0.0 老库补列迁移、引擎对外部隧道的分支（含「不适用探测」的三态、UDP 的 DNS 同步）、★ **mefrp 拉取失败与 DNS 同步失败「满 `alert_after_seconds` 才告警」的完整口径**（一条 warn → 静默 → 满阈值 error → 每再满一个阈值补报 → 恢复 success / 短抖不记 / force 与静态问题立刻报）、★ **DNS 告警按站点聚合**（一轮 N 条隧道失败只报一条、告警报出影响面）、★ **恢复的迟滞**（一次干净不算恢复、要连续干净满 `DNS_RECOVER_GRACE_SECONDS`；「本轮没发 CF 请求」不算干净；抖动 6 个来回复现「4 小时 62 条 warn」的 bug 且一条新告警都不记）、★ **DNS 核对节流**（地址没变就不重复打 CF；地址一变立刻同步不等间隔；填 0 退回每轮核对；失败也推进下次核对时间但保留上次的 host；★ **节流与迟滞的交互** —— 被跳过的轮次不清零干净计时，恢复仍判得出来）** | 否 |
 | `tests/test_api.py` | FastAPI 全端点：**登录页/会话 Cookie/登出作废/改密码/CSRF/防爆破/只读设置保护**、鉴权、CRUD、密钥打码、错误码、枚举字段校验、引擎生命周期、**frpc 实例 CRUD 与挂接 API**、**`/api/tunnels` 与 `/api/overview` 的挂接字段口径一致**、**节点偏好预览（含路由遮蔽回归）** | fastapi / httpx / pydantic |
 | `tests/test_manual_api.py` | 外部节点全部 HTTP 端点：导入 / 更新 / 删除 / 改连 / 探测、token 不回明文、**「地址已导入过」的 409 契约与「覆盖重建空节点」**、**导入时顺手同步 DNS 与 udp 隧道的探测端点**、**DNS 记录名查重的 409 契约（含编辑自己 / 导入时只放弃那一个字段）**、删掉最后一条隧道自动清理空节点 | fastapi / httpx / pydantic |
 | `tests/test_tags.py` | 隧道标签：默认打 `mefrp`、归一化与截断、`?tag=` 筛选（**空串 = 筛未打标的**）、`/api/tags` 计数与排序、显式清空、**老库只回填一次** | fastapi / httpx / pydantic |

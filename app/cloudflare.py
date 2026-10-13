@@ -11,8 +11,6 @@ from typing import Any
 
 import httpx
 
-from app.settings import FORCE_IPV4_LOCAL_ADDRESS
-
 API = "https://api.cloudflare.com/client/v4"
 
 # 只对**传输层**错误重试：连不上 / 超时 / 连接被重置 / 代理挂了。
@@ -99,13 +97,9 @@ class CloudflareClient:
         if self._client is None or self._client.is_closed or self._loop is not loop:
             self._client = httpx.AsyncClient(
                 timeout=self.timeout,
-                # `_transport` 只在测试里注入；生产走带 `local_address` 的默认
-                # transport —— **强制 IPv4**，绕开「域名优先解析出 IPv6、而那条
-                # 路由是黑洞」造成的 ConnectTimeout。
-                # 详见 `settings.FORCE_IPV4_LOCAL_ADDRESS` 的注释。
-                transport=self._transport if self._transport is not None
-                else httpx.AsyncHTTPTransport(
-                    local_address=FORCE_IPV4_LOCAL_ADDRESS),
+                # `_transport` 只在测试里注入；生产走 httpx 默认 transport
+                # （IPv4 / IPv6 都交给 anyio 的 happy eyeballs 自己挑）。
+                transport=self._transport,
             )
             self._loop = loop
         return self._client
