@@ -824,8 +824,15 @@ def _newest_dns() -> dict:
 
 
 def _sync_flaky():
-    return asyncio.run(eng._sync_dns(store.get_tunnel(_fl), None,
-                                     host="127.0.0.1"))
+    """跑「一轮」：同步 + 轮末聚合。
+
+    ⚠️ 必须带上 `_flush_dns_alerts()` —— DNS 的 warn / error 事件是在**轮末**
+    按站点聚合出来的，`_sync_dns` 自己只负责把失败登记进 `dns_fail_round`。
+    """
+    r = asyncio.run(eng._sync_dns(store.get_tunnel(_fl), None,
+                                  host="127.0.0.1"))
+    eng._flush_dns_alerts()
+    return r
 
 
 _sync_flaky()
@@ -844,15 +851,15 @@ check("★ 未满阈值期间完全静默（连跑 20 轮一条都不记）",
       (len(store.list_events(limit=200)), _n_before))
 
 # 把「连续失败起点」往前拨 30 分钟 —— 等价于真的断了半小时（比 sleep 靠谱，
-# 也不依赖真实时钟流逝）。
-eng.dns_fail_since[_fid] = time.time() - (ALERT_AFTER_SECONDS + 1)
+# 也不依赖真实时钟流逝）。⚠️ 状态是**站点级**的（不分隧道），所以直接赋值。
+eng.dns_fail_since = time.time() - (ALERT_AFTER_SECONDS + 1)
 _sync_flaky()
 _e = _newest_dns()
 check("★ 连续满 30 分钟才升 error", _e["level"] == "error", _e)
 check("★ error 文案带上已断时长", "30 分" in _e["message"], _e["message"])
 
 # 再满一个阈值 → 补一条（断一整天也只有 48 条，既不漏报也不刷屏）
-eng.dns_fail_since[_fid] = time.time() - (ALERT_AFTER_SECONDS * 2 + 1)
+eng.dns_fail_since = time.time() - (ALERT_AFTER_SECONDS * 2 + 1)
 _sync_flaky()
 check("★ 再满一个阈值补一条 error（长时间断网不漏报）",
       _newest_dns()["level"] == "error", _newest_dns())
@@ -864,7 +871,7 @@ check("恢复后记录同步成功（走了 upsert）", len(_cffl.upserts) == 1,
 check("★ 告过警的恢复记一条 success",
       "DNS 同步已恢复" in _newest_dns()["message"], _newest_dns()["message"])
 check("★ 恢复后连续失败状态清零",
-      _fid not in eng.dns_fail_since and _fid not in eng.dns_alert_count,
+      eng.dns_fail_since is None and eng.dns_alert_count == 0,
       (eng.dns_fail_since, eng.dns_alert_count))
 
 # 短抖自愈**不**记「已恢复」 —— 前面那条 warn 已经留过痕了，再来一条纯属噪音
@@ -884,6 +891,107 @@ asyncio.run(eng._sync_dns(store.get_tunnel(_fl), None, force=True,
                           host="127.0.0.1"))
 check("★ force（导入 / 立即探测）时第一次就如实记 error",
       _newest_dns()["level"] == "error", _newest_dns())
+
+
+# ★ 站点级聚合：DNS 同步打的是同一个 Cloudflare API，一轮里几条隧道都撞上同一个
+#   超时，也只该报**一条** —— 而不是每条各报一次。按隧道各记一份的话，那几份的
+#   「已连续失败」起点还相差几十秒（巡检是串行的，每条失败要耗掉一个 connect
+#   timeout），事件列表里看着就像时长在反复横跳。
+print("  --- DNS 告警按站点聚合（不按隧道）---")
+_agg1 = store.create_tunnel({
+    "name": "聚合 A", "proxy_name": "agg-a", "proxy_type": "tcp",
+    "local_ip": "127.0.0.1", "local_port": 5100, "current_remote_port": 5110,
+    "manual_node_id": mid, "enabled": 1, "auto_failover": 0,
+    "dns_record_name": "agg-a.example.com",
+})
+_agg2 = store.create_tunnel({
+    "name": "聚合 B", "proxy_name": "agg-b", "proxy_type": "tcp",
+    "local_ip": "127.0.0.1", "local_port": 5101, "current_remote_port": 5111,
+    "manual_node_id": mid, "enabled": 1, "auto_failover": 0,
+    "dns_record_name": "agg-b.example.com",
+})
+
+
+def _reset_dns_state() -> None:
+    eng.dns_fail_since = None
+    eng.dns_alert_count = 0
+    eng.dns_fail_tunnels.clear()
+    eng.dns_fail_round.clear()
+
+
+def _run_round(*tids) -> None:
+    """模拟一轮巡检：逐条同步，最后聚合一次（和 `tick()` 里的顺序一致）。"""
+    for _tid in tids:
+        asyncio.run(eng._sync_dns(store.get_tunnel(_tid), None,
+                                  host="127.0.0.1"))
+    eng._flush_dns_alerts()
+
+
+def _n_events() -> int:
+    return len(store.list_events(limit=500))
+
+
+eng.cf = _cffl
+_reset_dns_state()
+_cffl.fail = True
+
+_n0 = _n_events()
+_run_round(_agg1, _agg2)
+check("★ 一轮里两条隧道都失败 → 只记**一条**事件（按站点聚合，不是按隧道）",
+      _n_events() - _n0 == 1, _n_events() - _n0)
+_e = _newest_dns()
+check("★ 聚合出来的那条是 warn，且说明「满多久才告警」",
+      _e["level"] == "warn" and "才告警" in _e["message"], _e["message"])
+check("★ 聚合事件不带隧道（它是站点级事件）", _e["tunnel_id"] is None,
+      _e["tunnel_id"])
+
+# 未满阈值期间照旧一条都不记
+_n0 = _n_events()
+for _i in range(10):
+    _run_round(_agg1, _agg2)
+check("★ 聚合之后未满阈值仍然完全静默（连跑 10 轮一条都不记）",
+      _n_events() == _n0, _n_events() - _n0)
+
+# 拨到满 30 分 → 告警，且文案报出影响面
+eng.dns_fail_since = time.time() - (ALERT_AFTER_SECONDS + 1)
+_n0 = _n_events()
+_run_round(_agg1, _agg2)
+check("★ 聚合告警也仍然只有一条", _n_events() - _n0 == 1, _n_events() - _n0)
+check("★ 告警文案报出受影响的隧道条数",
+      "2 条隧道受影响" in _newest_dns()["message"], _newest_dns()["message"])
+
+# ★ 关键：本轮**有**失败就不清状态 —— 否则「一条老是超时、另一条正常」时，
+#   那条超时的会被另一条的成功反复清零，永远攒不满 30 分钟（漏报）。
+_reset_dns_state()
+eng.dns_fail_round[_agg1] = "x"
+eng._flush_dns_alerts()
+check("★ 本轮有失败 → 连续失败状态保持", eng.dns_fail_since is not None,
+      eng.dns_fail_since)
+eng._flush_dns_alerts()
+check("★ 下一轮一条失败都没有 → 才判为恢复、清状态",
+      eng.dns_fail_since is None, eng.dns_fail_since)
+
+# 恢复事件只在**告过警**时才记
+eng.dns_fail_since = time.time()
+eng.dns_alert_count = 0
+_n0 = _n_events()
+eng._flush_dns_alerts()
+check("★ 没告过警的站点恢复不记 success（保持安静）",
+      _n_events() == _n0, _n_events() - _n0)
+
+eng.dns_fail_since = time.time() - 100
+eng.dns_alert_count = 1
+_n0 = _n_events()
+eng._flush_dns_alerts()
+check("★ 告过警的站点恢复记一条 success", _n_events() - _n0 == 1,
+      _n_events() - _n0)
+check("★ 恢复文案带上此前连续失败的时长",
+      "DNS 同步已恢复" in _newest_dns()["message"]
+      and "此前连续失败" in _newest_dns()["message"],
+      _newest_dns()["message"])
+
+_reset_dns_state()
+_cffl.fail = False
 
 
 # 静态问题（token 没权限这种，重试一万次也不会好）不套「等半小时」，立刻报。

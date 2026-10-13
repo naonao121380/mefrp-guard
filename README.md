@@ -172,13 +172,13 @@ mefrp 的免费节点会不定期下线、维护、被禁用。手工处理一�
 
 ### 方式一：用 Release 里的镜像（推荐）
 
-从 [Releases](../../releases) 下载镜像包 `mefrp-guard-v1.0.2.tar`，和仓库里的
+从 [Releases](../../releases) 下载镜像包 `mefrp-guard-v1.0.3.tar`，和仓库里的
 `docker-compose.yml`、`.env.example` 两个文件放在同一个目录，然后：
 
 ```bash
 # 1. 导入镜像
-docker load -i mefrp-guard-v1.0.2.tar
-docker images | grep mefrp-guard        # 应看到 mefrp-guard  v1.0.2
+docker load -i mefrp-guard-v1.0.3.tar
+docker images | grep mefrp-guard        # 应看到 mefrp-guard  v1.0.3
 
 # 2. 准备配置
 cp .env.example .env
@@ -190,7 +190,7 @@ docker compose up -d
 
 > 只要镜像已经导入，compose 就会直接用它，**不会再去本地构建** —— 所以不需要装源码、也不需要 Dockerfile。
 
-> ⚠️ 镜像的 tag 必须和 `docker-compose.yml` 里的 `image:` 一致（默认 `mefrp-guard:v1.0.2`）。
+> ⚠️ 镜像的 tag 必须和 `docker-compose.yml` 里的 `image:` 一致（默认 `mefrp-guard:v1.0.3`）。
 > 不一致的话 compose 会以为本地没有这个镜像，转头去本地构建。
 
 ### 方式二：自己构建
@@ -198,17 +198,17 @@ docker compose up -d
 ```bash
 cp .env.example .env
 vim .env
-docker compose up -d --build            # 等价于 docker build -t mefrp-guard:v1.0.2 . && docker compose up -d
+docker compose up -d --build            # 等价于 docker build -t mefrp-guard:v1.0.3 . && docker compose up -d
 ```
 
 想导出成 tar 发给别人：
 
 ```bash
-docker save mefrp-guard:v1.0.2 -o mefrp-guard-v1.0.2.tar
+docker save mefrp-guard:v1.0.3 -o mefrp-guard-v1.0.3.tar
 ```
 
-> 镜像 tag 固定成 `v1.0.2` 而不是 `latest`：`latest` 会让「现在跑的是哪一版」变成回答不了的问题，
-> 回滚时也没有可指的目标。改了代码就 build 成 `v1.0.2`，`docker compose up -d` 会自动用新镜像重建。
+> 镜像 tag 固定成 `v1.0.3` 而不是 `latest`：`latest` 会让「现在跑的是哪一版」变成回答不了的问题，
+> 回滚时也没有可指的目标。改了代码就 build 成 `v1.0.3`，`docker compose up -d` 会自动用新镜像重建。
 
 ### 升级到新版本
 
@@ -497,7 +497,18 @@ TCP/UDP 隧道和 HTTP/HTTPS 隧道用的是**两套独立的偏好** —— 因
 
 ## 更新日志
 
-最新 **1.0.2**：
+最新 **1.0.3**：
+
+- **修**：**DNS 同步告警改成按「站点」聚合** —— 「连不上 Cloudflare」跟是哪条隧道无关。
+  原来每条隧道各存一份连续失败状态，3 条隧道就是 3 份 warn + 3 份 error，而且三份起点
+  相差几十秒（巡检串行，每条失败要耗掉一个 connect timeout），事件列表里看着就像
+  「已连续失败时长」在反复横跳。现在一轮 N 条隧道失败只报**一条**，恢复也只报一条，
+  文案里带上「共 N 条隧道受影响」。
+- **修**：**出站连接强制走 IPv4**（`local_address="0.0.0.0"`）—— 有些环境里域名优先解析出
+  IPv6、而那条路由是**黑洞**，导致 DNS 同步和 mefrp 拉取**同时** `ConnectTimeout`
+  （同一台机器上 `curl -4` 却秒连）。
+
+上一版 **1.0.2**：
 
 - **新**：**HTTP / HTTPS 隧道管理**（与 TCP/UDP 完全分开的两套偏好体系）、
   HTTP 层端到端探测（「按类型」模式，2xx/3xx 算通）、节点页与设置页的双口径页签、

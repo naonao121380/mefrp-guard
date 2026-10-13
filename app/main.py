@@ -57,7 +57,7 @@ async def lifespan(_app: FastAPI):
         store.add_event("info", "system", "mefrp-guard 停止")
 
 
-app = FastAPI(title="mefrp-guard", version="1.0.2", lifespan=lifespan,
+app = FastAPI(title="mefrp-guard", version="1.0.3", lifespan=lifespan,
               docs_url=None, redoc_url=None)
 
 

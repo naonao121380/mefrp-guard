@@ -249,13 +249,22 @@ WireGuard 的握手包）。那属于业务侧的事，不是这个工具该做�
   · 连续满阈值 → 升 `error`；之后每再满一个阈值补一条（断一整天也只有 48 条）
   · 恢复 → 状态清零；**告过警的**才记一条恢复事件，短抖自愈不记（前面那条 warn
     已经留过痕了，再来一条纯属噪音）
-  成功一次就清零（**清零很重要**：否则抖动会攒起来，隔几分钟突然升级成 error，
-  变成另一种误报）。`force`（用户明确点的动作）和**静态问题**（zone 找不到、token
-  没权限这类，重试一万次也不会好）不看阈值，第一次就如实记 `error`。
-  阈值刻意**不复用** `fail_threshold` —— 那个管的是「连续探测失败几次才触发切换」，
-  捆在一起以后调其中一个必然误伤另一个。
+  清零的判据见下面「按站点聚合」那条。`force`（用户明确点的动作）和**静态问题**
+  （zone 找不到、token 没权限这类，重试一万次也不会好）不看阈值，第一次就如实记
+  `error`。阈值刻意**不复用** `fail_threshold` —— 那个管的是「连续探测失败几次才触发
+  切换」，捆在一起以后调其中一个必然误伤另一个。
+- ★ **告警按「站点」聚合，不按隧道** —— DNS 同步打的是同一个 Cloudflare API，
+  「连不上」跟是哪条隧道无关。原来每条隧道各存一份连续失败状态，3 条隧道就是 3 份
+  warn + 3 份 error，而且三份的起点相差几十秒（巡检串行，每条失败要耗掉一个 connect
+  timeout）→ 事件列表里看着就像「已连续失败时长」在反复横跳、甚至倒退（用户就是拿
+  这个来问的）。现在只有一份状态：一轮里 N 条隧道失败只报**一条**（`dns_fail_round`
+  攒一轮、轮末 `_flush_dns_alerts()` 统一记），恢复也只报一条，文案里带上
+  「共 N 条隧道受影响」。
+  ⚠️ 恢复的判据是「本轮**所有**配了 DNS 的隧道都成功」，不是「有一条成功」——
+  否则一条老是超时、另一条正常时，那条超时的会被另一条的成功反复清零、永远攒不满
+  阈值（漏报）。静态问题仍按隧道立刻报，不参与聚合。
 - ★ **mefrp 拉取失败与 DNS 同步失败共用同一套口径** —— 见 `ALERT_AFTER_SECONDS` 与
-  `_note_mefrp_fail` / `_note_dns_fail`。两处原来各写各的（一处「每轮一条 error」、
+  `_note_mefrp_fail` / `_flush_dns_alerts`。两处原来各写各的（一处「每轮一条 error」、
   一处「连续 3 次」），调了一个忘了另一个。现在都是「一条 warn + 满阈值才 error」。
 
 ### 相关的巡检坑：mefrp 挂了不该连累外部节点
@@ -295,14 +304,14 @@ WireGuard 的握手包）。那属于业务侧的事，不是这个工具该做�
 ```bash
 cp .env.example .env
 vim .env                 # 至少填 MEFRP_TOKEN、MG_WEB_PASSWORD、FRPC_PATH
-docker build -t mefrp-guard:v1.0.2 .
+docker build -t mefrp-guard:v1.0.3 .
 docker compose up -d
 ```
 
 > 也可以一步做完：`docker compose up -d --build`，两者等价。
 >
-> 镜像 tag 固定成 `v1.0.2` 而不是 `latest` —— `latest` 会让「现在跑的是哪一版」
-> 变成一个回答不了的问题，回滚时也没有可指的目标。改了代码就 build 成 `v1.0.2`
+> 镜像 tag 固定成 `v1.0.3` 而不是 `latest` —— `latest` 会让「现在跑的是哪一版」
+> 变成一个回答不了的问题，回滚时也没有可指的目标。改了代码就 build 成 `v1.0.3`
 > 之类的新 tag，`docker compose up -d` 会自动用新镜像重建容器。
 
 起来后访问 `http://<宿主机>:<HOST_PORT>`（默认 8080），会先跳到登录页。
@@ -590,7 +599,7 @@ mefrp-guard/
 │       └── favicon.ico 老浏览器 / Safari / webview 的回落图标（`/favicon.ico`）
 ├── tests/              十一个测试文件（鉴权 / 纯逻辑 / CF 客户端 / 外部节点逻辑 / API /
 │                       外部节点 API / 标签 / 作用域 / 故障转移 / HTTP 隧道 / 多容器挂接），
-│                       共 1105 条断言
+│                       共 1116 条断言
 ├── run_local.sh        本地试跑脚本（不依赖 Docker，用沙箱 frpc 配置）
 ├── Dockerfile
 ├── docker-compose.yml
@@ -798,6 +807,34 @@ PREF_KEYS = {
 
 ## 排错
 
+**「DNS 同步 / mefrp 拉取一直报 `ConnectTimeout`」**
+
+先分清是**本地出口**还是**源站**：两个互不相干的 API（Cloudflare 和 mefrp）**同时**
+失败，基本就是本地出口的问题。判据：
+
+```bash
+getent ahosts api.cloudflare.com                              # IPv6 排在前面？
+curl -4 -sv https://api.cloudflare.com/client/v4/user -m 10   # 强制 IPv4 是不是秒连
+```
+
+**强制 IPv4 秒连、默认路径却超时 → IPv6 黑洞**（域名解析出 IPv6，但那条路由没有回音）。
+
+> ⚠️ **anyio 会主动把 IPv6 排到候选列表第一位** —— 它拿到 `getaddrinfo` 的结果后会
+> 重排（`anyio/_core/_sockets.py`：*"Organize the list so that the first address is an
+> IPv6 address"*）。所以**哪怕系统层面 IPv4 优先，它也会先试 IPv6**；改 `/etc/gai.conf`
+> 只影响 `getent` 那类调用，**管不住 anyio**。
+
+程序侧已兜底：`settings.FORCE_IPV4_LOCAL_ADDRESS`，两个客户端的 transport 都带
+`local_address="0.0.0.0"`。httpcore 会把它传成 anyio 的 `local_host`，anyio 再用它去调
+`getaddrinfo(target, port, family=<local_host 的地址族>)` —— 实测 `getaddrinfo("0.0.0.0",
+None)` 给的是 `AF_INET`，于是目标域名**只解析出 IPv4**，IPv6 压根不进候选列表。
+
+要彻底解决（也让机器上别的程序受益），在系统层关掉 IPv6 优先：
+
+```bash
+echo 'precedence ::ffff:0:0/96  100' >> /etc/gai.conf
+```
+
 **「`docker build` 失败，报 `json.decoder.JSONDecodeError: Unterminated string`」**
 
 不是 `requirements.txt` 有问题 —— 是 pip 抓 PyPI 索引页时**响应体被中途截断**了。
@@ -933,14 +970,14 @@ PYTHONPATH=$PWD/.devdeps PY=$PY ./tests/run_all.sh
 > ⚠️ `run_all.sh` **自己不设 `PYTHONPATH`** —— 不带上的话会在第一个需要依赖的文件上
 > 报 `No module named 'fastapi'`。
 
-十一个文件，共 **1105 条断言**（59 + 149 + 22 + 137 + 196 + 183 + 30 + 47 + 75 + 114 + 93）：
+十一个文件，共 **1116 条断言**（59 + 149 + 22 + 148 + 196 + 183 + 30 + 47 + 75 + 114 + 93）：
 
 | 文件 | 覆盖 | 需要第三方库 |
 |---|---|---|
 | `tests/test_auth.py` | **密码哈希（随机盐/迭代数/异常输入安全降级）、默认密码识别、会话令牌、登录防爆破、来源 IP 解析** | 否 |
 | `tests/test_logic.py` | frpc TOML 合并与跨节点校验、**单引号字面量解析**、配置备份/恢复/路径穿越、SQLite 持久化与字段白名单、Node/Proxy 字段解析、`pick_node` 择优调度、**节点偏好的有序语义与归一化**、**`probe_plan` 探测适用性（四种模式 × 四种隧道类型，含「http 在 auto 下是假阳性」）** | 否 |
 | `tests/test_cfclient.py` | **Cloudflare 客户端的 httpx 交互**：传输层退避重试、重试耗尽后 `transient=True` 与异常类型名、非传输层错误不重试、**连接池复用（3 个请求只建 1 个）与跨事件循环重建**、`upsert(existing=…)` 省掉两次自查、没配 token 一个请求都不发 | httpx |
-| `tests/test_manual_node.py` | **frpc 配置解析（TOML / INI）、`patch_server` 文本级改写的保真与合法性、外部节点数据层 CRUD、1.0.0 老库补列迁移、引擎对外部隧道的分支（含「不适用探测」的三态、UDP 的 DNS 同步）、★ **mefrp 拉取失败与 DNS 同步失败「满 `alert_after_seconds` 才告警」的完整口径**（一条 warn → 静默 → 满阈值 error → 每再满一个阈值补报 → 恢复 success / 短抖不记 / force 与静态问题立刻报）** | 否 |
+| `tests/test_manual_node.py` | **frpc 配置解析（TOML / INI）、`patch_server` 文本级改写的保真与合法性、外部节点数据层 CRUD、1.0.0 老库补列迁移、引擎对外部隧道的分支（含「不适用探测」的三态、UDP 的 DNS 同步）、★ **mefrp 拉取失败与 DNS 同步失败「满 `alert_after_seconds` 才告警」的完整口径**（一条 warn → 静默 → 满阈值 error → 每再满一个阈值补报 → 恢复 success / 短抖不记 / force 与静态问题立刻报）、★ **DNS 告警按站点聚合**（一轮 N 条隧道失败只报一条、恢复判据是「本轮全都没失败」、告警报出影响面）** | 否 |
 | `tests/test_api.py` | FastAPI 全端点：**登录页/会话 Cookie/登出作废/改密码/CSRF/防爆破/只读设置保护**、鉴权、CRUD、密钥打码、错误码、枚举字段校验、引擎生命周期、**frpc 实例 CRUD 与挂接 API**、**`/api/tunnels` 与 `/api/overview` 的挂接字段口径一致**、**节点偏好预览（含路由遮蔽回归）** | fastapi / httpx / pydantic |
 | `tests/test_manual_api.py` | 外部节点全部 HTTP 端点：导入 / 更新 / 删除 / 改连 / 探测、token 不回明文、**「地址已导入过」的 409 契约与「覆盖重建空节点」**、**导入时顺手同步 DNS 与 udp 隧道的探测端点**、**DNS 记录名查重的 409 契约（含编辑自己 / 导入时只放弃那一个字段）**、删掉最后一条隧道自动清理空节点 | fastapi / httpx / pydantic |
 | `tests/test_tags.py` | 隧道标签：默认打 `mefrp`、归一化与截断、`?tag=` 筛选（**空串 = 筛未打标的**）、`/api/tags` 计数与排序、显式清空、**老库只回填一次** | fastapi / httpx / pydantic |

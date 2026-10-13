@@ -6,6 +6,39 @@
 
 ---
 
+## 1.0.3
+
+### 修复
+
+- **DNS 同步的告警改成「按站点」聚合，不再每条隧道各报一份。** DNS 同步打的是
+  同一个 Cloudflare API，「连不上 Cloudflare」跟是哪条隧道无关。原来每条隧道各存
+  一份连续失败状态，3 条隧道就是 3 份 warn + 3 份 error —— 而且三份的起点相差几十秒
+  （巡检串行，每条失败要耗掉一个 connect timeout），事件列表里看着就像「已连续失败
+  时长」在反复横跳、甚至倒退。现在只有一份状态：一轮里 N 条隧道失败只报**一条**，
+  恢复也只报一条，告警文案里带上「共 N 条隧道受影响」。
+
+  > ⚠️ 恢复的判据是「本轮**所有**配了 DNS 的隧道都成功」，不是「有一条成功」——
+  > 否则一条老是超时、另一条正常时，那条超时的会被反复清零、永远攒不满阈值。
+  > 静态问题（zone 找不到 / token 没权限）仍按隧道立刻报，不参与聚合。
+
+- **出站连接强制走 IPv4**（`local_address="0.0.0.0"`）。有些环境里域名**优先解析出
+  IPv6**、而那条路由是**黑洞** —— 于是 DNS 同步和 mefrp 拉取会**同时**报
+  `ConnectTimeout`（而同一台机器上 `curl -4` 秒连成功）。⚠️ 别指望 anyio 的
+  happy eyeballs 自动绕过去：它**主动**把 IPv6 重排到候选列表第一位
+  （`_core/_sockets.py` 里那句 "Organize the list so that the first address is an
+  IPv6 address"），哪怕系统层面 IPv4 优先也会先试 IPv6。传 `local_address="0.0.0.0"`
+  之后，anyio 用它去调 `getaddrinfo(..., family=AF_INET)` —— **IPv6 压根不会进候选
+  列表**。代价是永远不用 IPv6（对只连两个 API 的工具完全够用）。
+  根治办法在系统层：`/etc/gai.conf` 里加一行 `precedence ::ffff:0:0/96 100`。
+
+### 内部
+
+- `settings.FORCE_IPV4_LOCAL_ADDRESS`；`CloudflareClient` 与 `MefrpClient` 的
+  transport 都带上它（CF 侧只在没有注入测试 transport 时生效）。
+- DNS 连续失败状态从 `dict[tid, ...]` 收成单值，另加 `dns_fail_round`（本轮失败的
+  隧道）与 `dns_fail_tunnels`（这次连续失败累计影响到的隧道）；事件记录从 `_sync_dns`
+  里挪到轮末的 `_flush_dns_alerts()`，由 `tick()` 调用。
+
 ## 1.0.2
 
 ### 新增

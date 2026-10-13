@@ -145,6 +145,28 @@ DEFAULT_SETTINGS: dict[str, object] = {
     "login_lockout_seconds": 300,   # 锁定时长（秒）
 }
 
+# ★ 出站连接**强制走 IPv4**（`local_address="0.0.0.0"`）。
+#
+# 为什么需要它：不少内网小机器 / 家宽环境下，域名会**优先解析出 IPv6**
+# （`/etc/gai.conf` 的 precedence 规则），但那条 IPv6 路由是个**黑洞** —— 包发出去
+# 没有回音。`getaddrinfo` 把 IPv6 排在前面，httpx / anyio 就去连它，一路挂到
+# connect 超时。实测现象：DNS 同步和 mefrp 拉取**同时**报 `ConnectTimeout`，
+# 而同一台机器上 `curl -4` 秒连成功。
+#
+# 为什么这样能绕过：httpcore 把 `local_address` 传给 anyio 的 `local_host`，anyio
+# 又拿它去调 `getaddrinfo(..., family=<local_host 的地址族>)` —— 传 `"0.0.0.0"`
+# 等于**把解析限制在 AF_INET**，IPv6 地址压根不会进候选列表。
+#
+# ⚠️ 别指望 anyio 的 happy eyeballs 自己绕过去：它**主动**把 IPv6 重排到候选列表
+# 第一位（`anyio/_core/_sockets.py` 里那句 "Organize the list so that the first
+# address is an IPv6 address"），所以哪怕系统层面 IPv4 优先，它也会先试 IPv6。
+#
+# 代价是永远不用 IPv6。对这个工具（只连 Cloudflare API 和 mefrp API）完全够用，
+# 而且远比「连不上」好。根治办法在系统层（`/etc/gai.conf` 里加
+# `precedence ::ffff:0:0/96 100` 让 IPv4 优先），这里只是程序侧的兜底，
+# 不去动用户的系统配置。
+FORCE_IPV4_LOCAL_ADDRESS = "0.0.0.0"
+
 # 只读设置：只允许程序内部写，不接受 /api/settings 的写入。
 # ⚠️ 密码哈希必须在这里 —— 否则任何人都能通过设置接口把密码改成自己知道的值。
 # 改密码走专门的 /api/auth/password（需要验证当前密码）。

@@ -1,11 +1,11 @@
 # mefrp-guard —— 构建式部署
 #
 # 先构建镜像，再用它起容器：
-#     docker build -t mefrp-guard:v1.0.2 .
+#     docker build -t mefrp-guard:v1.0.3 .
 #     docker compose up -d
 # 也可以一步做完：docker compose up -d --build
 #
-# 镜像 tag 固定成 v1.0.2 而不是 latest —— latest 会让「现在跑的是哪一版」
+# 镜像 tag 固定成 v1.0.3 而不是 latest —— latest 会让「现在跑的是哪一版」
 # 变成一个回答不了的问题，回滚时也没有可指的目标。
 #
 # 所有跟宿主机有关的取值（端口 / 静态 IP / 网络名 / frpc 配置根目录）都从同目录的
@@ -15,7 +15,7 @@
 services:
   mefrp-guard:
     build: .
-    image: mefrp-guard:v1.0.2
+    image: mefrp-guard:v1.0.3
     container_name: mefrp-guard
     restart: unless-stopped
 
