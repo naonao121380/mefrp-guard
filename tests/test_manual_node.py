@@ -765,6 +765,7 @@ print("  --- ★ 瞬时 DNS 失败：满 alert_after_seconds 才升 error ---")
 # 现在按**时间**：满 30 分钟才告警，之前只留一条 warn，中途自愈不再记。
 from app.cloudflare import CloudflareError                        # noqa: E402
 from app.engine import ALERT_AFTER_SECONDS, alert_after_seconds   # noqa: E402
+from app.settings import DNS_RECOVER_GRACE_SECONDS                # noqa: E402
 
 check("★ 默认告警门槛是 30 分钟", ALERT_AFTER_SECONDS == 1800, ALERT_AFTER_SECONDS)
 store.set_setting("alert_after_seconds", 1800)
@@ -838,8 +839,9 @@ def _sync_flaky():
 _sync_flaky()
 _e = _newest_dns()
 check("★ 刚开始失败只记一条 warn（不告警）", _e["level"] == "warn", _e)
-check("★ warn 文案说清了「满多久才告警、中途自愈不记录」",
-      "才告警" in _e["message"] and "自愈" in _e["message"], _e["message"])
+check("★ warn 文案说清了「满多久才告警、恢复要多久」",
+      "才告警" in _e["message"] and "恢复需连续正常" in _e["message"],
+      _e["message"])
 
 # ★ 关键：没满阈值期间**一条都不记** —— 这就是「别吵」的本体。
 #   原来每轮一条 warn，90 轮就是 90 条。
@@ -864,29 +866,46 @@ _sync_flaky()
 check("★ 再满一个阈值补一条 error（长时间断网不漏报）",
       _newest_dns()["level"] == "error", _newest_dns())
 
-# 恢复：状态清零，且**告过警**的才记一条 success
+# ★ 恢复要有**迟滞**：一次干净只是「这次碰巧通了」，不算恢复。
+#   实测 2026-10-13：CF API 打三次挂两次，每一次偶然成功都把 episode 切断，
+#   四小时刷出 62 条 warn、0 条 error（30 分钟的告警永远攒不满）。
 _cffl.fail = False
 _sync_flaky()
 check("恢复后记录同步成功（走了 upsert）", len(_cffl.upserts) == 1, _cffl.upserts)
+check("★ 一次干净**不算**恢复（episode 保持、不记 success）",
+      eng.dns_fail_since is not None
+      and "DNS 同步已恢复" not in _newest_dns()["message"],
+      (eng.dns_fail_since, _newest_dns()["message"]))
+check("★ 但「干净起点」已开始计时", eng.dns_ok_since is not None, eng.dns_ok_since)
+
+# 把「干净起点」往前拨过宽限期 → 这才算「连续干净满窗口」
+eng.dns_ok_since = time.time() - (DNS_RECOVER_GRACE_SECONDS + 1)
+_sync_flaky()
+check("★ 连续干净满宽限期才判恢复", eng.dns_fail_since is None,
+      eng.dns_fail_since)
 check("★ 告过警的恢复记一条 success",
       "DNS 同步已恢复" in _newest_dns()["message"], _newest_dns()["message"])
 check("★ 恢复后连续失败状态清零",
-      eng.dns_fail_since is None and eng.dns_alert_count == 0,
-      (eng.dns_fail_since, eng.dns_alert_count))
+      eng.dns_fail_since is None and eng.dns_alert_count == 0
+      and eng.dns_ok_since is None,
+      (eng.dns_fail_since, eng.dns_alert_count, eng.dns_ok_since))
 
-# 短抖自愈**不**记「已恢复」 —— 前面那条 warn 已经留过痕了，再来一条纯属噪音
+# 恢复后再挂 → 又是全新的一段，从 warn 重新开始
 _cffl.fail = True
 _sync_flaky()
 check("★ 恢复后再失败又从 warn 开始（短抖不会攒成 error）",
       _newest_dns()["level"] == "warn", _newest_dns())
+# 短抖自愈**不**记「已恢复」 —— 前面那条 warn 已经留过痕了，再来一条纯属噪音
 _cffl.fail = False
 _sync_flaky()
 check("★ 没告过警的短抖自愈不额外记「已恢复」（保持安静）",
       "DNS 同步已恢复" not in _newest_dns()["message"], _newest_dns()["message"])
 
 # force = 用户明确点的动作，不看阈值，第一次就如实记 error。
+# ⚠️ 此时站点可能已经处于「异常中」（迟滞没过完）—— 那也不影响：force 这条路
+#    压根不看聚合状态，用户正站在页面前等结果，必须如实报。
 _cffl.fail = True
-_sync_flaky()                       # 先起一个 streak（记 warn）
+_sync_flaky()
 asyncio.run(eng._sync_dns(store.get_tunnel(_fl), None, force=True,
                           host="127.0.0.1"))
 check("★ force（导入 / 立即探测）时第一次就如实记 error",
@@ -915,8 +934,10 @@ _agg2 = store.create_tunnel({
 def _reset_dns_state() -> None:
     eng.dns_fail_since = None
     eng.dns_alert_count = 0
+    eng.dns_ok_since = None
     eng.dns_fail_tunnels.clear()
     eng.dns_fail_round.clear()
+    eng.dns_ok_round = 0
 
 
 def _run_round(*tids) -> None:
@@ -928,7 +949,17 @@ def _run_round(*tids) -> None:
 
 
 def _n_events() -> int:
-    return len(store.list_events(limit=500))
+    return len(store.list_events(limit=1000))
+
+
+def _n_dns_alerts() -> int:
+    """只数 warn / error 级的 dns 事件。
+
+    ⚠️ 不能直接数事件总数：干净轮里记录名底下是空的，`_sync_dns` 会走 upsert
+    并记一条 **success**「DNS 已更新」—— 那跟告警没关系。
+    """
+    return len([e for e in store.list_events(limit=1000)
+                if e["kind"] == "dns" and e["level"] in ("warn", "error")])
 
 
 eng.cf = _cffl
@@ -967,13 +998,34 @@ eng.dns_fail_round[_agg1] = "x"
 eng._flush_dns_alerts()
 check("★ 本轮有失败 → 连续失败状态保持", eng.dns_fail_since is not None,
       eng.dns_fail_since)
+
+# ★ 「本轮没人失败」不等于「站点好了」：隧道被判故障时 `_reconcile` 根本不会调
+#   `_sync_dns`，三条隧道同时故障就一个 CF 请求都发不出去。拿「没问」当「通了」
+#   会在隧道长期故障时把 DNS 的 episode 悄悄判成恢复。
 eng._flush_dns_alerts()
-check("★ 下一轮一条失败都没有 → 才判为恢复、清状态",
-      eng.dns_fail_since is None, eng.dns_fail_since)
+check("★ 本轮没发任何 CF 请求 → 不算干净（无证据，状态保持）",
+      eng.dns_fail_since is not None and eng.dns_ok_since is None,
+      (eng.dns_fail_since, eng.dns_ok_since))
+
+# 真去问了、且没失败 → 干净。但**一次干净不算恢复**，要连续满宽限期。
+eng.dns_ok_round = 1
+eng._flush_dns_alerts()
+check("★ 干净但未满宽限期 → 仍不恢复（只是开始计时）",
+      eng.dns_fail_since is not None and eng.dns_ok_since is not None,
+      (eng.dns_fail_since, eng.dns_ok_since))
+
+eng.dns_ok_round = 1
+eng.dns_ok_since = time.time() - (DNS_RECOVER_GRACE_SECONDS + 1)
+eng._flush_dns_alerts()
+check("★ 连续干净满宽限期 → 才恢复、清状态",
+      eng.dns_fail_since is None and eng.dns_ok_since is None,
+      (eng.dns_fail_since, eng.dns_ok_since))
 
 # 恢复事件只在**告过警**时才记
 eng.dns_fail_since = time.time()
 eng.dns_alert_count = 0
+eng.dns_ok_round = 1
+eng.dns_ok_since = time.time() - (DNS_RECOVER_GRACE_SECONDS + 1)
 _n0 = _n_events()
 eng._flush_dns_alerts()
 check("★ 没告过警的站点恢复不记 success（保持安静）",
@@ -981,14 +1033,48 @@ check("★ 没告过警的站点恢复不记 success（保持安静）",
 
 eng.dns_fail_since = time.time() - 100
 eng.dns_alert_count = 1
+eng.dns_ok_round = 1
+eng.dns_ok_since = time.time() - (DNS_RECOVER_GRACE_SECONDS + 1)
 _n0 = _n_events()
 eng._flush_dns_alerts()
 check("★ 告过警的站点恢复记一条 success", _n_events() - _n0 == 1,
       _n_events() - _n0)
-check("★ 恢复文案带上此前连续失败的时长",
+check("★ 恢复文案带上此前异常的时长",
       "DNS 同步已恢复" in _newest_dns()["message"]
-      and "此前连续失败" in _newest_dns()["message"],
+      and "此前持续异常" in _newest_dns()["message"],
       _newest_dns()["message"])
+
+# ★★ 回归：抖动型故障源（打三次挂两次）不再被切成几十条 warn。
+#   这就是 2026-10-13 那天「4 小时 62 条 warn、0 条 error」的最小复现。
+print("  --- ★ 抖动型故障：一段故障只能有一条 warn ---")
+_reset_dns_state()
+_cffl.fail = True
+_run_round(_agg1, _agg2)
+check("★ 抖动开始：记一条 warn，episode 起表",
+      eng.dns_fail_since is not None and _newest_dns()["level"] == "warn",
+      (eng.dns_fail_since, _newest_dns()))
+_n_a = _n_dns_alerts()
+# 干净一轮 → 又挂一轮，反复 6 个来回（模拟 CF 时通时不通）
+for _i in range(6):
+    _cffl.fail = False
+    _run_round(_agg1, _agg2)
+    _cffl.fail = True
+    _run_round(_agg1, _agg2)
+check("★ 反复抖动 6 个来回：**一条新告警都不记**（episode 不被切断）",
+      _n_dns_alerts() == _n_a, _n_dns_alerts() - _n_a)
+check("★ 抖动期间 episode 起点没被清零（计时连续）",
+      eng.dns_fail_since is not None and eng.dns_alert_count == 0,
+      (eng.dns_fail_since, eng.dns_alert_count))
+# 拨满 30 分 → 该告警了，而且**只有一条**（不是每个来回一条）
+eng.dns_fail_since = time.time() - (ALERT_AFTER_SECONDS + 1)
+_n_a = _n_dns_alerts()
+_run_round(_agg1, _agg2)
+check("★ 抖动攒满 30 分 → 记一条 error（不是 62 条 warn）",
+      _n_dns_alerts() - _n_a == 1 and _newest_dns()["level"] == "error",
+      (_n_dns_alerts() - _n_a, _newest_dns()))
+check("★ error 文案说的是「持续异常」而不是「连续失败」"
+      "（中途确实通了几次，说「连续失败」是假的）",
+      "已持续异常" in _newest_dns()["message"], _newest_dns()["message"])
 
 _reset_dns_state()
 _cffl.fail = False

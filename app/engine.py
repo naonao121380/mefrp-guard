@@ -31,7 +31,7 @@ from .cloudflare import CloudflareClient, CloudflareError
 from .mefrp import (MefrpApiError, MefrpClient, MefrpError, Node, Proxy,
                     is_http_type, join_domains, kind_of, parse_domains)
 from .notifier import Notifier
-from .settings import BOOTSTRAP, pref_key
+from .settings import BOOTSTRAP, DNS_RECOVER_GRACE_SECONDS, pref_key
 
 
 # 哨兵：区分「调用方没传 current_proxy_id」与「明确要求不删任何 proxy」。
@@ -225,6 +225,11 @@ PROBE_HTTP = "http"
 #   · 恢复 → 状态清零；**告过警**的才记一条 success（短抖自愈不再记，免得吵）
 #   · 静态问题（zone 找不到这种，重试不会好）不套这套，立刻记 error
 #
+# ⚠️ DNS 这一侧还多一层**迟滞**：恢复要「连续干净满 `DNS_RECOVER_GRACE_SECONDS`」，
+#    不是「有一轮干净就算」。理由见那个常量的注释（抖动型故障源会把一段故障切成
+#    几十条 warn）。mefrp 那边不需要 —— 它一轮只打一个请求，不存在「同一轮里
+#    几条隧道各打各的、总有一条撞上超时」这种结构。
+#
 # 可在「设置」页改（`alert_after_seconds`）。刻意**不复用** `fail_threshold`：
 # 那个管的是「连续探测失败几次才触发切换」，捆在一起以后调一个必然误伤另一个。
 ALERT_AFTER_SECONDS = 1800
@@ -384,7 +389,7 @@ class GuardEngine:
         self.manual_probe: dict[int, tuple[float, bool, str]] = {}
 
         # ★ 连续失败的**起点时间戳**（None = 当前没在失败）与**已发过几次告警**。
-        #   只用来决定这条失败该记 warn 还是 error，成功一次就清零。
+        #   只用来决定这条失败该记 warn 还是 error，恢复一次就清零。
         #   内存态即可 —— 重启之后从头计时没有副作用（最多多记一条 warn）。
         #   口径见 `ALERT_AFTER_SECONDS`：满 30 分钟才告警，之前只留一条 warn。
         #
@@ -395,9 +400,18 @@ class GuardEngine:
         #    失败时长」在反复横跳、甚至倒退。现在只有一份状态，告警也就只有一条。
         self.dns_fail_since: float | None = None
         self.dns_alert_count: int = 0
+        # ★ 「站点已经干净了多久」的起点（None = 当前不算干净）。
+        #   ⚠️ **一次干净不足以判恢复** —— 只有连续干净满 `DNS_RECOVER_GRACE_SECONDS`
+        #   才清零。抖动型故障源（打三次挂两次）下，原来的「一轮干净即恢复」会把
+        #   一段持续几小时的故障切成几十条互不相连的 warn，而 30 分钟的告警永远
+        #   攒不满。详见 `settings.DNS_RECOVER_GRACE_SECONDS`。
+        self.dns_ok_since: float | None = None
         # 本轮巡检里撞上传输层失败的隧道（tid -> 失败文案）。每轮清空，
         # 轮末由 `_flush_dns_alerts` 聚合成**一条**事件。
         self.dns_fail_round: dict[int, str] = {}
+        # 本轮**真的问到 CF 了**的次数（每个成功的请求 +1）。用来把「本轮没人失败」
+        # 和「本轮压根没人去问」分开 —— 后者不能当恢复的证据，见 `_flush_dns_alerts`。
+        self.dns_ok_round: int = 0
         # 这一次「连续失败」累计影响到的隧道 —— 只为了在告警文案里报影响面。
         self.dns_fail_tunnels: set[int] = set()
         self.mefrp_fail_since: float | None = None
@@ -2418,6 +2432,12 @@ class GuardEngine:
                 store.update_tunnel(tunnel["id"], {"dns_zone_id": zone_id})
 
             records = await self.cf.list_records(zone_id, name=record_name)
+            # ★ 走到这里说明**真的问到 CF 了** —— 记一次「本轮有成功」。轮末的
+            #   `_flush_dns_alerts` 拿它把「本轮没人失败」和「本轮压根没人去问」
+            #   分开：隧道被判故障时 `_reconcile` 根本不会调 `_sync_dns`（见那里
+            #   的注释），三条隧道同时故障就一个请求都发不出去 —— 那种「没问」
+            #   不能当恢复的证据。
+            self.dns_ok_round += 1
             target = None
             for r in records:
                 if r.record_id == tunnel.get("dns_record_id"):
@@ -2433,8 +2453,8 @@ class GuardEngine:
                     and target.content == host:
                 if not tunnel.get("dns_record_id"):
                     store.update_tunnel(tunnel["id"], {"dns_record_id": target.record_id})
-                # 成功**不用在这里记账** —— 只有失败才会进 `dns_fail_round`，
-                # 轮末 `_flush_dns_alerts` 看到「本轮一条失败都没有」才判为恢复。
+                # 记录已经是对的 → 这一轮就是「干净」的。恢复与否由轮末的
+                # `_flush_dns_alerts` 判（而且要**连续**干净满宽限期才算）。
                 return ""
 
             proxied = bool(tunnel.get("dns_proxied"))
@@ -2483,37 +2503,61 @@ class GuardEngine:
         实际上每条各自都是老实的。用户看到的就是一屏自相矛盾的数字。
 
         聚合之后：一轮最多一条事件，时长只剩一条单调递增的线。
-        口径与 mefrp 完全一致（满 `alert_after_seconds` 才告警，之后每再满一个阈值
-        补一条），区别只是这里把「站点」当成一个整体看。
+        口径与 mefrp 基本一致（满 `alert_after_seconds` 才告警，之后每再满一个阈值
+        补一条），区别有两点：
+          · 这里把「站点」当成一个整体看；
+          · ★ 恢复要**连续干净满 `DNS_RECOVER_GRACE_SECONDS`**，不是「有一轮干净」。
 
         ⚠️ 原来这里是「连续 N 次」的计数，N=3 → 1 分钟就升 error。巡检 20 秒一轮、
-        每轮都顺手同步一次 DNS，于是移动宽带抖两三分钟就能刷出一屏红字。现在改成
-        按时间：只留一条 warn，满 `alert_after_seconds` 才告警。
+        每轮都顺手同步一次 DNS，于是移动宽带抖两三分钟就能刷出一屏红字。后来改成
+        按时间（只留一条 warn，满 `alert_after_seconds` 才告警）—— 但对**抖动型**
+        的故障源还是不够：只要中间偶然通了一轮，状态就被清零、下一轮又从「第一条
+        warn」开始。实测 2026-10-13：CF API 打三次挂两次，四小时刷出 62 条 warn、
+        0 条 error，30 分钟的告警永远攒不满。所以恢复判据加了迟滞，见
+        `settings.DNS_RECOVER_GRACE_SECONDS`。
         """
         failed = self.dns_fail_round
+        ok_round = self.dns_ok_round
         self.dns_fail_round = {}
+        self.dns_ok_round = 0
         now = time.time()
 
         if not failed:
-            # 这一轮一条隧道都没失败 → 站点可达 → 清掉连续失败状态。
-            # ⚠️ 判据是「**所有**配了 DNS 的隧道这轮都成功」，不是「有一条成功」——
-            #    否则一条隧道老是超时、另一条正常，那条超时的永远攒不满 30 分钟。
+            # 「本轮没人失败」有两种，必须分开：
+            #   · 真去问了 CF、并且问通了 → 干净，推进恢复计时；
+            #   · **压根没去问** → 隧道被判故障时 `_reconcile` 不调 `_sync_dns`
+            #     （见那里的注释），三条隧道同时故障就一个请求都发不出去。
+            #     这种「没问」不能当证据 —— 否则隧道长期故障时，DNS 的 episode
+            #     会被悄悄判成「恢复」，等隧道回来再挂又记一条全新的 warn。
+            if not ok_round:
+                self.dns_ok_since = None
+                return
             if self.dns_fail_since is None:
+                # 一直是好的，没什么要清的。顺手把计时归零，免得残留。
+                self.dns_ok_since = None
+                return
+            # ★ 一次干净**不算恢复** —— 抖动型故障源下，那只是「这一次碰巧通了」。
+            if self.dns_ok_since is None:
+                self.dns_ok_since = now
+            if now - self.dns_ok_since < DNS_RECOVER_GRACE_SECONDS:
                 return
             down = now - self.dns_fail_since
             alerted = self.dns_alert_count
             self.dns_fail_since = None
             self.dns_alert_count = 0
+            self.dns_ok_since = None
             self.dns_fail_tunnels.clear()
             # 只有**告过警**的才记恢复 —— 抖一下马上自愈的，前面那条 warn 已经
             # 留过痕了，再记一条 success 纯属噪音。
             if alerted:
                 store.add_event(
                     "success", "dns",
-                    f"DNS 同步已恢复（此前连续失败 {_fmt_span(down)}）",
+                    f"DNS 同步已恢复（此前持续异常 {_fmt_span(down)}）",
                 )
             return
 
+        # 有失败 → 「干净了多久」这个计时作废，从头再来。
+        self.dns_ok_since = None
         self.dns_fail_tunnels |= set(failed)
         # 同一轮里几条隧道撞的多半是同一个原因，取第一条的文案就够。
         msg = next(iter(failed.values()))
@@ -2524,7 +2568,7 @@ class GuardEngine:
             store.add_event(
                 "warn", "dns",
                 f"{msg}（连续失败满 {_fmt_span(alert_after_seconds())} 才告警；"
-                "中途自愈不再记录）",
+                f"恢复需连续正常 {_fmt_span(DNS_RECOVER_GRACE_SECONDS)}）",
             )
             return
 
@@ -2535,7 +2579,7 @@ class GuardEngine:
             n = len(self.dns_fail_tunnels)
             store.add_event(
                 "error", "dns",
-                f"{msg}（已连续失败 {_fmt_span(down)}"
+                f"{msg}（已持续异常 {_fmt_span(down)}"
                 + (f"，共 {n} 条隧道受影响" if n > 1 else "") + "）",
             )
 
