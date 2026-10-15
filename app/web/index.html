@@ -723,13 +723,13 @@ function renderTunnels(list, target){
           //    「换节点」的正确形态就是「重新粘一份新节点的配置」，那本质上
           //    是更新服务端要素，所以这里只留一个入口。
           ? `<button class="act pri" onclick="openManualImport(${t.manual_node_id||0})">更新节点配置</button>`
-          // ⚠️ 没挂接 frpc 容器就**不给**这个入口：切换的落地动作是「改写承载它的
-          //    frpc 配置并重启那个容器」，没有承载者就无从下手 —— 后端也会拒绝
-          //    （见 engine._failover 里那道守卫）。让它可点、点了才报错，比直接
-          //    禁用更糟：用户会以为是程序坏了。
-          : (t.frpc_bound === false
-              ? `<button class="act" disabled title="先挂接一个 frpc 容器 —— 切换要改写它的配置并重启它，没有承载者就没有地方落配置">手动切换</button>`
-              : `<button class="act pri" onclick="failover(${t.id})">手动切换</button>`)}
+          // ⚠️ 没挂接 frpc 容器**照样能切**（1.0.3 改）。切换节点是 mefrp 侧的
+          //    业务 —— 删掉旧节点上的同名 proxy、在新节点建一个 —— 这条隧道在
+          //    mefrp 上一直存在、一直占着节点和端口，跟本地有没有容器无关。
+          //    以前这里禁用，把顺序拧反了：用户往往正需要先落到一个能用的节点上，
+          //    再去挂 frpc。没挂接时后端只做 mefrp 那半截（不写配置、不重启、
+          //    不探测），所以卡片上仍然是这个按钮，只是对话框里会说明这一点。
+          : `<button class="act pri" onclick="failover(${t.id})">手动切换</button>`}
         <button class="act" onclick="bindTunnel(${t.id})">挂接 frpc</button>
         <button class="act" onclick="editTunnel(${t.id})">编辑</button>
         ${t.needs_downstream_review?`<button class="act" onclick="clearReview(${t.id})">下游已处理</button>`:''}
@@ -982,15 +982,9 @@ async function failover(id){
   const t = TUNNELS.find(x=>x.id===id)
         || (OVERVIEW ? OVERVIEW.tunnels.find(x=>x.id===id) : null);
   FO_ID = id;
-  // 没挂接 frpc 容器 → 这个动作根本落不了地（改不了配置、重启不了容器），
-  // 直接挡住，别把用户送到一个「点了必然失败」的对话框里。后端也有同一道守卫。
-  if(t && t.frpc_bound === false){
-    alert('这条隧道还没有挂接 frpc 容器，无法切换节点。\n\n'
-        + '切换要改写承载它的 frpc 配置并重启那个容器 —— 没有承载者就没有地方落配置，'
-        + '节点信息也就无从生效。\n\n'
-        + '请先到「frpc」页新建一个实例，再回来点这张卡片上的「挂接 frpc」。');
-    return;
-  }
+  // ⚠️ 没挂接 frpc 容器也**放行**（1.0.3 改）：切换是 mefrp 侧的业务，跟本地有没有
+  //    容器无关。没挂接时后端只搬 mefrp 上的隧道，不写配置也不重启 —— 对话框
+  //    下面会说明这一点，让用户知道自己买到的是什么。
   // ⚠️ 按这条隧道的类型取对应的节点口径 —— HTTP 组和 TCP/UDP 组的可用性判定
   //    用的是两套偏好，混用会显示一个「按另一套口径算出来」的可用性。
   const ptype = (t && t.proxy_type) || 'tcp';
@@ -1018,16 +1012,15 @@ async function failover(id){
       + (t.frpc_bound
           ? `<br>它由 frpc 容器 <b>${esc(t.frpc_instance_name||'—')}</b> 承载 ——
              切换会重建这个容器的配置并重启它。`
-          : `<br><span style="color:var(--amber)">⚠️ 它还没有挂接 frpc 容器，无法切换。
-            请先到「frpc 实例」页新建一个，再回来点「挂接 frpc」。</span>`)
+          : `<br><span style="color:var(--amber)">⚠️ 它还没有挂接 frpc 容器。</span>
+             切换会照常搬 mefrp 上的隧道（删旧节点上的同名 proxy、在新节点建一个），
+             但<b>本地没有配置要改</b> —— 不写 frpc 配置、不重启容器、也不做端到端
+             探测。等你挂上 frpc 之后，配置会按这个新节点自动生成。`)
     : '';
-  // 兜底：真走到这一步（数据没带上 frpc_bound）也不给提交。
-  $('foOk').disabled = !!(t && t.frpc_bound === false);
   $('foDlg').showModal();
 }
 
 async function doFailover(){
-  if($('foOk').disabled) return;
   const raw = $('fo_node_id').value;
   const nodeId = raw ? parseInt(raw,10) : null;
   $('foDlg').close();
@@ -1037,12 +1030,26 @@ async function doFailover(){
     const grp = (r.group_size > 1)
       ? `\n\n⚠️ 同一个 frpc 实例的 ${r.group_size} 条隧道一起搬了：\n  ${(r.group_tunnels||[]).join('、')}`
       : '';
+    // 对外入口那一行：HTTP 隧道是域名（端口对它是空的），TCP/UDP 是端口。
+    const entryLine = r.is_http
+      ? `域名：${_domainText(r.domain||'')||'（未指定）'}`
+      : `端口：${r.old_port||'—'} → ${r.remote_port}`;
     const frpcLine = r.frpc_instance
       ? `frpc 实例：${r.frpc_instance}\nfrpc 重启：${r.restart_ok?'成功':'失败'}${r.frpc_note?`（${r.frpc_note}）`:''}`
       : 'frpc：未挂接容器，配置未更新';
-    if(r.healthy){
+    if(r.unbound){
+      // ⚠️ **先判 unbound，别拿 healthy 判失败** —— 没挂接 frpc 的隧道永远不会
+      //    上线，healthy 恒为 false，但这次切换本身是成功的（mefrp 上确实搬过去了）。
+      //    走下面那个 else 会告诉用户「没验证通过」，那是拿「本来就没跑起来」当故障。
+      alert(`✅ 已切换节点\n\n新节点：${r.node}（${r.node_hostname||'地址未知'}）\n${entryLine}\n\n`
+        + `frpc：这条隧道还没有挂接容器 —— 本次只搬了 mefrp 上的隧道，`
+        + `本地没有配置要改，也没有做端到端探测。\n`
+        + `挂接 frpc 之后，配置会按这个新节点自动生成。`
+        + grp
+        + (r.port_changed?'\n\n⚠️ 远程端口变了，请检查下游配置（总览页有提示）':''));
+    }else if(r.healthy){
       const probeTxt = r.probe_skipped ? '不适用（UDP 隧道不做 TCP 探测）' : '通过';
-      alert(`✅ 切换成功\n\n新节点：${r.node}（${r.node_hostname||'地址未知'}）\n端口：${r.old_port||'—'} → ${r.remote_port}\n${frpcLine}\n端到端探测：${probeTxt}`
+      alert(`✅ 切换成功\n\n新节点：${r.node}（${r.node_hostname||'地址未知'}）\n${entryLine}\n${frpcLine}\n端到端探测：${probeTxt}`
         + grp
         + (r.port_changed?'\n\n⚠️ 远程端口变了，请检查下游配置（总览页有提示）':''));
     }else{
@@ -1547,7 +1554,9 @@ function renderFrpcList(){
     ? `<div class="note warn" style="margin-top:12px">⚠️ 有 ${unbound.length} 条隧道还没有挂接 frpc 容器，
        它们<b>不会被写进任何 frpc 配置</b>：${unbound.map(t=>`<code>${esc(t.name)}</code>`).join('、')}
        <div style="margin-top:8px">到「隧道」页逐条点「挂接 frpc」指定容器；如果这些隧道本来就已经在某个
-       frpc 配置文件里跑着，可以点「自动发现绑定」按现有配置一次性匹配（这一步会写入显式绑定）。</div></div>`
+       frpc 配置文件里跑着，可以点「自动发现绑定」按现有配置一次性匹配（这一步会写入显式绑定）。</div>
+       <div style="margin-top:8px">ⓘ 没挂接不影响<b>切换节点</b> —— 那是 mefrp 侧的业务（删旧节点上的同名隧道、
+       在新节点重建），隧道页的「手动切换」照样能点，只是不会去动本地配置。</div></div>`
     : '';
 
   if(!list.length){

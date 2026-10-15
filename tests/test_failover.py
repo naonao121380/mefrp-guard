@@ -53,6 +53,9 @@ class FakeMefrp:
                                node_id=5, local_ip="127.0.0.1", local_port=5000,
                                remote_port=41234, is_online=True)]
         self.fail_first_port = False
+        # ★ 新建出来的 proxy 默认「在线」（= 有 frpc 连上来了）。想模拟「没挂接
+        #   frpc、新 proxy 必然离线」的场景，把它置成 False —— 见 [19]。
+        self.created_online = True
     async def node_list(self):
         # hostname 一律空串 = 非管理员视图（真实行为）
         return [
@@ -87,7 +90,8 @@ class FakeMefrp:
         self._proxies = [p for p in self._proxies if p.proxy_name != proxy_name]
         self._proxies.append(Proxy(proxy_id=222, proxy_name=proxy_name, proxy_type=proxy_type,
                                    node_id=node_id, local_ip=local_ip, local_port=local_port,
-                                   remote_port=remote_port or 41234, is_online=True))
+                                   remote_port=remote_port or 41234,
+                                   is_online=self.created_online))
     async def proxy_delete(self, pid): self.deleted.append(pid)
     async def proxy_config(self, pid, fmt="toml"):
         # ★ 故意用 TOML **单引号字面量** —— mefrp 官方生成的配置就是这个风格，
@@ -384,6 +388,86 @@ check("probe_mode=http -> http 隧道走 HTTP 探测",
       E.probe_plan("http", "http")[0] == "http")
 store.set_setting("probe_mode", "auto")
 PROBE["ok"] = True; PROBE["why"] = ""
+
+print("[19] ★★ 未挂接 frpc 的隧道也能切换节点（1.0.3）")
+# 背景：以前「没挂接 frpc 容器」直接被拒（前端按钮变灰、后端也拦）。理由写的是
+# 「切换要改写承载它的 frpc 配置并重启容器，没有承载者就无从下手」—— 但那是把
+# 本地那半截当成了全部。切换节点本质是 **mefrp 侧的业务**：删掉旧节点上的同名
+# proxy、在新节点建一个。这条隧道在 mefrp 上一直存在、一直占着节点和端口，跟本地
+# 有没有容器毫无关系；而且用户想换节点的场景里，「先挂一个 frpc 容器」本身往往
+# 正是他接下来要做的事 —— 他需要先落到一个能用的节点上。
+#
+# 现在：me frp 那半截照做，本地那半截（写配置 / 重启容器 / 等上线 / 端到端探测）
+# 如实跳过，并且**不能因此判成失败**。
+un_id = store.create_tunnel({
+    "name": "未挂接的隧道", "proxy_name": "unbound-demo", "proxy_type": "tcp",
+    "local_ip": "127.0.0.1", "local_port": 6000, "desired_remote_port": 41300,
+    "enabled": 1, "auto_failover": 1, "dns_proxied": 0,
+    "dns_record_name": "unbound.example.com",
+    "current_proxy_id": 555, "current_node_id": 5, "current_remote_port": 41300,
+})
+# 没有 frpc 去连 frps → 新建出来的 proxy 必然是离线的。桩要还原这一点，
+# 否则「跳过上线等待」这个分支测不出来（proxy 永远在线，怎么都算成功）。
+fake.created_online = False
+fake.created.clear(); fake.attempts.clear(); fake.deleted.clear()
+cf.upserts.clear(); nf.sent.clear()
+eng.node_cooldown = {}; eng.dns_checked.clear()
+_restarts_before = dk.restarts
+_cfg_before = pathlib.Path(cfg).read_text(encoding="utf-8")
+
+_un = asyncio.run(eng._failover(store.get_tunnel(un_id), "手动触发（未挂接 frpc）",
+                                prefer_node_id=9, ignore_cooldown=True))
+
+check("★ 不再被「没挂接 frpc」挡住，切换真的走完了", _un.get("ok") is True, _un)
+check("结果里带了 unbound 标记（前端靠它区分文案）", _un.get("unbound") is True, _un)
+check("★ 没挂接时 healthy 恒为 False（确实没有任何东西在跑）",
+      _un.get("healthy") is False, _un.get("healthy"))
+check("★ 但没把它当失败：probe_ok 是 None（不适用）而不是 False",
+      _un.get("probe_ok") is None, _un.get("probe_ok"))
+check("★ 跳过上线等待（新 proxy 离线，也不去白等 45 秒）",
+      _un.get("online") is False, _un.get("online"))
+check("mefrp 上真的搬了：新节点建了同名 proxy",
+      any(c[1] == "unbound-demo" for c in fake.created), fake.created)
+check("旧节点上的 proxy 555 被删掉", 555 in fake.deleted, fake.deleted)
+check("新节点已落库", store.get_tunnel(un_id)["current_node_id"] == 9,
+      store.get_tunnel(un_id)["current_node_id"])
+check("新 proxyId 已落库", store.get_tunnel(un_id)["current_proxy_id"] == 222,
+      store.get_tunnel(un_id)["current_proxy_id"])
+check("★ 没写 frpc 配置（没有承载者，一个字都不该动）",
+      pathlib.Path(cfg).read_text(encoding="utf-8") == _cfg_before)
+check("★ 没重启容器", dk.restarts == _restarts_before, (dk.restarts, _restarts_before))
+check("★ DNS 仍然同步到新节点地址（域名不能一直指着老节点）",
+      bool(cf.upserts) and cf.upserts[0]["content"] == "10.0.0.9", cf.upserts)
+_un_evs = store.list_events(tunnel_id=un_id)
+check("★ 事件级别是 success，不是 error",
+      any(e["level"] == "success" and e["kind"] == "failover" for e in _un_evs),
+      [(e["level"], e["kind"]) for e in _un_evs])
+check("★ 通知里不出现「frpc 重启：失败」这种误导文案",
+      bool(nf.sent) and "frpc 重启：失败" not in nf.sent[0][2],
+      (nf.sent[0][2][:400] if nf.sent else None))
+check("★ 通知里说清「只搬了 mefrp 上的隧道」",
+      bool(nf.sent) and "只搬了 mefrp 上的隧道" in nf.sent[0][2],
+      (nf.sent[0][2][:400] if nf.sent else None))
+
+# 反过来：**自动**切换仍然挡住未挂接的隧道 —— 没有 frpc 时探测必然一直失败，
+# 放行只会让它在节点之间来回搬（每过一个冷却期一次），永远搬不好。
+eng.nodes = {n.node_id: n for n in asyncio.run(fake.node_list())}
+asyncio.run(eng._refresh_remote())          # 让 eng.proxies 里出现刚建的那条
+store.update_tunnel(un_id, {"fail_streak": 0})
+fake.created.clear(); fake.attempts.clear(); fake.deleted.clear()
+store.set_setting("fail_threshold", 1)
+store.set_setting("auto_failover", True)
+eng.probe_cache.clear()
+PROBE["ok"] = False; PROBE["why"] = "没有 frpc 连上来"
+asyncio.run(eng._reconcile(store.get_tunnel(un_id)))
+check("★ 自动路径仍然不搬未挂接的隧道（避免无限来回切换）",
+      fake.created == [], fake.created)
+check("★ 但事件里明确告诉用户「手动切换」是可用的",
+      any("手动切换" in (e["detail"] or "")
+          for e in store.list_events(tunnel_id=un_id)),
+      [e["message"] for e in store.list_events(tunnel_id=un_id)][:3])
+PROBE["ok"] = True; PROBE["why"] = ""
+fake.created_online = True
 
 print(f"\n==> PASS {ok} / FAIL {bad}")
 sys.exit(1 if bad else 0)

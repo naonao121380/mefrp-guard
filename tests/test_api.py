@@ -81,24 +81,33 @@ with TestClient(app) as c:
     r = c.post(f"/api/tunnels/{tid}/probe", headers=AUTH)
     check("探测无隧道 -> 404", r.status_code == 404, r.status_code)
     r = c.post(f"/api/tunnels/{tid}/failover", headers=AUTH, json={"node_id":None})
-    # 此刻还没有任何 frpc 实例，这条隧道也没挂接 —— 切换必须先被这一层拦住，
-    # 并且说清原因。不能静默返回 200 骗用户说「已触发切换」。
-    check("★ 未挂接容器的隧道：切换被拒且说明原因",
-          r.status_code == 400 and "挂接" in r.text, r.text[:200])
+    # ★ 未挂接 frpc 的隧道**不再被「先挂接容器」挡住**（1.0.3 改）—— 切换节点是
+    #   mefrp 侧的业务（删旧节点上的同名 proxy、在新节点重建），跟本地有没有容器
+    #   无关。这个测试环境没配 mefrp token，所以会卡在更前面那一步，但报的必须是
+    #   **真实原因**，不能再拿「还没有挂接 frpc 容器」搪塞。
+    #   （未挂接隧道切换成功的完整链路在 `test_failover.py` 的 [19] 里跑真流程。）
+    check("★ 未挂接容器的隧道：不再因「没挂接 frpc」被拒",
+          "挂接 frpc 容器" not in r.text, r.text[:200])
+    check("★ 报的是真实原因（没配 mefrp Token），不是拿挂接搪塞",
+          r.status_code == 400 and "Token" in r.text, r.text[:200])
     r = c.post(f"/api/tunnels/{tid}/failover", headers=AUTH, json={"node_id":12345})
     check("切换（指定不存在的节点）-> 400", r.status_code == 400, r.text[:200])
 
-    # ★ 前端也必须拦（后端拒绝只是最后一道）：未挂接 frpc 的隧道，卡片上那个
-    #   「手动切换」不能是个能点的活按钮。让用户点进一个「点了必然失败」的
-    #   对话框，他只会以为是程序坏了 —— 而切换的语义（改写承载它的 frpc 配置
-    #   并重启那个容器）在没有承载者时根本无从落地。
+    # ★ 前端也必须放行（1.0.3 改）：未挂接 frpc 的隧道同样能点「手动切换」。
+    #   以前这里把按钮禁掉，等于把顺序拧反了 —— 用户想换节点的场景里「先挂一个
+    #   frpc 容器」本身就是他接下来要做的事，而挂之前他往往正需要先落到一个能用
+    #   的节点上。没挂接时后端只做 mefrp 那半截（不写配置、不重启、不探测），
+    #   对话框里会说明这一点。
     _html = (pathlib.Path(__file__).resolve().parent.parent
              / "app" / "web" / "index.html").read_text(encoding="utf-8")
-    check("★ 前端：未挂接 frpc 的隧道不给「手动切换」活按钮",
-          "t.frpc_bound === false" in _html, "index.html 里找不到 frpc_bound 守卫")
-    check("★ 前端：切换对话框的「确认」按钮也会被禁用",
-          'id="foOk"' in _html and "$('foOk').disabled" in _html,
-          "index.html 里找不到 foOk 守卫")
+    check("★ 前端：未挂接 frpc 的隧道也给「手动切换」活按钮（不再禁用）",
+          "t.frpc_bound === false" not in _html,
+          "index.html 里还留着 frpc_bound 守卫（会把按钮变灰）")
+    check("★ 前端：切换对话框的「确认」按钮不再被禁用",
+          'id="foOk"' in _html and "$('foOk').disabled" not in _html,
+          "index.html 里还留着 foOk 禁用逻辑")
+    check("★ 前端：切换结果先判 unbound（不能拿 healthy 判成失败）",
+          "r.unbound" in _html, "index.html 里找不到 unbound 分支")
 
     print("[4] 未纳管隧道 / 节点")
     r = c.get("/api/orphans", headers=AUTH)

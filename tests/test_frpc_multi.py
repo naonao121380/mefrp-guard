@@ -452,7 +452,7 @@ check("回滚时没有重启任何容器", dk_a.restarts == 1 and dk_b.restarts 
 fake.fail_on_node = set()
 
 # ================================================================ [11] 未绑定
-print("[11] 未挂接容器的隧道：不写配置 + 明确告警 + 拒绝切换")
+print("[11] 未挂接容器的隧道：不写配置 + 明确告警 + 照样能切换")
 eng.docker = None
 res4 = asyncio.run(eng._rebuild_and_restart(store.get_tunnel(tX)))
 check("如实返回「跳过了」", res4.get("skipped") is True, res4)
@@ -462,15 +462,33 @@ check("写了告警事件",
       any(e["kind"] == "frpc" and e["level"] == "warn" and "没有挂接" in e["message"]
           for e in evs),
       [(e["level"], e["kind"], e["message"][:40]) for e in evs[:8]])
-# 没挂接也不能切换：换了节点本地没人接，比不切更糟（用户会以为自愈成功了）
+# ★ 未挂接 frpc 的隧道**也能切换**（1.0.3 改）。以前这里断言「拒绝切换」，理由写的
+#   是「换了节点本地没人接，比不切更糟」—— 那是把本地那半截当成了全部。切换节点本质
+#   是 mefrp 侧的业务（删掉旧节点上的同名 proxy、在新节点建一个），隧道在 mefrp 上
+#   一直存在、一直占着节点和端口，跟本地有没有容器无关。
+#   没挂接时只做 mefrp 那半截 —— 不写配置、不重启、不探测，而且**不能因此判失败**
+#   （没有 frpc 时「隧道没上线」是必然结果）。
+_x_pid = fake.add("nobody-panel", 5, 41234, local_port=7000)
+store.update_tunnel(tX, {"current_proxy_id": _x_pid, "current_node_id": 5,
+                         "current_remote_port": 41234})
 fake.created.clear(); fake.deleted.clear()
+_restarts_before = dk_a.restarts + dk_b.restarts
 res4b = asyncio.run(eng._failover(store.get_tunnel(tX), "测试未挂接",
                                   ignore_cooldown=True))
-check("★ 未挂接 -> 拒绝切换", res4b.get("ok") is False, res4b)
-check("★ 拒绝理由讲清要挂接", "挂接" in (res4b.get("error") or ""),
-      res4b.get("error"))
-check("★ 拒绝时没在 mefrp 上动过任何 proxy",
-      not fake.created and not fake.deleted, (fake.created, fake.deleted))
+check("★ 未挂接 -> 照样切换（不再被拒）", res4b.get("ok") is True, res4b)
+check("★ 结果里标了 unbound（前端靠它区分文案）",
+      res4b.get("unbound") is True, res4b.get("unbound"))
+check("★ healthy 恒为 False（确实没东西在跑），但没被当成失败：probe_ok=None",
+      res4b.get("healthy") is False and res4b.get("probe_ok") is None, res4b)
+check("★ mefrp 上真的动了：先删旧、再建新",
+      bool(fake.created) and _x_pid in fake.deleted, (fake.created, fake.deleted))
+check("★ 没重启任何容器（没有承载者，也没写配置）",
+      dk_a.restarts + dk_b.restarts == _restarts_before,
+      (dk_a.restarts, dk_b.restarts, _restarts_before))
+check("★ 事件级别是 success，不是 error",
+      any(e["level"] == "success" and e["kind"] == "failover"
+          for e in store.list_events(tunnel_id=tX)),
+      [(e["level"], e["kind"]) for e in store.list_events(tunnel_id=tX)])
 
 print("[12] 空实例重建 -> 报错而不是写空配置")
 # 把 tB1/tD 解绑，让 B 变成空实例；同时记下 B 的文件内容

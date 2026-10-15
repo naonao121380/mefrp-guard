@@ -1112,17 +1112,30 @@ class GuardEngine:
             return
 
         if self.frpc_for_tunnel(tunnel) is None:
-            # 未挂接 frpc 容器的隧道不能自动切换（换节点要改配置、重启容器）。
+            # ★ **手动**切换已经支持未挂接 frpc 的隧道了（见 `_failover` 的
+            #   `unbound`），但**自动**这条路仍然挡住 —— 理由和以前不一样了：
+            #
+            #   没有 frpc 去连 frps，这条隧道的探测就**必然**一直失败。自动切换
+            #   一旦放行，它会每过一个冷却期就搬一次、搬完照样不通、再搬……永远
+            #   在节点之间来回滚，既解决不了问题（问题不在节点上），又会把
+            #   mefrp 上的 proxy 反复删了重建。这种「看起来在自愈」比不动作更糟。
+            #
+            #   要换节点请到隧道卡片上点「手动切换」—— 那是用户明确表达意图，
+            #   而且换完之后他马上就会去挂 frpc。
+            #
             # ⚠️ 只在「刚跨过阈值」那一次记事件 —— 否则 streak 会一直保持在高位，
             # 每个 tick 都记一条，20 秒一条很快把日志刷满，真正的问题反而被淹没。
             if streak == threshold:
                 store.add_event(
                     "error", "failover",
                     f"隧道「{tunnel['name']}」连续 {streak} 次异常，但它还没有挂接 "
-                    "frpc 容器，无法自动切换",
+                    "frpc 容器，不做自动切换",
                     tunnel_id=tid,
-                    detail="到「frpc 实例」页为它挂接一个 frpc 容器"
-                           "（配置文件路径 + 容器名）。",
+                    detail="没有 frpc 去连 frps，这条隧道的探测必然一直失败 —— "
+                           "自动切换只会让它在节点之间来回搬，解决不了问题。\n"
+                           "要换节点请点这张卡片上的「手动切换」（已支持未挂接时"
+                           "切换，只搬 mefrp 上的隧道）；或者到「frpc 实例」页"
+                           "为它挂接一个 frpc 容器（配置文件路径 + 容器名）。",
                 )
             return
 
@@ -1579,8 +1592,9 @@ class GuardEngine:
                         ignore_cooldown: bool = False) -> dict:
         """执行一次故障转移。
 
-        ⚠️ 前提：这条隧道**已经挂接了一个 frpc 容器**。没挂接就直接拒绝 ——
-        换节点要改本地配置并重启容器，没有归属就无从下手（见下面的守卫）。
+        ★ **不要求这条隧道挂接了 frpc 容器**（1.0.3 改）。切换节点是 mefrp 侧的
+        业务，跟本地有没有容器无关 —— 详见下面 `unbound` 那段的说明。没挂接时
+        只做 mefrp 那半截（搬 proxy + 落库 + 同步 DNS），本地配置/重启/探测全跳过。
 
         模型是「一条隧道 : 一个 frpc 容器」，所以正常情况下这里只搬一条。
         但切换仍然按 `frpc_group` 的**整组**语义走：一个 frpc 进程只能连一个
@@ -1626,24 +1640,26 @@ class GuardEngine:
             )
             return {"ok": False, "error": f"仍在冷却期，还需等待 {left} 秒"}
 
-        # 没有挂接 frpc 容器 → 拒绝切换。
-        # 换节点要改本地 frpc 配置、重启它的容器，没有归属就无从下手。如果在这里
-        # 硬搬 mefrp 上的 proxy，结果是「proxy 换了节点、本地却没人接」—— 比不切换
-        # 更糟，因为用户会以为自愈成功了。所以如实拒绝，让他去挂接。
+        # ★ 没挂接 frpc 容器**照样允许切换**（1.0.3 改）。
+        #
+        # 切换节点本质是 **mefrp 侧的业务**：删掉旧节点上的同名 proxy、在新节点建
+        # 一个。这条隧道在 mefrp 上一直存在、一直占着一个节点和一个远程端口，跟
+        # 本地有没有 frpc 容器**毫无关系** —— 节点挂了它一样要搬。
+        #
+        # 以前这里直接拒绝，把顺序拧反了：用户想换节点的场景里「先挂一个 frpc
+        # 容器」本身就是他接下来要做的事，而挂之前他往往正需要先落到一个能用的
+        # 节点上（否则挂完才发现节点不通，白折腾一轮）。
+        #
+        # 少做的只有**本地**那半截：不写 frpc 配置、不重启容器、不等上线、不做
+        # 端到端探测 —— 没有承载者，这四件事本来就无从谈起。下面用 `unbound` 把
+        # 这些分支和「失败」区分开：没有 frpc 时「隧道没上线」是**必然**结果，
+        # 不是故障，不能拿它判这次切换失败。
         instance = self.frpc_for_tunnel(tunnel)
-        if instance is None:
-            store.add_event(
-                "error", "failover",
-                f"隧道「{tunnel['name']}」需要切换，但它还没有挂接 frpc 容器，无法切换",
-                tunnel_id=tid,
-                detail="到「frpc 实例」页为它挂接一个 frpc 容器（配置文件路径 + 容器名）。",
-            )
-            return {"ok": False,
-                    "error": "这条隧道还没有挂接 frpc 容器，无法切换 —— "
-                             "请先到「frpc 实例」页为它挂接一个容器"}
+        unbound = instance is None
 
         # 解析要一起搬走的整组隧道。正常模型（一隧道一容器）下就是它自己，
-        # 见 frpc_group 里关于「安全网」的说明。
+        # 见 frpc_group 里关于「安全网」的说明。未挂接时 frpc_group 本来就退化
+        # 成单条 —— 没有实例，也就无所谓「同实例的其它隧道」。
         group = self.frpc_group(tunnel, instance)
         others = [t for t in group if int(t["id"]) != tid]
 
@@ -1814,11 +1830,13 @@ class GuardEngine:
         )
 
         # ---- 重建配置 + 重启（整组只做一次）----
+        # ★ 没挂接 frpc 时这一步没有承载者，`_rebuild_and_restart` 会自己返回
+        #   `skipped=True`（它本来就处理了这个情况）。所以这里不用特判，只是下面
+        #   别再把它当成「重启失败」报给用户。
         rr = await self._rebuild_and_restart(store.get_tunnel(tid) or tunnel)
         restart_ok = bool(rr.get("restart_ok"))
 
         # ---- 等触发的那条隧道上线，再做端到端验证 ----
-        online = await self._await_online(tunnel["proxy_name"], timeout=45)
         node_addr = await self.node_address(node.node_id)
         cur_t = store.get_tunnel(tid) or tunnel
         new_port = cur_t["current_remote_port"]
@@ -1835,31 +1853,48 @@ class GuardEngine:
         pkind, skip_why = probe_plan(tunnel.get("proxy_type", "tcp"), mode)
         probe_ok: bool | None = False
         probe_why = "未验证"
-        if pkind == PROBE_NONE:
-            probe_ok, probe_why = None, skip_why
-        elif not online:
-            probe_why = "隧道尚未上线，跳过端到端验证"
-        elif pkind == PROBE_HTTP:
-            url = http_probe_url(tunnel.get("proxy_type", "tcp"), new_domain,
-                                 str(store.get_setting("http_probe_path", "/") or "/"))
-            if not url:
-                probe_ok, probe_why = None, "这条 HTTP 隧道没有绑定域名，无法做 HTTP 探测"
-            else:
-                probe_ok, probe_why = await http_probe(url)
-        elif not node_addr:
-            probe_why = f"拿不到节点「{node.name}」的公网地址，无法验证"
+        if unbound:
+            # ★ 没挂接 frpc 的隧道：**不等上线、不探测**。
+            #   没有 frpc 去连 frps，proxy 就一定是离线的 —— 等 45 秒是白等，
+            #   探测也必然失败。那不是「故障」，是「本来就没跑起来」。
+            #   把 probe_ok 置成 None（= 不适用）而不是 False（= 未通过），
+            #   下面才会把它归到「不适用」那一类，而不是判成切换失败。
+            online = False
+            probe_ok = None
+            probe_why = "这条隧道还没有挂接 frpc 容器，没有承载者 —— 跳过上线等待与端到端验证"
         else:
-            probe_ok, probe_why = await tcp_probe(
-                node_addr, new_port,
-                float(store.get_setting("probe_timeout", 4) or 4),
-            )
+            online = await self._await_online(tunnel["proxy_name"], timeout=45)
+            if pkind == PROBE_NONE:
+                probe_ok, probe_why = None, skip_why
+            elif not online:
+                probe_why = "隧道尚未上线，跳过端到端验证"
+            elif pkind == PROBE_HTTP:
+                url = http_probe_url(tunnel.get("proxy_type", "tcp"), new_domain,
+                                     str(store.get_setting("http_probe_path", "/") or "/"))
+                if not url:
+                    probe_ok, probe_why = None, "这条 HTTP 隧道没有绑定域名，无法做 HTTP 探测"
+                else:
+                    probe_ok, probe_why = await http_probe(url)
+            elif not node_addr:
+                probe_why = f"拿不到节点「{node.name}」的公网地址，无法验证"
+            else:
+                probe_ok, probe_why = await tcp_probe(
+                    node_addr, new_port,
+                    float(store.get_setting("probe_timeout", 4) or 4),
+                )
 
         # 更新 DNS：探测通过、或该协议本就不适用探测（None）时都该同步。
         # 只有明确的 False 才代表「地址真的不对」，那才不该写 DNS。
         # ⚠️ 要同步**整组**：它们的地址跟着节点一起变了，只改触发的那条会让其余
         #    几条的 DNS 悄悄指向旧节点，变成「配置看着正常但访问打不开」。
+        #
+        # ★ `or unbound`：没挂接 frpc 的隧道**同样要同步** —— DNS 记录指向的是
+        #   **节点地址**，节点换了不更新的话，域名会一直指着一个已经不再承载它的
+        #   老节点；等用户回头挂上 frpc，域名还是打不开，而那时早就没人记得是
+        #   这次切换漏掉的。判据里 `probe_ok is not False` 对 unbound 恒成立
+        #   （上面把它置成了 None），所以只需要补上「没人上线」这一条。
         dns_msgs: list[str] = []
-        if online and probe_ok is not False:
+        if (online or unbound) and probe_ok is not False:
             for r in moved:
                 mtid = int(r["tunnel"]["id"])
                 cur = store.get_tunnel(mtid) or r["tunnel"]
@@ -1911,13 +1946,23 @@ class GuardEngine:
         ]
         if len(moved) > 1:
             lines.append(f"连带切换：同实例另外 {len(moved) - 1} 条隧道一起搬走")
-        lines += [
-            f"frpc 实例：{rr.get('instance') or '未绑定'}",
-            f"frpc 重启：{'成功' if restart_ok else '失败，请检查'}"
-            + (f"（{rr['note']}）" if rr.get("note") else ""),
-            f"隧道上线：{'是' if online else '否'}",
-            f"端到端探测：{probe_line}",
-        ]
+        if unbound:
+            # ★ 没挂接 frpc：本地那半截**什么都没做**，而且要明确说清是「没做」
+            #   而不是「做了但失败了」。原来那句「frpc 重启：失败，请检查」正是
+            #   这么误导人的 —— `_rebuild_and_restart` 返回的 restart_ok 是 False，
+            #   但那只是「没有承载者、跳过」，不是重启出错了。
+            lines.append("frpc：这条隧道还没有挂接 frpc 容器 —— "
+                         "本次只搬了 mefrp 上的隧道，本地没有配置要改。"
+                         "挂接之后配置会按这个新节点自动生成")
+            lines.append("隧道上线：无从判断（没有 frpc 去连 frps）")
+        else:
+            lines += [
+                f"frpc 实例：{rr.get('instance') or '未绑定'}",
+                f"frpc 重启：{'成功' if restart_ok else '失败，请检查'}"
+                + (f"（{rr['note']}）" if rr.get("note") else ""),
+                f"隧道上线：{'是' if online else '否'}",
+            ]
+        lines.append(f"端到端探测：{probe_line}")
         if dns_msgs:
             lines.append("DNS：" + "；".join(dns_msgs))
         if changed_names:
@@ -1928,7 +1973,12 @@ class GuardEngine:
             if note:
                 lines.append(f"备忘：{note}")
 
-        level = "success" if (online and probe_ok is not False) else "error"
+        # ★ 这次切换**动作本身**算不算成功。
+        #   没挂接 frpc 的隧道只有一条判据：mefrp 上确实搬过去了（走到这里就是）。
+        #   拿「隧道上线」当判据会把它**永远判成失败** —— 没有 frpc 它就不该上线，
+        #   那不是切换的锅。
+        switch_ok = bool(online or unbound)
+        level = "success" if (switch_ok and probe_ok is not False) else "error"
         store.add_event(
             level, "failover",
             f"隧道「{tunnel['name']}」已切换到「{node.name}」"
@@ -1944,15 +1994,20 @@ class GuardEngine:
         # 两者分开报，前端才能给出准确的提示（比如「已切到新节点，但探测没通过」）。
         # probe_ok 为 None（协议不适用探测）时，只要隧道上线就算 healthy ——
         # 不能因为「没探测」就判成不健康，那是拿工具的局限去惩罚用户。
+        # ⚠️ 没挂接 frpc 时 healthy 恒为 False，但 ok 为 True —— 前端**先看
+        #    `unbound`**，别拿 healthy 去判「切换失败了」。
         return {
-            "ok": bool(online),
+            "ok": switch_ok,
             "healthy": bool(online and probe_ok is not False),
+            "unbound": unbound,
             "node": node.name,
             "node_id": node.node_id,
             "node_hostname": node_addr,
             "old_port": old_port,
             "remote_port": new_port,
             "port_changed": port_changed,
+            "is_http": http_like,
+            "domain": new_domain,
             "restart_ok": restart_ok,
             "frpc_instance": rr.get("instance"),
             "frpc_instance_id": rr.get("instance_id"),
@@ -1964,7 +2019,7 @@ class GuardEngine:
             "probe_ok": probe_ok,
             "probe_skipped": probe_ok is None,
             "probe_reason": probe_why,
-            "error": "" if online else (probe_why or "隧道未能上线"),
+            "error": "" if switch_ok else (probe_why or "隧道未能上线"),
             "detail": "\n".join(lines),
         }
 
@@ -2703,6 +2758,15 @@ class GuardEngine:
 
         if self.client is None:
             self.reload_clients()
+        # ★ 切换节点**完全靠 mefrp 的接口**（删旧 proxy + 建新 proxy），没配 token
+        #   就一步都走不了。不拦的话会一路走到 `pick_node`，报出「没有满足条件的
+        #   节点（共 0 个：节点列表为空）」—— 那句话会把用户引到「是不是我的带宽 /
+        #   区域阈值调太严了」上，而真正的原因是他根本没填 token。
+        if not str(store.get_settings().get("mefrp_token") or "").strip():
+            return {"ok": False,
+                    "error": "尚未配置 mefrp API Token，无法切换节点 —— "
+                             "切换要调 mefrp 的接口（删掉旧节点上的同名隧道、"
+                             "在新节点重建），请先到「设置」页填上 Token"}
 
         if node_id is not None:
             node = self.nodes.get(int(node_id))

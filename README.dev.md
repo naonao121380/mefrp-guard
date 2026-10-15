@@ -94,9 +94,13 @@ WireGuard 的握手包）。那属于业务侧的事，不是这个工具该做�
 
 每一步都会写进事件日志。任一步失败都会明确告诉你失败在哪，不会静默吞掉。
 
-⚠️ **没挂接容器的隧道不会切换**：换节点要改本地配置、重启容器，没有归属就无从下手；
-硬搬 mefrp 上的 proxy 只会变成「proxy 换了节点、本地没人接」，比不切换更糟。
-接口会返回 400 并说明原因。
+⚠️ **没挂接容器的隧道也能切换**（1.0.3 改）：切换是 mefrp 侧的业务 —— 删掉旧节点上的
+同名 proxy、在新节点建一个，跟本地有没有容器无关。没挂接时只做 mefrp 那半截（删旧建新、
+落库、同步 DNS），本地那半截如实跳过（不写配置、不重启、不等上线、不探测），并且
+**不因此判成失败**（返回值 `unbound=true` / `ok=true` / `healthy=false` / `probe_ok=null`，
+事件记 success）。
+⚠️ 但**自动**切换仍然挡住它：没有 frpc 时探测必然一直失败，放行只会让它在节点之间来回搬、
+永远搬不好。要换节点请点卡片上的「手动切换」。
 
 ⚠️ **为什么必须先删旧、再建新**：mefrp 上 `proxyName` 在账号内唯一，**同名隧道不能共存**，
 先建会直接撞名失败。代价是这条隧道在中间那几步会**短暂完全不可用** —— 它本来就已经是坏的，
@@ -578,9 +582,9 @@ PY=<python> PORT=18080 ./run_local.sh
 
 其它容器**完全不受影响**（配置不重写、容器不重启、DNS 不动）。
 
-**没挂接的隧道不会切换。** 换节点要改本地配置、重启容器，没有归属就无从下手；
-硬搬 mefrp 上的 proxy 只会变成「proxy 换了节点、本地没人接」，比不切换更糟。
-这种情况接口返回 400 并说明原因。
+**没挂接的隧道也能切换**（1.0.3 改）。切换是 mefrp 侧的业务，跟本地有没有容器无关 ——
+没挂接时上面第 1 步（搬 proxy）和第 5 步里的 DNS 照做，第 2~4 步如实跳过，而且**不因此
+判成失败**。详见本节末「未挂接的隧道」。
 
 > 为什么内部还是按「一组」处理：万一你把两条隧道挂到了同一个容器上（UI 不拦，
 > 排查问题时确实可能临时这么干），只搬一条会让合并配置时 `serverAddr` 不一致 → 直接报错 →
@@ -594,7 +598,12 @@ PY=<python> PORT=18080 ./run_local.sh
 - 「frpc 实例」页顶部的黄色横幅
 - 事件日志（`warn` 级）
 
-连续失败达到阈值时还会额外记一条 `error`，说明它因为没挂接所以无法自动切换。
+连续失败达到阈值时还会额外记一条 `error`，说明它因为没挂接所以**不做自动切换**，并提示
+「手动切换」是可用的。
+
+> ★ 1.0.3 之前这里还拦住了**手动**切换（前后端一起拦），理由写的是「换节点要改本地配置、
+> 重启容器，没有归属就无从下手」—— 那是把本地那半截当成了全部。现在手动切换放行：只做
+> mefrp 那半截，本地那半截跳过且不判失败。见 `engine._failover` 的 `unbound`。
 
 ## Token 获取
 
@@ -643,7 +652,7 @@ mefrp-guard/
 │       └── favicon.ico 老浏览器 / Safari / webview 的回落图标（`/favicon.ico`）
 ├── tests/              十一个测试文件（鉴权 / 纯逻辑 / CF 客户端 / 外部节点逻辑 / API /
 │                       外部节点 API / 标签 / 作用域 / 故障转移 / HTTP 隧道 / 多容器挂接），
-│                       共 1154 条断言
+│                       共 1176 条断言
 ├── run_local.sh        本地试跑脚本（不依赖 Docker，用沙箱 frpc 配置）
 ├── Dockerfile
 ├── docker-compose.yml
@@ -1026,7 +1035,7 @@ PYTHONPATH=$PWD/.devdeps PY=$PY ./tests/run_all.sh
 > ⚠️ `run_all.sh` **自己不设 `PYTHONPATH`** —— 不带上的话会在第一个需要依赖的文件上
 > 报 `No module named 'fastapi'`。
 
-十一个文件，共 **1154 条断言**（59 + 149 + 22 + 177 + 205 + 183 + 30 + 47 + 75 + 114 + 93）：
+十一个文件，共 **1176 条断言**（59 + 149 + 22 + 177 + 207 + 183 + 30 + 47 + 92 + 114 + 96）：
 
 | 文件 | 覆盖 | 需要第三方库 |
 |---|---|---|
@@ -1034,13 +1043,13 @@ PYTHONPATH=$PWD/.devdeps PY=$PY ./tests/run_all.sh
 | `tests/test_logic.py` | frpc TOML 合并与跨节点校验、**单引号字面量解析**、配置备份/恢复/路径穿越、SQLite 持久化与字段白名单、Node/Proxy 字段解析、`pick_node` 择优调度、**节点偏好的有序语义与归一化**、**`probe_plan` 探测适用性（四种模式 × 四种隧道类型，含「http 在 auto 下是假阳性」）** | 否 |
 | `tests/test_cfclient.py` | **Cloudflare 客户端的 httpx 交互**：传输层退避重试、重试耗尽后 `transient=True` 与异常类型名、非传输层错误不重试、**连接池复用（3 个请求只建 1 个）与跨事件循环重建**、`upsert(existing=…)` 省掉两次自查、没配 token 一个请求都不发 | httpx |
 | `tests/test_manual_node.py` | **frpc 配置解析（TOML / INI）、`patch_server` 文本级改写的保真与合法性、外部节点数据层 CRUD、1.0.0 老库补列迁移、引擎对外部隧道的分支（含「不适用探测」的三态、UDP 的 DNS 同步）、★ **mefrp 拉取失败与 DNS 同步失败「满 `alert_after_seconds` 才告警」的完整口径**（一条 warn → 静默 → 满阈值 error → 每再满一个阈值补报 → 恢复 success / 短抖不记 / force 与静态问题立刻报）、★ **DNS 告警按站点聚合**（一轮 N 条隧道失败只报一条、告警报出影响面）、★ **恢复的迟滞**（一次干净不算恢复、要连续干净满 `DNS_RECOVER_GRACE_SECONDS`；「本轮没发 CF 请求」不算干净；抖动 6 个来回复现「4 小时 62 条 warn」的 bug 且一条新告警都不记）、★ **DNS 核对节流**（地址没变就不重复打 CF；地址一变立刻同步不等间隔；填 0 退回每轮核对；失败也推进下次核对时间但保留上次的 host；★ **节流与迟滞的交互** —— 被跳过的轮次不清零干净计时，恢复仍判得出来）、★ **橙云开关（`dns_proxied`）也是「记录该长什么样」的一部分**（三者全对才不写 CF；补勾/取消橙云都必须真的落一次；开关一变节流不拦）** | 否 |
-| `tests/test_api.py` | FastAPI 全端点：**登录页/会话 Cookie/登出作废/改密码/CSRF/防爆破/只读设置保护**、★ **Cookie 与 Basic 的优先级（有效 Cookie + 失效 Basic 仍算已登录；无有效 Cookie 时正确 Basic 走脚本通道、失效 Basic 仍 401；401 不带 `WWW-Authenticate`）**、★ **前端静态断言（未挂接 frpc 的卡片不给「手动切换」活按钮）**、鉴权、CRUD、密钥打码、错误码、枚举字段校验、引擎生命周期、**frpc 实例 CRUD 与挂接 API**、**`/api/tunnels` 与 `/api/overview` 的挂接字段口径一致**、**节点偏好预览（含路由遮蔽回归）** | fastapi / httpx / pydantic |
+| `tests/test_api.py` | FastAPI 全端点：**登录页/会话 Cookie/登出作废/改密码/CSRF/防爆破/只读设置保护**、★ **Cookie 与 Basic 的优先级（有效 Cookie + 失效 Basic 仍算已登录；无有效 Cookie 时正确 Basic 走脚本通道、失效 Basic 仍 401；401 不带 `WWW-Authenticate`）**、★ **前端静态断言（未挂接 frpc 的卡片**照样**给「手动切换」活按钮、对话框的「确认」不再被禁用、切换结果先判 `unbound` 再判 `healthy`）**、鉴权、CRUD、密钥打码、错误码、枚举字段校验、引擎生命周期、**frpc 实例 CRUD 与挂接 API**、**`/api/tunnels` 与 `/api/overview` 的挂接字段口径一致**、**节点偏好预览（含路由遮蔽回归）** | fastapi / httpx / pydantic |
 | `tests/test_manual_api.py` | 外部节点全部 HTTP 端点：导入 / 更新 / 删除 / 改连 / 探测、token 不回明文、**「地址已导入过」的 409 契约与「覆盖重建空节点」**、**导入时顺手同步 DNS 与 udp 隧道的探测端点**、**DNS 记录名查重的 409 契约（含编辑自己 / 导入时只放弃那一个字段）**、删掉最后一条隧道自动清理空节点 | fastapi / httpx / pydantic |
 | `tests/test_tags.py` | 隧道标签：默认打 `mefrp`、归一化与截断、`?tag=` 筛选（**空串 = 筛未打标的**）、`/api/tags` 计数与排序、显式清空、**老库只回填一次** | fastapi / httpx / pydantic |
 | `tests/test_scope.py` | **隧道名的唯一性作用域**：同名隧道跨运营商并存、展示名重名不报错、mefrp 作用域内仍唯一、`/api/orphans` 与 `probe` 按作用域分流、**老库整表重建去掉 UNIQUE** | fastapi / httpx / pydantic |
 | `tests/test_failover.py` | 完整故障转移流水线（mefrp / CF / Gotify / Docker 全部打桩），含**节点地址取址路径**与 **UDP 跳过探测** | fastapi / httpx / pydantic |
 | `tests/test_http_tunnel.py` | **1.0.2 HTTP/HTTPS 隧道**：`domain` 字段的「文本化 JSON 数组」解析与序列化（含畸形输入兜底）、`proxy_create` 两类隧道的请求体差异（`remotePort` 必须显式 null、TCP 侧 domain 强制清空）、**HTTP 探测的 URL 构造与返回码三态（2xx/3xx 通、4xx/5xx 不通）**、**按类型校验（HTTP 缺域名 / 填端口、TCP 绑域名都是 400）**、**两套偏好体系的隔离（同一节点在两组口径下选出不同结果）**、**冷却表的 `(类型组, 节点)` 复合键**、**DNS 目标一律是节点地址（IP→A、域名→CNAME，两类隧道口径一致）**、**已废弃的 `http_entry` 不再落库也不再透传** | fastapi / httpx / pydantic |
-| `tests/test_frpc_multi.py` | **多容器挂接：不自动播种、只认显式挂接、未挂接拒绝切换、按容器重建、成组切换、跨容器隔离、失败回滚、自动发现** | 否 |
+| `tests/test_frpc_multi.py` | **多容器挂接：不自动播种、只认显式挂接、未挂接也能切换（不写配置/不重启/不判失败）、按容器重建、成组切换、跨容器隔离、失败回滚、自动发现** | 否 |
 
 `test_auth` / `test_logic` / `test_failover` / `test_frpc_multi` / `test_manual_node`
 用 `sys.modules` 注入假的 `httpx`（或在桩里补齐 `TransportError` 等属性），在
@@ -1071,7 +1080,13 @@ PYTHONPATH=$PWD/.devdeps PY=$PY ./tests/run_all.sh
 - **组内任一条创建失败 → 整体回滚**：已经搬走的隧道被**建回原节点**，新节点上的 proxy 被删
 - **切换顺序是「先删旧、再建新」**（假客户端会像真 mefrp 一样对同名创建直接报错，顺序反了就红）
 - **首次启动不播种任何实例**，挂接全靠手动
-- **未挂接的隧道：不写配置、拒绝切换、`frpc_bound` 为假** —— 哪怕当时只有一个容器
+- **未挂接的隧道：不写配置、`frpc_bound` 为假** —— 哪怕当时只有一个容器
+- ★ **未挂接的隧道也能切换节点**（1.0.3 改）：真搬 proxy（先删旧、再建新）、落库、
+  同步 DNS，但**不写配置、不重启容器、不等上线、不探测**；结果是 `ok=true` /
+  `healthy=false` / `probe_ok=null`（不适用），事件记 **success** 而不是 error。
+  桩里 `FakeMefrp.created_online` 用来还原「没有 frpc 连上来 → 新建的 proxy 必然
+  离线」这个事实 —— 不置成 `False` 的话「跳过上线等待」那条分支测不出来。
+  同一条用例还钉住了「**自动**路径仍然不搬未挂接的隧道」（否则会无限来回切换）。
 - **显式取消挂接不会被启发式规则挂回去**（旧容器配置里还留着隧道名也不认）
 - **空实例重建报错而不是写空配置**（避免把用户手写的 `[[proxies]]` 清掉）
 - **两个容器不能共用同一个配置文件**，相对路径也直接拒绝
