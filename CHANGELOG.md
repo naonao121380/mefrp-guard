@@ -69,6 +69,29 @@
   > 不通，`curl -4` 却秒连成功），把这行加回去即可。根治办法在系统层：
   > `/etc/gai.conf` 里加一行 `precedence ::ffff:0:0/96 100`。
 
+- **「橙云代理」开关改了不生效。** 编辑隧道时把「DNS 记录走 Cloudflare 代理（橙云）」
+  从关改成开（或反过来），保存后页面和库里都变了，**Cloudflare 上那条记录却纹丝不动**。
+  根因是 DNS 同步里「这条记录已经是对的了」的判定**只比了类型和地址** ——
+  `target.type == want_type and target.content == host`，**漏了 `proxied`**。用户建隧道
+  时没勾、地址又一直没变，于是补勾之后每一轮都判定「已经对了」直接 return，CF 上那条
+  记录永远停在灰云。现在 `proxied` 一起纳入判定，类型 / 地址 / 橙云三者同时成立才算「对」。
+
+  > ⚠️ 同一个东西还必须进**核对节流**：`dns_checked` 原来只存 `host`，改了开关之后
+  > 那一轮会被「地址没变」直接跳过，最长要等 `dns_check_interval`（默认 15 分钟）才
+  > 轮到。现在存 `(host, proxied)`，开关一变下一轮立刻同步。
+  > 另外 `PATCH /api/tunnels/{id}` 在改动 `dns_proxied` / `dns_record_name` 时会
+  > **当场 force 同步一次**（不等下一轮巡检），改记录名时顺带清掉缓存的
+  > `dns_zone_id` / `dns_record_id` —— 新名字可能落在**别的 zone** 里，留着旧 zone
+  > 会拿错误的 zone 去改记录。
+
+- **没挂接 frpc 容器的隧道，前端仍然允许点「手动切换」。** 后端一直有守卫（没挂接就
+  拒绝切换并说明原因），但**卡片上那个按钮是活的**：点进去照样弹出完整的切换对话框，
+  用户选完节点、点「确认切换」，才收到一句「还没有挂接 frpc 容器」。而切换的落地动作
+  是「改写承载它的 frpc 配置并重启那个容器」—— 没有承载者就无从下手。把用户送进一个
+  「点了必然失败」的对话框，只会让他以为是程序坏了。现在按钮直接**禁用**（附提示
+  「先挂接一个 frpc 容器」），对话框的「确认切换」也一并禁用，`failover()` 在入口处
+  就拦住并说清该去做什么。
+
 ### 内部
 
 - `settings.DNS_RECOVER_GRACE_SECONDS`（默认 600 秒）；`GuardEngine` 新增
@@ -77,13 +100,19 @@
 - `settings.DEFAULT_SETTINGS["dns_check_interval"]`（默认 900 秒）+ `engine.DNS_CHECK_INTERVAL`
   兜底 + `engine.dns_check_interval()`（每次现读，不缓存；`0` / 负数 = 关掉节流）；
   `GuardEngine._dns_check_due()` / `_note_dns_check()` 与内存态 `dns_checked`
-  （`tid -> (上次同步用的 host, 下次该核对的时间)`）。
+  （`tid -> (上次同步用的 host, 上次同步用的橙云开关, 下次该核对的时间)`）。
 - 设置页新增「DNS 记录核对间隔（秒）」输入框（`s_dns_check_interval`，进 `SET_KEYS`）。
 - DNS 连续失败状态从 `dict[tid, ...]` 收成单值，另加 `dns_fail_round`（本轮失败的
   隧道）与 `dns_fail_tunnels`（这次连续失败累计影响到的隧道）；事件记录从 `_sync_dns`
   里挪到轮末的 `_flush_dns_alerts()`，由 `tick()` 调用。
 - 外部节点：「立即探测」那条路（`main._sync_dns_after_probe`）补上 `force=True`，
   与切换节点 / 导入两条路口径一致。
+- `main.patch_tunnel`：`dns_record_name` / `dns_proxied` 变化时当场 `force=True`
+  同步一次 DNS（失败只记事件，不让「保存」这一步失败）。
+- `engine._sync_dns` 的「记录已对」判定加 `bool(target.proxied) == proxied`；
+  `_dns_check_due()` / `_note_dns_check()` 多收一个 `proxied` 参数。
+- 前端 `renderTunnels()` 的「手动切换」按钮按 `t.frpc_bound === false` 禁用，
+  `failover()` 入口拦一道，`#foOk` 跟随禁用。
 
 ## 1.0.2
 

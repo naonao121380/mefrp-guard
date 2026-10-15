@@ -916,7 +916,38 @@ async def patch_tunnel(tunnel_id: int, payload: TunnelPatch,
                 "那条路会同时改写配置文件并重启容器，直接改字段不会。")
         data["manual_node_id"] = None
 
+    # ★ 改了「DNS 记录名」或「橙云」必须**当场**去 CF 落一次，不能等下一轮巡检
+    #   —— 那一轮还会被 `_dns_check_due` 拦下（地址没变），用户改完页面看着毫无
+    #   动静，最长要等 `dns_check_interval`（默认 15 分钟）才生效。
+    #   ⚠️ 记录名变了还要把缓存的 zone/record id 一起清掉：新名字可能落在**别的
+    #   zone** 里，留着旧的 zone_id 会拿错误的 zone 去改记录。
+    old = store.get_tunnel(tunnel_id) or {}
+    name_changed = ("dns_record_name" in data
+                    and str(old.get("dns_record_name") or "")
+                        != str(data.get("dns_record_name") or ""))
+    proxied_changed = ("dns_proxied" in data
+                       and bool(old.get("dns_proxied"))
+                           != bool(data.get("dns_proxied")))
+    if name_changed:
+        data["dns_zone_id"] = None
+        data["dns_record_id"] = None
+
     store.update_tunnel(tunnel_id, data)
+
+    if name_changed or proxied_changed:
+        cur = store.get_tunnel(tunnel_id) or {}
+        try:
+            mn = engine.manual_node_for(cur)
+            if mn is not None:
+                # 外部节点没有 mefrp 的 Proxy 对象，地址由节点记录直接给出。
+                await engine._sync_dns(cur, None, force=True,
+                                       host=str(mn.get("server_addr") or ""))
+            else:
+                await engine._sync_dns(
+                    cur, engine.proxies.get(cur.get("proxy_name") or ""),
+                    force=True)
+        except Exception:  # noqa: BLE001 - DNS 同步失败不该让「保存」这一步失败
+            pass
     return {"ok": True}
 
 

@@ -457,7 +457,7 @@ dialog h3{margin-top:0;color:var(--text);font-size:15px}
     但如果新建失败，程序会把旧的<b>重新建回原节点</b>，不会让它凭空消失。</div>
   <div class="flex" style="margin-top:18px"><div class="sp"></div>
     <button class="act" onclick="document.getElementById('foDlg').close()">取消</button>
-    <button class="act pri" onclick="doFailover()">确认切换</button></div>
+    <button class="act pri" id="foOk" onclick="doFailover()">确认切换</button></div>
 </dialog>
 
 <dialog id="frpcDlg">
@@ -723,7 +723,13 @@ function renderTunnels(list, target){
           //    「换节点」的正确形态就是「重新粘一份新节点的配置」，那本质上
           //    是更新服务端要素，所以这里只留一个入口。
           ? `<button class="act pri" onclick="openManualImport(${t.manual_node_id||0})">更新节点配置</button>`
-          : `<button class="act pri" onclick="failover(${t.id})">手动切换</button>`}
+          // ⚠️ 没挂接 frpc 容器就**不给**这个入口：切换的落地动作是「改写承载它的
+          //    frpc 配置并重启那个容器」，没有承载者就无从下手 —— 后端也会拒绝
+          //    （见 engine._failover 里那道守卫）。让它可点、点了才报错，比直接
+          //    禁用更糟：用户会以为是程序坏了。
+          : (t.frpc_bound === false
+              ? `<button class="act" disabled title="先挂接一个 frpc 容器 —— 切换要改写它的配置并重启它，没有承载者就没有地方落配置">手动切换</button>`
+              : `<button class="act pri" onclick="failover(${t.id})">手动切换</button>`)}
         <button class="act" onclick="bindTunnel(${t.id})">挂接 frpc</button>
         <button class="act" onclick="editTunnel(${t.id})">编辑</button>
         ${t.needs_downstream_review?`<button class="act" onclick="clearReview(${t.id})">下游已处理</button>`:''}
@@ -976,6 +982,15 @@ async function failover(id){
   const t = TUNNELS.find(x=>x.id===id)
         || (OVERVIEW ? OVERVIEW.tunnels.find(x=>x.id===id) : null);
   FO_ID = id;
+  // 没挂接 frpc 容器 → 这个动作根本落不了地（改不了配置、重启不了容器），
+  // 直接挡住，别把用户送到一个「点了必然失败」的对话框里。后端也有同一道守卫。
+  if(t && t.frpc_bound === false){
+    alert('这条隧道还没有挂接 frpc 容器，无法切换节点。\n\n'
+        + '切换要改写承载它的 frpc 配置并重启那个容器 —— 没有承载者就没有地方落配置，'
+        + '节点信息也就无从生效。\n\n'
+        + '请先到「frpc」页新建一个实例，再回来点这张卡片上的「挂接 frpc」。');
+    return;
+  }
   // ⚠️ 按这条隧道的类型取对应的节点口径 —— HTTP 组和 TCP/UDP 组的可用性判定
   //    用的是两套偏好，混用会显示一个「按另一套口径算出来」的可用性。
   const ptype = (t && t.proxy_type) || 'tcp';
@@ -1006,10 +1021,13 @@ async function failover(id){
           : `<br><span style="color:var(--amber)">⚠️ 它还没有挂接 frpc 容器，无法切换。
             请先到「frpc 实例」页新建一个，再回来点「挂接 frpc」。</span>`)
     : '';
+  // 兜底：真走到这一步（数据没带上 frpc_bound）也不给提交。
+  $('foOk').disabled = !!(t && t.frpc_bound === false);
   $('foDlg').showModal();
 }
 
 async function doFailover(){
+  if($('foOk').disabled) return;
   const raw = $('fo_node_id').value;
   const nodeId = raw ? parseInt(raw,10) : null;
   $('foDlg').close();

@@ -1123,7 +1123,7 @@ asyncio.run(eng._sync_dns(store.get_tunnel(_fl), None, host="10.0.0.2"))
 check("★ 地址变了 → 立刻同步，不等间隔", _cffl.list_calls - _n0 == 1,
       _cffl.list_calls - _n0)
 
-eng.dns_checked[_fid] = ("10.0.0.2", time.time() - 1)
+eng.dns_checked[_fid] = ("10.0.0.2", False, time.time() - 1)
 _n0 = _cffl.list_calls
 asyncio.run(eng._sync_dns(store.get_tunnel(_fl), None, host="10.0.0.2"))
 check("★ 到间隔 → 核对一次", _cffl.list_calls - _n0 == 1,
@@ -1146,16 +1146,16 @@ store.set_setting("dns_check_interval", 900)
 # 失败也要推进「下次核对」—— 否则一个正在挂的 API 会被每轮都撞一次
 # （一次最坏 47 秒 = 15 秒超时 × 3 次尝试），把巡检周期整个拖垮。
 _cffl.fail = True
-eng.dns_checked[_fid] = ("10.0.0.2", time.time() + 900)
+eng.dns_checked[_fid] = ("10.0.0.2", False, time.time() + 900)
 _n0 = _cffl.list_calls
 asyncio.run(eng._sync_dns(store.get_tunnel(_fl), None, host="10.0.0.2"))
 check("★ 没到点就压根不打（连「撞一个正在挂的 API」都省了）",
       _cffl.list_calls - _n0 == 0, _cffl.list_calls - _n0)
 
-eng.dns_checked[_fid] = ("10.0.0.2", time.time() - 1)
+eng.dns_checked[_fid] = ("10.0.0.2", False, time.time() - 1)
 asyncio.run(eng._sync_dns(store.get_tunnel(_fl), None, host="10.0.0.2"))
 check("★ 失败后把「下次核对」推到下一个间隔",
-      eng.dns_checked[_fid][1] > time.time() + 800, eng.dns_checked[_fid])
+      eng.dns_checked[_fid][2] > time.time() + 800, eng.dns_checked[_fid])
 check("★ 失败时保留上一次的 host（地址再变仍会立刻触发同步）",
       eng.dns_checked[_fid][0] == "10.0.0.2", eng.dns_checked[_fid])
 _cffl.fail = False
@@ -1202,6 +1202,97 @@ check("★ 并且记一条「已恢复」", _n_recovered() - _nrec0 == 1,
       _n_recovered() - _nrec0)
 _reset_dns_state()
 _cffl.fail = False
+
+
+# ★★ 橙云（dns_proxied）必须真的落到 CF 上。
+#   回归：原来「记录已经是对的」只比 type/content —— 用户建隧道时没勾橙云、
+#   之后在编辑框里补勾，地址一个字没变 → 判定「已经对了」直接 return，CF 上
+#   那条记录永远停在灰云。页面勾了、库里也存了，就是 CF 上没变。
+#   节流键也一样：原来只存 host，改了开关下一轮会被「地址没变」跳过，
+#   最长要等 dns_check_interval（默认 15 分钟）才轮到。
+class ExistingCF:
+    """`list_records` 回一条**真实存在**的记录，用来验「记录是否已对」的判定。
+
+    `upsert` 会把这边的状态改掉（模拟真 CF）—— 不改的话第二次同步又会看到旧值，
+    测出来的东西和线上不一样。
+    """
+
+    def __init__(self, content: str, proxied: bool) -> None:
+        self.token = "fake-cf-token"
+        self.content = content
+        self.proxied = proxied
+        self.upserts: list[dict] = []
+        self.list_calls = 0
+
+    async def resolve_zone(self, name: str):
+        from app.cloudflare import Zone
+        return Zone(zone_id="ZEX", name="example.com")
+
+    async def list_records(self, zone_id: str, name: str | None = None):
+        from app.cloudflare import DnsRecord
+        self.list_calls += 1
+        return [DnsRecord("REX", zone_id, str(name or ""), "A",
+                          self.content, self.proxied)]
+
+    async def upsert(self, **kw):
+        from app.cloudflare import DnsRecord
+        self.upserts.append(kw)
+        self.content = str(kw["content"])
+        self.proxied = bool(kw["proxied"])
+        return DnsRecord("REX", kw["zone_id"], kw["name"], kw["record_type"],
+                         self.content, self.proxied)
+
+
+print("  --- ★ 橙云开关（dns_proxied）改动必须落到 CF ---")
+store.set_setting("dns_check_interval", 900)
+_ex = store.create_tunnel({
+    "name": "橙云隧道", "proxy_name": "orange-dns", "proxy_type": "http",
+    "local_ip": "127.0.0.1", "local_port": 5200, "manual_node_id": mid,
+    "enabled": 1, "auto_failover": 0,
+    "dns_record_name": "orange.example.com", "dns_proxied": 0,
+})
+_exid = int(store.get_tunnel(_ex)["id"])
+_cfex = ExistingCF(content="10.0.0.9", proxied=False)
+eng.cf = _cfex
+_reset_dns_state()
+
+_n = len(_cfex.upserts)
+asyncio.run(eng._sync_dns(store.get_tunnel(_ex), None, host="10.0.0.9"))
+check("★ 类型/地址/橙云三者全对 → 不写 CF（省掉的就是这一整趟）",
+      len(_cfex.upserts) - _n == 0, len(_cfex.upserts) - _n)
+
+# 用户补勾橙云 —— 地址一个字没变
+store.update_tunnel(_exid, {"dns_proxied": 1})
+_n = len(_cfex.upserts)
+asyncio.run(eng._sync_dns(store.get_tunnel(_ex), None, host="10.0.0.9"))
+check("★ 补勾橙云 → 必须重新写一次 CF（回归：原来会判「已经对了」跳过）",
+      len(_cfex.upserts) - _n == 1, len(_cfex.upserts) - _n)
+check("★ 写下去的就是 proxied=True",
+      bool(_cfex.upserts[-1].get("proxied")) is True,
+      _cfex.upserts[-1].get("proxied"))
+
+# 再取消勾选 —— 必须能改回灰云，不能只支持开
+store.update_tunnel(_exid, {"dns_proxied": 0})
+_n = len(_cfex.upserts)
+asyncio.run(eng._sync_dns(store.get_tunnel(_ex), None, host="10.0.0.9"))
+check("★ 取消橙云 → 同样要落回去（不能只支持开）",
+      len(_cfex.upserts) - _n == 1
+      and bool(_cfex.upserts[-1].get("proxied")) is False,
+      (len(_cfex.upserts) - _n, _cfex.upserts[-1].get("proxied")))
+
+# 节流键也必须带橙云：不 force、不清缓存，改了开关下一轮就得立刻同步
+store.update_tunnel(_exid, {"dns_proxied": 1})
+eng.dns_checked.clear()
+asyncio.run(eng._sync_dns(store.get_tunnel(_ex), None, host="10.0.0.9"))  # 建缓存
+store.update_tunnel(_exid, {"dns_proxied": 0})
+_n = len(_cfex.upserts)
+asyncio.run(eng._sync_dns(store.get_tunnel(_ex), None, host="10.0.0.9"))
+check("★ 橙云开关变了 → 节流不拦，下一轮立刻同步"
+      "（回归：原来键里只有 host，会被跳过 15 分钟）",
+      len(_cfex.upserts) - _n == 1, len(_cfex.upserts) - _n)
+
+eng.cf = _cffl
+_reset_dns_state()
 
 
 # 静态问题（token 没权限这种，重试一万次也不会好）不套「等半小时」，立刻报。

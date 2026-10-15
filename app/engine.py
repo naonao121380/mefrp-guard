@@ -426,10 +426,12 @@ class GuardEngine:
         # 本轮**真的问到 CF 了**的次数（每个成功的请求 +1）。用来把「本轮没人失败」
         # 和「本轮压根没人去问」分开 —— 后者不能当恢复的证据，见 `_flush_dns_alerts`。
         self.dns_ok_round: int = 0
-        # ★ DNS 核对节流：tid -> (上次同步用的 host, 下次该核对的时间)。
-        #   地址没变就别每轮都去打 CF（见 `_dns_check_due`）。内存态即可 —— 重启
-        #   之后每条约多核对一次，没有副作用。
-        self.dns_checked: dict[int, tuple[str, float]] = {}
+        # ★ DNS 核对节流：tid -> (上次同步用的 host, 橙云开关, 下次该核对的时间)。
+        #   地址**和橙云开关**都没变就别每轮都去打 CF（见 `_dns_check_due`）。
+        #   内存态即可 —— 重启之后每条约多核对一次，没有副作用。
+        #   ⚠️ 橙云必须进这个键：用户建隧道时没勾、之后在编辑框里补勾，地址一个字
+        #   没变 —— 只比 host 的话这一轮会被直接跳过，CF 上那条记录永远停在灰云。
+        self.dns_checked: dict[int, tuple[str, bool, float]] = {}
         # 这一次「连续失败」累计影响到的隧道 —— 只为了在告警文案里报影响面。
         self.dns_fail_tunnels: set[int] = set()
         self.mefrp_fail_since: float | None = None
@@ -2436,9 +2438,17 @@ class GuardEngine:
         is_ip = bool(_IPV4_RE.match(host))
         want_type = "A" if is_ip else "CNAME"
 
+        # ★ 橙云（proxied）也是「这条记录该长什么样」的一部分，必须和地址一起参与
+        #   比对。用户建隧道时没勾、之后在编辑框里补勾 —— 地址一个字没变，只比
+        #   type/content 的话会判定「记录已经是对的」直接 return，CF 上那条记录就
+        #   永远停在灰云（这正是「之后再选无法生效」的根因）。下面判定和节流键都
+        #   用它。
+        proxied = bool(tunnel.get("dns_proxied"))
+
         # ★ 地址没变就别每轮都去打 CF —— 见 `_dns_check_due`。
-        #   `force` 是用户明确点的动作（切换 / 导入 / 手动探测），一律不看节流。
-        if not force and not self._dns_check_due(tid, host):
+        #   `force` 是用户明确点的动作（切换 / 导入 / 手动探测 / 改 DNS 设置），
+        #   一律不看节流。
+        if not force and not self._dns_check_due(tid, host, proxied):
             return ""
 
         assert self.cf is not None
@@ -2472,16 +2482,19 @@ class GuardEngine:
                         target = r
                         break
 
+            # ★ 三个条件必须**同时**成立才算「记录已经是对的」：类型、地址、橙云。
+            #   少了 proxied 那一项，用户补勾橙云之后这里会判定「已经对了」直接
+            #   return —— 页面上勾了、库里也存了，CF 上却还是灰云。
             if target is not None and target.type.upper() == want_type \
-                    and target.content == host:
+                    and target.content == host \
+                    and bool(target.proxied) == proxied:
                 if not tunnel.get("dns_record_id"):
                     store.update_tunnel(tunnel["id"], {"dns_record_id": target.record_id})
                 # 记录已经是对的 → 这一轮就是「干净」的。恢复与否由轮末的
                 # `_flush_dns_alerts` 判（而且要**连续**干净满宽限期才算）。
-                self._note_dns_check(tid, host, True)
+                self._note_dns_check(tid, host, proxied, True)
                 return ""
 
-            proxied = bool(tunnel.get("dns_proxied"))
             rec = await self.cf.upsert(
                 zone_id=zone_id,
                 name=record_name,
@@ -2498,15 +2511,17 @@ class GuardEngine:
                 "dns_record_id": rec.record_id,
             })
             msg = f"{record_name} → {want_type} {host}"
-            self._note_dns_check(tid, host, True)
+            if proxied:
+                msg += "（橙云）"
+            self._note_dns_check(tid, host, proxied, True)
             store.add_event("success", "dns", f"DNS 已更新：{msg}",
                             tunnel_id=tunnel["id"])
             return msg
         except CloudflareError as exc:
             # 失败也要把「下次核对」推到下一个间隔 —— 否则一个正在挂的 API 会被
-            # 每轮都撞一次（一次最坏 47 秒），把巡检周期整个拖垮。地址真变了的话，
-            # 下一轮仍会因为 host 不同而立刻重试（那才是必须尽快收敛的情况）。
-            self._note_dns_check(tid, host, False)
+            # 每轮都撞一次（一次最坏 47 秒），把巡检周期整个拖垮。地址/橙云真变了
+            # 的话，下一轮仍会因为键不同而立刻重试（那才是必须尽快收敛的情况）。
+            self._note_dns_check(tid, host, proxied, False)
             msg = f"更新 DNS 失败：{exc}"
             if force:
                 # 用户明确点的动作（导入 / 立即探测 / 切换后同步）—— 他正站在
@@ -2524,12 +2539,17 @@ class GuardEngine:
 
     # -- DNS 核对节流（地址不变就别每轮都去问 CF）---------------------------
 
-    def _dns_check_due(self, tid: int, host: str) -> bool:
+    def _dns_check_due(self, tid: int, host: str, proxied: bool = False) -> bool:
         """这条隧道这一轮要不要真的去问 Cloudflare。
 
         · 没核对过 → 要；
-        · **地址和上次同步用的不一样 → 要**（记录指错了必须马上改，不能等间隔）；
+        · **地址或橙云开关和上次同步用的不一样 → 要**（记录指错了必须马上改，
+          不能等间隔）；
         · 否则到 `dns_check_interval` 才要。
+
+        ⚠️ 橙云必须一起比：用户建隧道时没勾、之后补勾，地址一个字没变 —— 只看
+        host 的话这一轮会被跳过，记录要等 `dns_check_interval`（默认 15 分钟）才
+        有机会改，用户看到的就是「勾了没反应」。
 
         ⚠️ 原来这里是「每轮都核对」（`engine_interval` = 20 秒）。地址很少变，那些
         请求只是为了确认「没变」—— 而实测 CF API 从家宽出去时通时不通，这些请求
@@ -2543,25 +2563,27 @@ class GuardEngine:
         rec = self.dns_checked.get(tid)
         if rec is None:
             return True
-        prev_host, next_due = rec
-        if host != prev_host:
+        prev_host, prev_proxied, next_due = rec
+        if host != prev_host or bool(proxied) != bool(prev_proxied):
             return True
         return time.time() >= next_due
 
-    def _note_dns_check(self, tid: int, host: str, ok: bool) -> None:
+    def _note_dns_check(self, tid: int, host: str, proxied: bool,
+                        ok: bool) -> None:
         """记下「这条隧道核对过了」，顺便安排下一次核对的时间。
 
         ⚠️ **失败也要推进时间**：否则一个正在挂的 API 会被每一轮都撞一次（一次
         最坏 47 秒 = 15 秒超时 × 3 次尝试），把巡检周期从 20 秒拖到分钟级。但失败时
-        **保留上一次成功用的 host** —— 地址真变了的话，下一轮 `_dns_check_due`
-        仍会因为 host 不同而立刻重试，那才是必须尽快收敛的情况。
+        **保留上一次成功用的 host 和橙云开关** —— 两者真变了的话，下一轮
+        `_dns_check_due` 仍会因为键不同而立刻重试，那才是必须尽快收敛的情况。
         """
         rec = self.dns_checked.get(tid)
-        prev_host = rec[0] if rec else None
-        self.dns_checked[tid] = (
-            host if (ok or prev_host is None) else prev_host,
-            time.time() + dns_check_interval(),
-        )
+        if ok or rec is None:
+            key = (host, bool(proxied))
+        else:
+            key = (rec[0], rec[1])
+        self.dns_checked[tid] = (key[0], key[1],
+                                 time.time() + dns_check_interval())
 
     def _flush_dns_alerts(self) -> None:
         """一轮巡检走完，把 DNS 同步的失败 / 恢复**按站点聚合成一条**事件。

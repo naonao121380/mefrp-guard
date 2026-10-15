@@ -84,6 +84,18 @@ with TestClient(app) as c:
     r = c.post(f"/api/tunnels/{tid}/failover", headers=AUTH, json={"node_id":12345})
     check("切换（指定不存在的节点）-> 400", r.status_code == 400, r.text[:200])
 
+    # ★ 前端也必须拦（后端拒绝只是最后一道）：未挂接 frpc 的隧道，卡片上那个
+    #   「手动切换」不能是个能点的活按钮。让用户点进一个「点了必然失败」的
+    #   对话框，他只会以为是程序坏了 —— 而切换的语义（改写承载它的 frpc 配置
+    #   并重启那个容器）在没有承载者时根本无从落地。
+    _html = (pathlib.Path(__file__).resolve().parent.parent
+             / "app" / "web" / "index.html").read_text(encoding="utf-8")
+    check("★ 前端：未挂接 frpc 的隧道不给「手动切换」活按钮",
+          "t.frpc_bound === false" in _html, "index.html 里找不到 frpc_bound 守卫")
+    check("★ 前端：切换对话框的「确认」按钮也会被禁用",
+          'id="foOk"' in _html and "$('foOk').disabled" in _html,
+          "index.html 里找不到 foOk 守卫")
+
     print("[4] 未纳管隧道 / 节点")
     r = c.get("/api/orphans", headers=AUTH)
     check("/api/orphans 200 且是数组", r.status_code == 200 and isinstance(r.json(), list), r.text[:200])
