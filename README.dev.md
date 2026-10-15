@@ -392,16 +392,27 @@ docker compose up -d
 
 **登录页 `/login`** 是独立的自包含页面（暗色，与主 UI 同风格），带锁定倒计时。
 
-**两套凭据通道**，按顺序尝试：
+**两套凭据通道：会话 Cookie 优先，`Authorization: Basic` 兜底。**
 
-1. `Authorization: Basic` —— 给脚本 / curl / 自动化用
+1. 会话 Cookie `mg_session` —— 给浏览器用（登录页换来的）
+2. `Authorization: Basic` —— 给脚本 / curl / 自动化用
    ```bash
    curl -u admin:admin123 http://127.0.0.1:8080/api/overview
    ```
-2. 会话 Cookie `mg_session` —— 给浏览器用（登录页换来的）
+
+> ⚠️ **顺序不能反**（2026-10-15 修正）。浏览器会把认证过的 Basic 凭据按
+> **origin + realm** 缓存下来，之后**每个**请求都自动附加（preemptive，不管服务器
+> 这一次有没有挑战它）。1.0.0 / 1.0.1 是 Basic 时代，从那个版本升上来的浏览器里
+> 必然躺着这组凭据；只要用户改过密码，它就是**失效**的。
+> Basic 排在前面的话，`check_credentials` 一失败就 `return False` —— Cookie 永远
+> 没机会生效，用户看到的是「登录页疯狂刷新」：
+> **输入正确密码 → 登录成功 → 跳首页 → 又被踢回登录页 → 再登 → 再踢……**
 
 未登录时：`/api/*` 返回 **401**，页面请求（`/`）返回 **302 → /login**。
-**故意不弹浏览器原生 Basic 对话框** —— 那个对话框没法登出，正是引入登录页要摆脱的东西。
+**故意不弹浏览器原生 Basic 对话框** —— 那个对话框没法登出，正是引入登录页要摆脱的
+东西。所以 401 响应里**不带 `WWW-Authenticate`**：浏览器既不会弹框，也不会再缓存
+新凭据。Basic 头仍然**被接受**（`curl -u` 和脚本都是主动发 Authorization 头的，
+不依赖挑战）。
 
 `/healthz` 和 `/login` 不需要鉴权（前者给容器健康检查，后者是入口本身）。
 
@@ -632,7 +643,7 @@ mefrp-guard/
 │       └── favicon.ico 老浏览器 / Safari / webview 的回落图标（`/favicon.ico`）
 ├── tests/              十一个测试文件（鉴权 / 纯逻辑 / CF 客户端 / 外部节点逻辑 / API /
 │                       外部节点 API / 标签 / 作用域 / 故障转移 / HTTP 隧道 / 多容器挂接），
-│                       共 1147 条断言
+│                       共 1154 条断言
 ├── run_local.sh        本地试跑脚本（不依赖 Docker，用沙箱 frpc 配置）
 ├── Dockerfile
 ├── docker-compose.yml
@@ -1015,15 +1026,15 @@ PYTHONPATH=$PWD/.devdeps PY=$PY ./tests/run_all.sh
 > ⚠️ `run_all.sh` **自己不设 `PYTHONPATH`** —— 不带上的话会在第一个需要依赖的文件上
 > 报 `No module named 'fastapi'`。
 
-十一个文件，共 **1147 条断言**（59 + 149 + 22 + 177 + 198 + 183 + 30 + 47 + 75 + 114 + 93）：
+十一个文件，共 **1154 条断言**（59 + 149 + 22 + 177 + 205 + 183 + 30 + 47 + 75 + 114 + 93）：
 
 | 文件 | 覆盖 | 需要第三方库 |
 |---|---|---|
 | `tests/test_auth.py` | **密码哈希（随机盐/迭代数/异常输入安全降级）、默认密码识别、会话令牌、登录防爆破、来源 IP 解析** | 否 |
 | `tests/test_logic.py` | frpc TOML 合并与跨节点校验、**单引号字面量解析**、配置备份/恢复/路径穿越、SQLite 持久化与字段白名单、Node/Proxy 字段解析、`pick_node` 择优调度、**节点偏好的有序语义与归一化**、**`probe_plan` 探测适用性（四种模式 × 四种隧道类型，含「http 在 auto 下是假阳性」）** | 否 |
 | `tests/test_cfclient.py` | **Cloudflare 客户端的 httpx 交互**：传输层退避重试、重试耗尽后 `transient=True` 与异常类型名、非传输层错误不重试、**连接池复用（3 个请求只建 1 个）与跨事件循环重建**、`upsert(existing=…)` 省掉两次自查、没配 token 一个请求都不发 | httpx |
-| `tests/test_manual_node.py` | **frpc 配置解析（TOML / INI）、`patch_server` 文本级改写的保真与合法性、外部节点数据层 CRUD、1.0.0 老库补列迁移、引擎对外部隧道的分支（含「不适用探测」的三态、UDP 的 DNS 同步）、★ **mefrp 拉取失败与 DNS 同步失败「满 `alert_after_seconds` 才告警」的完整口径**（一条 warn → 静默 → 满阈值 error → 每再满一个阈值补报 → 恢复 success / 短抖不记 / force 与静态问题立刻报）、★ **DNS 告警按站点聚合**（一轮 N 条隧道失败只报一条、告警报出影响面）、★ **恢复的迟滞**（一次干净不算恢复、要连续干净满 `DNS_RECOVER_GRACE_SECONDS`；「本轮没发 CF 请求」不算干净；抖动 6 个来回复现「4 小时 62 条 warn」的 bug 且一条新告警都不记）、★ **DNS 核对节流**（地址没变就不重复打 CF；地址一变立刻同步不等间隔；填 0 退回每轮核对；失败也推进下次核对时间但保留上次的 host；★ **节流与迟滞的交互** —— 被跳过的轮次不清零干净计时，恢复仍判得出来）** | 否 |
-| `tests/test_api.py` | FastAPI 全端点：**登录页/会话 Cookie/登出作废/改密码/CSRF/防爆破/只读设置保护**、鉴权、CRUD、密钥打码、错误码、枚举字段校验、引擎生命周期、**frpc 实例 CRUD 与挂接 API**、**`/api/tunnels` 与 `/api/overview` 的挂接字段口径一致**、**节点偏好预览（含路由遮蔽回归）** | fastapi / httpx / pydantic |
+| `tests/test_manual_node.py` | **frpc 配置解析（TOML / INI）、`patch_server` 文本级改写的保真与合法性、外部节点数据层 CRUD、1.0.0 老库补列迁移、引擎对外部隧道的分支（含「不适用探测」的三态、UDP 的 DNS 同步）、★ **mefrp 拉取失败与 DNS 同步失败「满 `alert_after_seconds` 才告警」的完整口径**（一条 warn → 静默 → 满阈值 error → 每再满一个阈值补报 → 恢复 success / 短抖不记 / force 与静态问题立刻报）、★ **DNS 告警按站点聚合**（一轮 N 条隧道失败只报一条、告警报出影响面）、★ **恢复的迟滞**（一次干净不算恢复、要连续干净满 `DNS_RECOVER_GRACE_SECONDS`；「本轮没发 CF 请求」不算干净；抖动 6 个来回复现「4 小时 62 条 warn」的 bug 且一条新告警都不记）、★ **DNS 核对节流**（地址没变就不重复打 CF；地址一变立刻同步不等间隔；填 0 退回每轮核对；失败也推进下次核对时间但保留上次的 host；★ **节流与迟滞的交互** —— 被跳过的轮次不清零干净计时，恢复仍判得出来）、★ **橙云开关（`dns_proxied`）也是「记录该长什么样」的一部分**（三者全对才不写 CF；补勾/取消橙云都必须真的落一次；开关一变节流不拦）** | 否 |
+| `tests/test_api.py` | FastAPI 全端点：**登录页/会话 Cookie/登出作废/改密码/CSRF/防爆破/只读设置保护**、★ **Cookie 与 Basic 的优先级（有效 Cookie + 失效 Basic 仍算已登录；无有效 Cookie 时正确 Basic 走脚本通道、失效 Basic 仍 401；401 不带 `WWW-Authenticate`）**、★ **前端静态断言（未挂接 frpc 的卡片不给「手动切换」活按钮）**、鉴权、CRUD、密钥打码、错误码、枚举字段校验、引擎生命周期、**frpc 实例 CRUD 与挂接 API**、**`/api/tunnels` 与 `/api/overview` 的挂接字段口径一致**、**节点偏好预览（含路由遮蔽回归）** | fastapi / httpx / pydantic |
 | `tests/test_manual_api.py` | 外部节点全部 HTTP 端点：导入 / 更新 / 删除 / 改连 / 探测、token 不回明文、**「地址已导入过」的 409 契约与「覆盖重建空节点」**、**导入时顺手同步 DNS 与 udp 隧道的探测端点**、**DNS 记录名查重的 409 契约（含编辑自己 / 导入时只放弃那一个字段）**、删掉最后一条隧道自动清理空节点 | fastapi / httpx / pydantic |
 | `tests/test_tags.py` | 隧道标签：默认打 `mefrp`、归一化与截断、`?tag=` 筛选（**空串 = 筛未打标的**）、`/api/tags` 计数与排序、显式清空、**老库只回填一次** | fastapi / httpx / pydantic |
 | `tests/test_scope.py` | **隧道名的唯一性作用域**：同名隧道跨运营商并存、展示名重名不报错、mefrp 作用域内仍唯一、`/api/orphans` 与 `probe` 按作用域分流、**老库整表重建去掉 UNIQUE** | fastapi / httpx / pydantic |

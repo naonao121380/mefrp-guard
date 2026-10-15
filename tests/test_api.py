@@ -27,7 +27,11 @@ with TestClient(app) as c:
     print("[1] 健康检查与鉴权")
     r = c.get("/healthz"); check("/healthz 免鉴权 200", r.status_code == 200 and r.json()["ok"], r.status_code)
     r = c.get("/api/overview"); check("无凭据 -> 401", r.status_code == 401, r.status_code)
-    check("401 带 WWW-Authenticate", "www-authenticate" in {k.lower() for k in r.headers}, dict(r.headers))
+    # ★ 401 **不能**带 `WWW-Authenticate: Basic` —— 带上浏览器就弹原生 Basic
+    #   对话框（还盖在登录页上），而且会**缓存**那组凭据、之后每个请求都自动附加。
+    #   那正是引入登录页要摆脱的东西。Basic 头仍然被接受，只是不再主动挑战。
+    check("★ 401 不带 WWW-Authenticate（不弹原生对话框）",
+          "www-authenticate" not in {k.lower() for k in r.headers}, dict(r.headers))
     r = c.get("/api/overview", headers={"Authorization": "Basic " + base64.b64encode(b"admin:wrong").decode()})
     check("错误口令 -> 401", r.status_code == 401, r.status_code)
     r = c.get("/api/overview", headers={"Authorization": "Basic notbase64!!"})
@@ -267,6 +271,37 @@ with TestClient(app) as c:
     r = c.get("/", follow_redirects=False)
     check("登录后 / 直接给 UI", r.status_code == 200, r.status_code)
 
+    # ★★ 回归「登录页疯狂刷新」：浏览器会把认证过的 Basic 凭据按 origin + realm
+    #   缓存下来，之后**每个**请求都自动附加（preemptive，不管服务器这次有没有
+    #   挑战）。1.0.0 / 1.0.1 是 Basic 时代，从那个版本升上来的浏览器里必然躺着
+    #   这组凭据 —— 而且只要用户改过密码，它就是**失效**的。
+    #   如果 Basic 的优先级高于 Cookie，那组失效凭据就会把刚拿到的有效会话顶掉：
+    #       登录成功 → 跳首页 → 又被踢回登录页 → 再登 → 再踢……
+    #   下面把它钉死：Cookie 必须在前面。
+    _stale = {"Authorization": "Basic "
+              + base64.b64encode(b"admin:stale-old-password").decode()}
+    r = c.get("/", headers=_stale, follow_redirects=False)
+    check("★ 有效 Cookie + 失效 Basic -> 首页仍是 200（不被踢回登录页）",
+          r.status_code == 200, r.status_code)
+    r = c.get("/api/auth/me", headers=_stale)
+    check("★ 有效 Cookie + 失效 Basic -> me 仍是 authenticated=true",
+          r.json().get("authenticated") is True, r.json())
+    r = c.get("/api/overview", headers=_stale)
+    check("★ 有效 Cookie + 失效 Basic -> API 仍是 200",
+          r.status_code == 200, r.status_code)
+    # 反过来：没有有效 Cookie 时，失效的 Basic 必须**照旧被拒**
+    # （改了顺序不等于放行），而且 Basic 兼容通道本身不能坏。
+    r = c.get("/api/overview", headers=_stale,
+              cookies={"mg_session": "totally-made-up-token"})
+    check("★ 无有效 Cookie + 失效 Basic -> 仍然 401",
+          r.status_code == 401, r.status_code)
+    _good = {"Authorization": "Basic "
+             + base64.b64encode(f"admin:{PW}".encode()).decode()}
+    r = c.get("/api/overview", headers=_good,
+              cookies={"mg_session": "totally-made-up-token"})
+    check("★ 无有效 Cookie + 正确 Basic -> 200（脚本通道没被改坏）",
+          r.status_code == 200, r.status_code)
+
     print("[12] 登出必须真的作废服务端会话")
     cookie_val = c.cookies.get("mg_session")
     r = c.post("/api/auth/logout")
@@ -293,6 +328,8 @@ with TestClient(app) as c:
     print("[15] 改密码")
     r = c.post("/api/auth/login", json={"username": "admin", "password": PW})
     check("重新登录以拿到会话", r.status_code == 200, r.status_code)
+    # 记下这次登录的 Cookie —— 改完密码它必须作废（只清 Cookie 不算数）
+    _pre_change_cookie = c.cookies.get("mg_session")
 
     r = c.post("/api/auth/password", json={"current_password": "nope", "new_password": "brand-new-pw1"})
     check("当前密码错误 -> 403", r.status_code == 403, r.text[:200])
@@ -307,8 +344,23 @@ with TestClient(app) as c:
 
     old_auth = {"Authorization": "Basic " + base64.b64encode(f"admin:{PW}".encode()).decode()}
     new_auth = {"Authorization": "Basic " + base64.b64encode(b"admin:brand-new-pw1").decode()}
-    check("★ 旧密码立刻失效", c.get("/api/overview", headers=old_auth).status_code == 401)
-    check("新密码可用", c.get("/api/overview", headers=new_auth).status_code == 200)
+    # ⚠️ 验 Basic 必须**排除 Cookie**：`change_password` 会给当前客户端**补发**一个
+    #    新会话（设计如此 —— 不能把正在改密码的人自己踢出去），带着它的话 Cookie
+    #    会先命中，验不出 Basic 的失效。
+    _no_cookie = {"mg_session": "totally-made-up-token"}
+    check("★ 旧密码的 Basic 立刻失效",
+          c.get("/api/overview", headers=old_auth, cookies=_no_cookie).status_code == 401)
+    check("新密码的 Basic 可用",
+          c.get("/api/overview", headers=new_auth, cookies=_no_cookie).status_code == 200)
+    # ★ 改密码前建立的会话必须**真的**作废 —— 否则旧密码泄露期间拿到令牌的人
+    #   在改密码之后照样能用，改密码就白改了。
+    check("★ 改密码前的旧 Cookie 已作废",
+          c.get("/api/overview",
+                cookies={"mg_session": _pre_change_cookie}).status_code == 401)
+    # ★ 反过来：当前客户端不该被自己踢出去，改完还是登录状态。
+    check("★ 改密码后当前客户端仍是登录状态",
+          c.get("/api/auth/me").json().get("authenticated") is True,
+          c.get("/api/auth/me").text[:120])
 
     # 改回去，后面的用例还要用 AUTH
     r = c.post("/api/auth/password", json={"current_password": "brand-new-pw1", "new_password": PW})

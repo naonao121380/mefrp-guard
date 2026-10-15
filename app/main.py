@@ -77,7 +77,14 @@ app = FastAPI(title="mefrp-guard", version="1.0.3", lifespan=lifespan,
 # ---------------------------------------------------------------------------
 
 SESSION_COOKIE = "mg_session"
-_UNAUTHORIZED = {"WWW-Authenticate": 'Basic realm="mefrp-guard"'}
+# ⚠️ **故意不返回 `WWW-Authenticate: Basic`。**
+#    带上它，浏览器就会弹原生 Basic 对话框（还盖在登录页上面），并且把那组凭据
+#    **缓存**下来、之后每个请求都自动附加 —— 那个对话框没法登出，正是引入登录页
+#    要摆脱的东西（README.dev.md 的「认证」一节写明了这一点）。
+#    Basic 头本身仍然**被接受**（见 `is_authenticated` 的兜底分支），只是不再主动
+#    挑战：`curl -u` 和脚本都是**主动**发 Authorization 头的，不依赖挑战。
+#    （这条以前是 `_UNAUTHORIZED = {"WWW-Authenticate": ...}`，实现和上面那句设计
+#      意图是矛盾的 —— 2026-10-15 去掉。）
 
 
 def auth_enabled() -> bool:
@@ -142,9 +149,32 @@ def is_authenticated(request: Request) -> bool:
 
     和 require_auth 的分工：这个返回布尔，给「未登录要重定向到登录页」的
     页面路由用；require_auth 负责抛带具体原因的 401/403，给 API 用。
+
+    ★ **会话 Cookie 优先，Basic 兜底** —— 顺序不能反，理由见下面的长注释。
     """
     if not auth_enabled():
         return True
+
+    # ★ 先看 Cookie。`Authorization: Basic` 是**兼容通道**（脚本 / curl /
+    #   自动化），它只该在「没有有效会话」时兜底 —— 绝不能反过来压过 Cookie。
+    #
+    #   为什么顺序这么要紧：浏览器会把认证过的 Basic 凭据按 **origin + realm**
+    #   缓存下来，之后**每个**请求都自动附加（preemptive），不管服务器这次
+    #   有没有挑战它。1.0.0 / 1.0.1 是 Basic 时代，从那个版本升上来的浏览器里
+    #   必然躺着这组凭据；只要用户改过密码，它就是失效的（前面若挂了 Lucky /
+    #   nginx 的 BasicAuth，反代还会把**它自己**那组凭据透传进来，那就更对不上）。
+    #
+    #   如果 Basic 排在前面，`check_credentials` 一失败就 `return False` ——
+    #   Cookie 永远没机会生效，用户看到的是：
+    #       输入正确密码 → 登录成功 → 跳首页 → 又被踢回登录页 → 再登 → 再踢……
+    #   也就是「登录页疯狂刷新」。实测：有效 Cookie + 错误 Basic 时，
+    #   `/` 返回 302、`/api/auth/me` 返回 authenticated:false、`/api/overview` 401。
+    token = request.cookies.get(SESSION_COOKIE, "")
+    if token:
+        sess = store.get_session(auth.token_fingerprint(token))
+        if sess is not None:
+            request.state.username = sess["username"]
+            return True
 
     header = request.headers.get("authorization", "")
     if header.lower().startswith("basic "):
@@ -158,14 +188,7 @@ def is_authenticated(request: Request) -> bool:
             return True
         return False
 
-    token = request.cookies.get(SESSION_COOKIE, "")
-    if not token:
-        return False
-    sess = store.get_session(auth.token_fingerprint(token))
-    if sess is None:
-        return False
-    request.state.username = sess["username"]
-    return True
+    return False
 
 
 def require_auth(request: Request) -> None:
@@ -181,7 +204,7 @@ def require_auth(request: Request) -> None:
     if is_authenticated(request):
         return
 
-    raise HTTPException(status_code=401, detail="需要登录", headers=_UNAUTHORIZED)
+    raise HTTPException(status_code=401, detail="需要登录")
 
 
 Auth = Depends(require_auth)

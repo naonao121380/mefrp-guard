@@ -92,6 +92,30 @@
   「先挂接一个 frpc 容器」），对话框的「确认切换」也一并禁用，`failover()` 在入口处
   就拦住并说清该去做什么。
 
+- **「登录页疯狂刷新」：Basic 凭据压过了会话 Cookie。** 表现是输入正确密码 → 登录
+  成功 → 跳首页 → **又被踢回登录页** → 再登 → 再踢，来回刷个不停。
+
+  根因是 `is_authenticated()` 里两套凭据通道的**优先级反了**：`Authorization: Basic`
+  排在会话 Cookie 前面，而 Basic 校验失败时直接 `return False`（**压根不看 Cookie**）。
+  浏览器会把认证过的 Basic 凭据按 **origin + realm** 缓存下来，之后**每个**请求都
+  自动附加（preemptive，不管服务器这一次有没有挑战它）—— 1.0.0 / 1.0.1 是 Basic
+  时代，从那个版本升上来的浏览器里必然躺着这组凭据，而只要用户改过密码它就是
+  **失效**的（前面若挂了 Lucky / nginx 的 BasicAuth，反代还会把它自己那组凭据透传
+  进来，那就更对不上）。于是 Cookie 永远没机会生效。
+
+  实测复现（有效 Cookie + 一个错的 Basic 头）：`/` 返回 **302**、`/api/auth/me`
+  返回 `authenticated:false`、`/api/overview` 返回 **401** —— 三个结果和无 Cookie 时
+  一模一样。
+
+  现在改成**会话 Cookie 优先、Basic 兜底**：有有效会话就认，没有才回落到 Basic。
+  脚本 / curl / 自动化不受影响（它们本来就主动发 Authorization 头，不依赖优先级）。
+
+  顺带修掉一处自相矛盾：401 响应原来带着
+  `WWW-Authenticate: Basic realm="mefrp-guard"`，而设计意图白纸黑字写着「**故意不弹
+  浏览器原生 Basic 对话框**」（那个对话框没法登出，正是引入登录页要摆脱的东西）。
+  带着挑战头不但会让浏览器弹框，还会**诱导它缓存凭据**，正是上面那个 bug 的放大器。
+  现在 401 不再带 `WWW-Authenticate`；Basic 头仍然被接受，只是不再主动挑战。
+
 ### 内部
 
 - `settings.DNS_RECOVER_GRACE_SECONDS`（默认 600 秒）；`GuardEngine` 新增
@@ -113,6 +137,13 @@
   `_dns_check_due()` / `_note_dns_check()` 多收一个 `proxied` 参数。
 - 前端 `renderTunnels()` 的「手动切换」按钮按 `t.frpc_bound === false` 禁用，
   `failover()` 入口拦一道，`#foOk` 跟随禁用。
+- `is_authenticated()`：会话 Cookie 分支提到 Basic 分支**之前**（原来反了）；
+  401 不再带 `WWW-Authenticate`（`_UNAUTHORIZED` 常量已删）。
+- `tests/test_api.py` 新增 7 条断言：有效 Cookie + 失效 Basic 时 `/`、`/api/auth/me`、
+  `/api/overview` 都必须照常通过；无有效 Cookie 时失效 Basic 仍 401、正确 Basic 仍
+  200（兼容通道没被改坏）。另外把「改密码前的旧 Cookie 已作废」和「改密码后当前
+  客户端仍登录」也钉住了 —— 这两条原来被「Basic 优先」的顺序**掩盖**着：那个
+  `★ 旧密码立刻失效` 断言其实一直是靠 Basic 先命中的假象在过。
 
 ## 1.0.2
 
