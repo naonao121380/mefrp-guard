@@ -88,6 +88,21 @@ _move_tunnel -> ok=True  new_port=37720   （旧端口不在目标节点池里�
 清理完成，残留：无
 ```
 
+### 产物
+
+| 项 | 值 |
+|---|---|
+| 文件 | `out/mefrp-guard-v1.0.4.tar` |
+| 大小 | 62,949,888 B（约 60.0 MiB） |
+| sha256 | `3c69d1ff9b7f94313bc6294b84abe0c7a8a2718dba3eb712401aa8ef60cd3c34` |
+| image ID | `sha256:6b4dc6f98fad6a15ef5945f9a8d7e0d50dd74f1af1e0da58d0acc11f3a4a1f32` |
+| RepoTags | `mefrp-guard:1.0.4` |
+| 构建机 | `10.215.170.202`，构建耗时 **29s**（MTU 修好之后） |
+| 源码 | `4b872c5` |
+
+镜像内 `tests/run_all.sh` 全量通过、`/healthz` → `{"ok":true,...}`、
+`docker save` 往返 load 后 image ID 一致。
+
 ---
 
 ## 1.0.3 — 2026-10-17 重建（编辑隧道推远端 + metadatas 类型修复）

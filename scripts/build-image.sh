@@ -86,6 +86,9 @@ do_verify() {
     echo -n "  _pushNotice(前端):  "; grep -c "_pushNotice" /app/app/web/index.html
     echo -n "  force_restart:      "; grep -c "force_restart" /app/app/engine.py
     echo -n "  normalize_metadatas:"; grep -c "normalize_metadatas" /app/app/frpc.py
+    echo -n "  port_candidates:    "; grep -c "def port_candidates" /app/app/engine.py
+    echo -n "  pick_free_port:     "; grep -c "def pick_free_port" /app/app/engine.py
+    echo -n "  notify dedupe:      "; grep -c "DEDUPE_WINDOWS" /app/app/notifier.py
   ' || return 1
 
   hr "2.2) 依赖版本"
