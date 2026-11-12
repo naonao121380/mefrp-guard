@@ -174,13 +174,13 @@ mefrp 的免费节点会不定期下线、维护、被禁用。手工处理一�
 
 ### 方式一：用 Release 里的镜像（推荐）
 
-从 [Releases](../../releases) 下载镜像包 `mefrp-guard-v1.0.3.tar`，和仓库里的
+从 [Releases](../../releases) 下载镜像包 `mefrp-guard-v1.0.5.tar`，和仓库里的
 `docker-compose.yml`、`.env.example` 两个文件放在同一个目录，然后：
 
 ```bash
 # 1. 导入镜像
-docker load -i mefrp-guard-v1.0.3.tar
-docker images | grep mefrp-guard        # 应看到 mefrp-guard  v1.0.3
+docker load -i mefrp-guard-v1.0.5.tar
+docker images | grep mefrp-guard        # 应看到 mefrp-guard  v1.0.5
 
 # 2. 准备配置
 cp .env.example .env
@@ -192,7 +192,7 @@ docker compose up -d
 
 > 只要镜像已经导入，compose 就会直接用它，**不会再去本地构建** —— 所以不需要装源码、也不需要 Dockerfile。
 
-> ⚠️ 镜像的 tag 必须和 `docker-compose.yml` 里的 `image:` 一致（默认 `mefrp-guard:v1.0.3`）。
+> ⚠️ 镜像的 tag 必须和 `docker-compose.yml` 里的 `image:` 一致（默认 `mefrp-guard:v1.0.5`）。
 > 不一致的话 compose 会以为本地没有这个镜像，转头去本地构建。
 
 ### 方式二：自己构建
@@ -200,17 +200,17 @@ docker compose up -d
 ```bash
 cp .env.example .env
 vim .env
-docker compose up -d --build            # 等价于 docker build -t mefrp-guard:v1.0.3 . && docker compose up -d
+docker compose up -d --build            # 等价于 docker build -t mefrp-guard:v1.0.5 . && docker compose up -d
 ```
 
 想导出成 tar 发给别人：
 
 ```bash
-docker save mefrp-guard:v1.0.3 -o mefrp-guard-v1.0.3.tar
+docker save mefrp-guard:v1.0.5 -o mefrp-guard-v1.0.5.tar
 ```
 
-> 镜像 tag 固定成 `v1.0.3` 而不是 `latest`：`latest` 会让「现在跑的是哪一版」变成回答不了的问题，
-> 回滚时也没有可指的目标。改了代码就 build 成 `v1.0.3`，`docker compose up -d` 会自动用新镜像重建。
+> 镜像 tag 固定成 `v1.0.5` 而不是 `latest`：`latest` 会让「现在跑的是哪一版」变成回答不了的问题，
+> 回滚时也没有可指的目标。改了代码就 build 成 `v1.0.5`，`docker compose up -d` 会自动用新镜像重建。
 
 ### 升级到新版本
 
@@ -509,7 +509,21 @@ TCP/UDP 隧道和 HTTP/HTTPS 隧道用的是**两套独立的偏好** —— 因
 
 ## 更新日志
 
-最新 **1.0.4**：
+最新 **1.0.5**：
+
+- **修**：**通知刷屏的根因** —— 去重键原来是**正文哈希**，而正文里带着「第 N 次失败、
+  下次重试前等 X 分」这种每次都变的数字，于是「同一句话」被判定成完全不同的话，
+  去重形同虚设。现在改成**稳定 key**，并按「情形」只报一条：一个问题告诉你一次，
+  恢复之后再犯才报第二条。
+- **新**：**通知总闸** —— 不管代码怎么写，`10 条/分钟`、`40 条/小时` 是硬上限，超出的
+  合并成一条「已被限流」提示。这是「以后新代码又忘了去重」也刷不出来的兜底。
+- **新**：**自动切换次数上限**（设置项，默认 **3 次**，0 = 不限）—— 同一条隧道自动
+  切换用完就彻底停手，只推一条告警，之后完全交给人工。计数存在库里，**重启不清零**；
+  隧道恢复健康、或人工点「恢复自动切换」/「手动切换」才归零。
+- **改**：隧道卡片上有「⛔ 自动重试已停」标记和「恢复自动切换」按钮；事件列表里
+  「仍在冷却期」这类说明不再每 20 秒一条。
+
+上一版 **1.0.4**：
 
 - **修**：**所有节点切换都报 `[400] 远程端口无效`，回滚也失败** —— **mefrp 后端改了**，
   `remotePort: null`（让节点自动分配）不再被接受，传了必 400；端口被占用则是

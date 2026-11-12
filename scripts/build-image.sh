@@ -89,6 +89,10 @@ do_verify() {
     echo -n "  port_candidates:    "; grep -c "def port_candidates" /app/app/engine.py
     echo -n "  pick_free_port:     "; grep -c "def pick_free_port" /app/app/engine.py
     echo -n "  notify dedupe:      "; grep -c "DEDUPE_WINDOWS" /app/app/notifier.py
+    echo -n "  notify rate limit:  "; grep -c "RATE_LIMITS" /app/app/notifier.py
+    echo -n "  notify once():      "; grep -c "def _notify_once" /app/app/engine.py
+    echo -n "  failover_max_att:   "; grep -c "failover_max_attempts" /app/app/settings.py
+    echo -n "  reset-failover(API):"; grep -c "reset-failover" /app/app/main.py
   ' || return 1
 
   hr "2.2) 依赖版本"

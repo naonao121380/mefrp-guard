@@ -153,10 +153,13 @@ class FakeCF:
 
 
 class FakeNotifier:
-    def __init__(self): self.sent = []
+    # 引擎现在会给 send 传 key= / force=，并且读 last_reason 判断「这条算不算
+    # 已经被处理过」（见 engine._notify_once）。桩要如实模拟这两点。
+    def __init__(self): self.sent = []; self.last_reason = "sent"
     def configure(self, *a): pass
-    async def send(self, title, message, level="info"):
-        self.sent.append((level, title, message)); return True
+    def reset(self, *a): pass
+    async def send(self, title, message, level="info", *, key=None, force=False):
+        self.sent.append((level, title, message)); self.last_reason = "sent"; return True
 
 
 class FakeDocker:

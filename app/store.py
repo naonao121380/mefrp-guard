@@ -85,6 +85,10 @@ CREATE TABLE IF NOT EXISTS tunnels (
     last_failover_at         INTEGER NOT NULL DEFAULT 0,
     last_ok_at               INTEGER NOT NULL DEFAULT 0,
     fail_streak              INTEGER NOT NULL DEFAULT 0,
+    -- ★ 已用掉几次**自动**切换（人工切换 / 恢复健康会清零）。
+    --   到设置项 `failover_max_attempts` 就停手，改由人工处理。
+    --   必须持久化：重启一次就「忘记自己试过三次」，等于上限不存在。
+    failover_attempts        INTEGER NOT NULL DEFAULT 0,
     last_error               TEXT DEFAULT '',
     created_at               INTEGER NOT NULL,
     updated_at               INTEGER NOT NULL
@@ -215,6 +219,8 @@ def _migrate() -> None:
         ("tunnels", "route_locations", "TEXT NOT NULL DEFAULT ''"),
         ("tunnels", "crt_path", "TEXT NOT NULL DEFAULT ''"),
         ("tunnels", "key_path", "TEXT NOT NULL DEFAULT ''"),
+        # ---- 1.0.5：自动切换次数上限 ----
+        ("tunnels", "failover_attempts", "INTEGER NOT NULL DEFAULT 0"),
     )
     for table, col, decl in wanted:
         cols = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
@@ -502,6 +508,8 @@ TUNNEL_FIELDS = (
     #   last_ok_at       —— UI 上「上次健康」永远显示 —（只是显示问题）
     #   last_error       —— UI 上看不到失败原因（只是显示问题）
     "last_failover_at", "last_ok_at", "fail_streak", "last_error",
+    # 自动切换已用次数（见 SCHEMA 与 settings.failover_max_attempts）
+    "failover_attempts",
 )
 
 

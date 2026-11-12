@@ -15,6 +15,8 @@
   * fail_threshold —— 连续失败 N 次才判定故障，避免网络抖动误切
   * failover_cooldown —— 一次切换后冷却一段时间，避免在多个坏节点间反复横跳
   * node_cooldown —— 刚被切走的节点一段时间内不再选它
+  * failover_max_attempts —— 同一条隧道最多自动切换几次，用完停手交给人工
+  * 通知三件套 —— 稳定 key 去重 / 情形级静音 / 全局限流（见 `_notify_once`）
 """
 
 from __future__ import annotations
@@ -235,11 +237,14 @@ PROBE_HTTP = "http"
 # 那个管的是「连续探测失败几次才触发切换」，捆在一起以后调一个必然误伤另一个。
 ALERT_AFTER_SECONDS = 1800
 
-# ★ 连续多少次「切换成功、但切完依然不健康」就停止自动切换（熔断）。
+# ★ 同一条隧道最多自动切换几次 —— 默认值，设置页可改（`failover_max_attempts`）。
 #
-# 自动切换能治的只有「这个节点坏了」。如果换了三个节点依然不通，问题就不在
-# 节点上（frpc 没连、容器配置里没这条隧道、本地服务没起）—— 再换也只是反复
-# 删/建 proxy，把「还能手动救」变成「越折腾越乱」。
+# 自动切换能治的只有「这个节点坏了」。如果换了几次依然不通，问题就不在节点上
+# （frpc 没连、容器配置里没这条隧道、本地服务没起、mefrp 接口改版）—— 再换
+# 也只是反复删/建 proxy，把「还能手动救」变成「越折腾越乱」。
+#
+# ⚠️ 计数是**持久化**的（tunnels.failover_attempts），重启不清零。到上限后
+#    引擎彻底停手，只留一条告警 + 页面上的「恢复自动切换」按钮，把决定权交回人。
 AUTO_FAILOVER_BREAKER = 3
 
 
@@ -538,9 +543,20 @@ class GuardEngine:
         #   内存态即可：重启后重新从 1 开始，最多多推两三条。
         self.failover_fail_streak: dict[int, int] = {}
 
-        # ★ 「切换成功但切完不健康」的连续次数（tid -> 次数），到
-        #   AUTO_FAILOVER_BREAKER 就熔断，不再自动切换。见 _reconcile 里的说明。
-        self.failover_unhealthy_streak: dict[int, int] = {}
+        # ★ 「切换成功但切完不健康」的连续次数已经并进 `tunnels.failover_attempts`
+        #   （持久化，见 settings.failover_max_attempts）—— 不再单独维护一个内存计数。
+        #
+        # ★ 情形级告警静音表：key -> True 表示「这个情形已经报过了」。
+        #   与 notifier 的时间窗去重**不是一回事**：时间窗是「N 分钟内别再发」，
+        #   这里是「同一个故障没恢复就别再发第二条」。两个都要，理由见
+        #   `_notify_once` 的注释。
+        self._alert_muted: dict[str, bool] = {}
+
+        # ★ 事件节流表：key -> 上次记事件的时刻（monotonic）。
+        #   有些「说明原因」的 warn 天生会被每轮巡检重复触发（最典型的是
+        #   「需要切换，但仍在冷却期」—— 冷却 5 分钟，20 秒一轮就是 15 条）。
+        #   Gotify 那边已经拦住了，但事件列表也是给人看的，同样不能被刷。
+        self._event_throttle: dict[str, float] = {}
 
         self.last_error: str = ""
         self.tick_count: int = 0
@@ -1183,8 +1199,16 @@ class GuardEngine:
                     verdict = Verdict(False, why, "probe")
 
         if verdict.ok:
-            if tunnel["fail_streak"]:
-                store.update_tunnel(tid, {"fail_streak": 0, "last_error": ""})
+            if tunnel["fail_streak"] or int(tunnel.get("failover_attempts") or 0):
+                # ★ 恢复健康 = 这一段故障结束了：失败计数、自动切换次数、
+                #   所有「情形级」告警静音一起清零。下次再犯才会重新报一条。
+                store.update_tunnel(tid, {
+                    "fail_streak": 0, "last_error": "", "failover_attempts": 0,
+                })
+                self._notify_clear(self._alert_key(tid, "probe-fail"),
+                                   self._alert_key(tid, "failover-fail"),
+                                   self._alert_key(tid, "failover-rollback"),
+                                   self._alert_key(tid, "paused"))
             store.update_tunnel(tid, {"last_ok_at": int(time.time())})
             await self._sync_dns(tunnel, proxy)
             return
@@ -1201,8 +1225,9 @@ class GuardEngine:
                 tunnel_id=tid, detail=f"判定层：{verdict.layer}",
             )
             if store.get_setting("notify_on_probe_fail"):
-                await self._notify(
-                    f"隧道异常：{tunnel['name']}", verdict.reason, "warn"
+                await self._notify_once(
+                    self._alert_key(tid, "probe-fail"),
+                    f"隧道异常：{tunnel['name']}", verdict.reason, "warn",
                 )
 
         if streak < threshold:
@@ -1244,42 +1269,57 @@ class GuardEngine:
                 )
             return
 
-        # ★ 熔断：连续几次「切换动作成功、但切完依然不健康」就停止自动切换。
+        # ★ 自动切换次数上限（设置项 `failover_max_attempts`，默认 3）。
         #
-        # 为什么需要：2026-11-13 的事故里，ikuai_ovpn（udp）一直显示离线，
-        # 引擎每过一个冷却期就把它搬一次 —— 每次都是「搬成功、照样不通、再搬」。
-        # 这类问题的根因**不在节点上**（frpc 没连上 / 隧道没在容器配置里），
-        # 换多少个节点都一样，而每搬一次都要删掉旧 proxy 再新建，等于持续破坏。
-        # 冷却退避只能让它变慢，不能让它停。
+        # 为什么需要：自动切换只能解决「这个节点坏了」。2026-11-13 的事故里，
+        # ikuai_ovpn（udp）一直离线，引擎每过一个冷却期就搬一次 —— 每次都是
+        # 「搬成功、照样不通、再搬」。这类问题的根因**不在节点上**（frpc 没连上 /
+        # 隧道没在容器配置里 / 本地服务没起 / mefrp 接口改版），换多少个节点都一样，
+        # 而每搬一次都要删掉旧 proxy 再新建，等于持续破坏。
         #
-        # 停在这里、把话说明白，比「看起来在自愈」负责得多。健康一次就清零。
-        unhealthy = int(self.failover_unhealthy_streak.get(tid, 0))
-        if unhealthy >= AUTO_FAILOVER_BREAKER:
-            if streak == threshold:
+        # 冷却退避只能让它变慢，不能让它停。所以这里用**持久化计数**：
+        #   · 每真正发起一次自动切换 +1（见 `_failover`）
+        #   · 恢复健康、或人工切换一次 → 清零
+        #   · 到上限就彻底停手，只报一条，等人工处理
+        max_attempts = int(store.get_setting("failover_max_attempts",
+                                             AUTO_FAILOVER_BREAKER)
+                           or AUTO_FAILOVER_BREAKER)
+        used = int(tunnel.get("failover_attempts") or 0)
+        if max_attempts > 0 and used >= max_attempts:
+            # ⚠️ **不能**用 `streak == threshold` 做「只记一次」的门 —— `streak`
+            #   在阈值之上还会一直涨（3、4、5…），而「次数用完」发生在第 3 次
+            #   尝试之后，那时 streak 早就不等于 threshold 了，于是事件和告警
+            #   都不会发出来：引擎静悄悄停手，人根本不知道。
+            #   这里用「这个情形是否已经报过」+ 事件节流（1 小时）来控频。
+            key_paused = self._alert_key(tid, "paused")
+            if not self._alert_muted.get(key_paused) and \
+                    self._event_due(f"paused-event:{tid}", 3600):
                 store.add_event(
                     "error", "failover",
-                    f"隧道「{tunnel['name']}」连续 {unhealthy} 次切换后依然不健康，"
-                    "已暂停自动切换",
+                    f"隧道「{tunnel['name']}」已自动切换 {used} 次仍未恢复，"
+                    "已停止自动重试",
                     tunnel_id=tid,
                     detail="自动切换只能解决「节点坏了」，解决不了「隧道本身没连上」。\n"
                            "请人工确认：承载它的 frpc 容器是否在跑、容器配置里是否真的有"
-                           "这条隧道、本地服务端口是否通。\n"
-                           "处理完点一次「切换节点」或重启引擎，计数会自动归零。",
+                           "这条隧道、本地服务端口是否通、mefrp 侧是否还能建这个端口。\n"
+                           f"处理完点页面上的「恢复自动切换」（会清零计数并重新给 "
+                           f"{max_attempts} 次机会），或直接手动切换一次。",
                 )
-                await self._notify(
-                    f"⛔ 已暂停自动切换：{tunnel['name']}",
-                    f"连续 {unhealthy} 次切换后依然不健康，继续换节点没有意义。\n"
-                    "请检查 frpc 容器与本地服务，处理完手动切换一次即可恢复。",
-                    "error",
-                )
+            await self._notify_once(
+                key_paused,
+                f"⛔ 已停止自动重试：{tunnel['name']}",
+                f"自动切换 {used} 次（上限 {max_attempts}）之后依然不健康，"
+                "继续换节点没有意义，已停手。\n\n"
+                "请检查 frpc 容器、容器配置里有没有这条隧道、本地服务是否在跑。\n"
+                "处理完点「恢复自动切换」，或手动切换一次即可恢复。",
+                "error",
+            )
             return
 
-        res = await self._failover(tunnel, verdict.reason)
-        if res.get("healthy"):
-            self.failover_unhealthy_streak.pop(tid, None)
-        elif res.get("ok"):
-            # 切换动作本身成功了，但隧道没上线 / 探测没通过 —— 记一笔。
-            self.failover_unhealthy_streak[tid] = unhealthy + 1
+        await self._failover(tunnel, verdict.reason)
+        # 健康一次就清零 —— 由 `verdict.ok` 那条分支负责（见上面的注释）。
+        # 这里不再单独记「切换成功但没恢复」的次数：次数统一由
+        # `_failover` 里的 `failover_attempts` 统计，避免两套计数打架。
 
     async def _reconcile_manual(self, tunnel: dict) -> None:
         """外部节点上的隧道：**只探测、只报告，永不自动切换**。
@@ -1335,7 +1375,11 @@ class GuardEngine:
 
         if ok is True:
             if tunnel["fail_streak"]:
+                # 恢复 = 这段故障结束，情形级告警重新武装（外部节点没有自动切换，
+                # 所以不用管 failover_attempts）。
                 store.update_tunnel(tid, {"fail_streak": 0, "last_error": ""})
+                self._notify_clear(self._alert_key(tid, "probe-fail"),
+                                   self._alert_key(tid, "manual-needs-human"))
             store.update_tunnel(tid, {"last_ok_at": int(time.time())})
             # 外部节点没有 Proxy 对象，地址直接就是节点的 serverAddr。
             await self._sync_dns(tunnel, None, host=host)
@@ -1368,7 +1412,10 @@ class GuardEngine:
                 tunnel_id=tid, detail=f"探测目标：{host}:{port}",
             )
             if store.get_setting("notify_on_probe_fail"):
-                await self._notify(f"隧道异常：{tunnel['name']}", why, "warn")
+                await self._notify_once(
+                    self._alert_key(tid, "probe-fail"),
+                    f"隧道异常：{tunnel['name']}", why, "warn",
+                )
 
         if streak == threshold:
             # ⚠️ 只在刚跨过阈值那一次记 —— 否则 streak 会一直保持在高位，
@@ -1382,7 +1429,8 @@ class GuardEngine:
                        "换节点是**实例级**动作：去「frpc」页把承载这条隧道的那个实例"
                        "改连到别的节点（或点隧道卡片上的「更新节点配置」重新粘一份配置）。",
             )
-            await self._notify(
+            await self._notify_once(
+                self._alert_key(tid, "manual-needs-human"),
                 f"⚠️ 隧道异常（需人工处理）：{tunnel['name']}",
                 f"外部节点：{node['name']}（{host}:{port}）\n"
                 f"原因：{why}\n\n外部节点不支持自动切换，请手动处理。",
@@ -1794,6 +1842,20 @@ class GuardEngine:
             store.update_tunnel(sid, {"last_failover_at": int(now)})
         return streak
 
+    def _event_due(self, key: str, interval: float = 600.0) -> bool:
+        """这条「说明性事件」现在该不该记（同 key 至少隔 `interval` 秒）。
+
+        只给**会随每轮巡检重复触发**的事件用（冷却中、实例冷却中这类）。真正的
+        故障事件（第一次失败、跨过阈值、切换结果）不要走这里 —— 那些漏了就是
+        漏了信息。
+        """
+        now = time.monotonic()
+        last = self._event_throttle.get(key)
+        if last is not None and now - last < interval:
+            return False
+        self._event_throttle[key] = now
+        return True
+
     async def _failover(self, tunnel: dict, reason: str,
                         prefer_node_id: int | None = None,
                         ignore_cooldown: bool = False) -> dict:
@@ -1838,12 +1900,11 @@ class GuardEngine:
         base_cooldown = float(store.get_setting("failover_cooldown", 300) or 300)
         cooldown = base_cooldown
 
-        # ★ 手动切换（ignore_cooldown=True）是用户明确介入 —— 把两个「连续失败」
+        # ★ 手动切换（ignore_cooldown=True）是用户明确介入 —— 把「连续失败」
         #   计数一起清零，重新给一次完整的机会。否则一次熔断之后，用户手动修好
         #   了问题，引擎还会因为历史计数不肯再自动切换。
         if ignore_cooldown:
             self.failover_fail_streak.pop(tid, None)
-            self.failover_unhealthy_streak.pop(tid, None)
 
         # ★ 连续失败 → 指数退避（base、2×、4×、8×，封顶 8 倍）。
         #   对「失败原因根本不在节点上」的情况（mefrp 接口改了、账号没权限、
@@ -1856,12 +1917,15 @@ class GuardEngine:
         if not ignore_cooldown and \
                 now - float(tunnel["last_failover_at"] or 0) < cooldown:
             left = int(cooldown - (now - float(tunnel["last_failover_at"] or 0)))
-            store.add_event(
-                "warn", "failover",
-                f"隧道「{tunnel['name']}」需要切换，但仍在冷却期（{left}s"
-                + (f"，已连续失败 {fails} 次，冷却已退避" if fails else "") + "）",
-                tunnel_id=tid,
-            )
+            # ⚠️ 节流：冷却期内每轮巡检都会走到这里，不拦的话事件列表 20 秒一条。
+            #    真正的原因已经在 `last_error` 和第一条失败事件里了。
+            if self._event_due(f"cool:{tid}", 600):
+                store.add_event(
+                    "warn", "failover",
+                    f"隧道「{tunnel['name']}」需要切换，但仍在冷却期（{left}s"
+                    + (f"，已连续失败 {fails} 次，冷却已退避" if fails else "") + "）",
+                    tunnel_id=tid,
+                )
             return {"ok": False, "error": f"仍在冷却期，还需等待 {left} 秒"}
 
         # ★ 没挂接 frpc 容器**照样允许切换**（1.0.3 改）。
@@ -1895,17 +1959,37 @@ class GuardEngine:
                       if now - float(t["last_failover_at"] or 0) < cooldown]
             if recent:
                 left = int(cooldown - (now - float(recent[0]["last_failover_at"] or 0)))
-                store.add_event(
-                    "warn", "failover",
-                    f"隧道「{tunnel['name']}」需要切换，但它所属的 frpc 实例"
-                    f"刚切换过，仍在冷却期（{left}s）",
-                    tunnel_id=tid,
-                )
+                if self._event_due(f"cool-group:{tid}", 600):
+                    store.add_event(
+                        "warn", "failover",
+                        f"隧道「{tunnel['name']}」需要切换，但它所属的 frpc 实例"
+                        f"刚切换过，仍在冷却期（{left}s）",
+                        tunnel_id=tid,
+                    )
                 return {"ok": False,
                         "error": f"所属 frpc 实例仍在冷却期，还需等待 {left} 秒"}
 
         group_note = (f"（连带同实例的另外 {len(others)} 条隧道一起切换）"
                       if others else "")
+
+        # ★ 计数只在**真的要去动 mefrp** 这一步做 —— 被冷却挡回去不算一次尝试。
+        #
+        #   · 自动切换：整组各 +1（持久化）。到上限后引擎在 `_reconcile` 里就
+        #     不再进来，这里不会无限涨。
+        #   · 手动切换：清零，并把情形级告警重新武装 —— 用户修完东西点一次，
+        #     等于明确说「再试一次」，那就该给满额度的新机会。
+        for t in group:
+            sid = int(t["id"])
+            if ignore_cooldown:
+                store.update_tunnel(sid, {"failover_attempts": 0})
+                self._notify_clear(self._alert_key(sid, "paused"),
+                                   self._alert_key(sid, "failover-fail"),
+                                   self._alert_key(sid, "failover-rollback"))
+            else:
+                store.update_tunnel(sid, {
+                    "failover_attempts": int(t.get("failover_attempts") or 0) + 1,
+                })
+
         store.add_event(
             "warn", "failover",
             f"隧道「{tunnel['name']}」开始故障转移，原因：{reason}{group_note}",
@@ -1938,7 +2022,11 @@ class GuardEngine:
             store.update_tunnel(tid, {"last_error": why})
             store.add_event("error", "failover",
                             f"隧道「{tunnel['name']}」切换失败：{why}", tunnel_id=tid)
-            await self._notify(
+            # ⚠️ 用**稳定 key** + 情形去重：正文里带着冷却秒数（每次退避都变），
+            #   拿去哈希的话每条都「不重复」，去重会整个失效 —— 这是 11-13
+            #   刷屏能穿过去的原因之一。
+            await self._notify_once(
+                self._alert_key(tid, "failover-fail"),
                 f"⚠️ 隧道切换失败：{tunnel['name']}",
                 f"{why}\n\n"
                 f"已进入冷却（第 {fails} 次连续失败，下次重试前等 "
@@ -2009,8 +2097,9 @@ class GuardEngine:
                     f"且回滚未完全成功：{'；'.join(rollback_errs)}",
                     tunnel_id=int(bad["tunnel"]["id"]),
                 )
-                await self._notify(
-                    f"⚠️ 隧道切换失败：{tunnel['name']}",
+                await self._notify_once(
+                    self._alert_key(tid, "failover-rollback"),
+                    f"⚠️ 隧道切换失败（回滚未完成）：{tunnel['name']}",
                     f"节点：{node.name}\n原因：{err}\n\n"
                     "⚠️ 回滚未完全成功，以下隧道需要人工检查：\n"
                     + "\n".join(f"  · {e}" for e in rollback_errs)
@@ -2026,7 +2115,8 @@ class GuardEngine:
                 f"本次切换已回滚：{err}",
                 tunnel_id=int(bad["tunnel"]["id"]),
             )
-            await self._notify(
+            await self._notify_once(
+                self._alert_key(tid, "failover-fail"),
                 f"⚠️ 隧道切换失败：{tunnel['name']}",
                 f"节点：{node.name}\n原因：{err}\n"
                 f"（本次共 {len(group)} 条隧道要一起切换，已全部建回原节点）"
@@ -2220,9 +2310,14 @@ class GuardEngine:
             + (f"（同实例共 {len(moved)} 条一起）" if len(moved) > 1 else ""),
             tunnel_id=tid, detail="\n".join(lines),
         )
+        # ★ 切换是**真实事件**，每次都要告知 —— 但用稳定 key + 时间窗兜住
+        #   「抖动型隧道一分钟切三次」这种极端情况。切完不健康单独一个 key：
+        #   那和「切完就好了」是两回事，别互相顶掉。
         await self._notify(
             ("✅ " if level == "success" else "⚠️ ") + f"隧道已切换：{tunnel['name']}",
             "\n".join(lines), level,
+            key=self._alert_key(tid, "switched" if level == "success"
+                                     else "switched-unhealthy"),
         )
 
         # ok 表示「切换动作本身走完了」；healthy 表示「切换后端到端真的通了」。
@@ -2670,6 +2765,7 @@ class GuardEngine:
                     "原端口在目标节点上不可用（被占用或不在节点允许范围内），"
                     "已自动换用新端口。请检查依赖这个端口的客户端 / 防火墙 / DNAT 配置。",
                     "warn",
+                    key=self._alert_key(tunnel_id, "port-changed"),
                 )
                 out["port_changed"] = True
                 out["old_port"] = old_port
@@ -3486,6 +3582,7 @@ class GuardEngine:
         await self._notify(
             f"{'✅' if level == 'success' else '⚠️'} 已切换外部节点：{label}",
             "\n".join(lines), level,
+            key=f"i{int(iid)}:manual-node-switch",
         )
 
         return {
@@ -3512,9 +3609,106 @@ class GuardEngine:
     # ------------------------------------------------------------------
     # 通知
     # ------------------------------------------------------------------
+    #
+    # ★ 三层，缺一不可：
+    #   1. `_notify`        —— 普通事件，只做 notifier 那一层的去重/限流
+    #   2. `_notify_once`   —— **情形级**：同一个问题没恢复就只报一条
+    #   3. `notifier.send`  —— 最后一道全局限流，防止新代码又写出循环
+    #
+    # 为什么不能只靠第 1 层：时间窗去重是「30 分钟内别重发」，一个持续一夜的
+    # 故障会老老实实地每 30 分钟报一次（一夜 16 条）；而真正的语义应该是
+    # 「这个故障我告诉你一次，恢复了我再告诉你，期间别再吵」。
 
-    async def _notify(self, title: str, message: str, level: str = "info") -> None:
-        await self.notifier.send(title, message, level)
+    @staticmethod
+    def _alert_key(tunnel_id: int, kind: str) -> str:
+        """情形键：一条隧道的某一类问题 = 一个 key。
+
+        ⚠️ **不要**把变化的数字（端口、秒数、节点名）拼进来 —— 那样每次
+        都是新 key，去重就失效了。动态细节写在正文里即可。
+        """
+        return f"t{int(tunnel_id)}:{kind}"
+
+    async def _notify(self, title: str, message: str, level: str = "info",
+                      *, key: str | None = None, force: bool = False) -> bool:
+        return await self.notifier.send(title, message, level, key=key, force=force)
+
+    async def _notify_once(self, key: str, title: str, message: str,
+                           level: str = "error") -> bool:
+        """同一情形（`key`）只推一条，直到 `_notify_clear` 解除。
+
+        「发完就静音」是刻意的：
+          · 条件持续存在（隧道一直离线、切换一直失败）→ 不再重复打扰；
+          · 条件恢复 → 引擎调 `_notify_clear`，下次再犯才报第二条；
+          · 进程重启 → 静音表是内存态，最多多报一条。这个方向是安全的
+            （宁可多一条，不可漏掉新故障）。
+
+        发送**失败**（Gotify 连不上）时不静音，留给下一轮重试 —— notifier 那边
+        有 60 秒短退避兜着，不会打成死循环。
+        """
+        if self._alert_muted.get(key):
+            return False
+        ok = await self._notify(title, message, level, key=key)
+        reason = getattr(self.notifier, "last_reason", "sent")
+        if ok or reason in ("sent", "duplicate", "http_error"):
+            self._alert_muted[key] = True
+        return ok
+
+    def _notify_clear(self, *keys: str) -> None:
+        """解除情形静音（条件已恢复 / 人工介入），下次再发生可以重新报一条。"""
+        for k in keys:
+            self._alert_muted.pop(k, None)
+            reset = getattr(self.notifier, "reset", None)
+            if callable(reset):
+                reset(k)
+
+    def max_failover_attempts(self) -> int:
+        """自动切换次数上限（设置项；0 = 不限）。脏值回落默认值。"""
+        try:
+            n = int(store.get_setting("failover_max_attempts",
+                                      AUTO_FAILOVER_BREAKER)
+                    or AUTO_FAILOVER_BREAKER)
+        except (TypeError, ValueError):
+            n = AUTO_FAILOVER_BREAKER
+        return max(0, n)
+
+    def auto_failover_paused(self, tunnel: dict, *, manual: bool = False) -> bool:
+        """这条隧道的自动切换是不是已经用完次数、停手了。
+
+        `manual=True`（外部节点托管）永远返回 False —— 那种隧道本来就不自动切换，
+        标成「已暂停」会让人以为它以前会自动切。
+        """
+        if manual:
+            return False
+        limit = self.max_failover_attempts()
+        if limit <= 0:
+            return False
+        return int(tunnel.get("failover_attempts") or 0) >= limit
+
+    def reset_failover_attempts(self, tunnel_id: int) -> dict:
+        """人工「恢复自动切换」：清零次数、解除静音，并重置冷却起点。
+
+        为什么要动 `last_failover_at`：不然用户刚点完，引擎下一轮发现还在
+        冷却期（失败退避可能已经涨到 40 分钟），会再等半小时才试 —— 看起来
+        像按钮没生效。
+        """
+        tunnel = store.get_tunnel(int(tunnel_id))
+        if tunnel is None:
+            return {"ok": False, "error": "隧道不存在"}
+        tid = int(tunnel_id)
+        store.update_tunnel(tid, {"failover_attempts": 0, "last_failover_at": 0})
+        self.failover_fail_streak.pop(tid, None)
+        self._notify_clear(self._alert_key(tid, "paused"),
+                           self._alert_key(tid, "failover-fail"),
+                           self._alert_key(tid, "failover-rollback"))
+        store.add_event(
+            "info", "failover",
+            f"隧道「{tunnel['name']}」的自动切换已恢复",
+            tunnel_id=tid,
+            detail="计数已清零、冷却已重置。下一轮巡检发现异常就会重新尝试切换"
+                   "（最多再试 "
+                   f"{int(store.get_setting('failover_max_attempts', AUTO_FAILOVER_BREAKER) or AUTO_FAILOVER_BREAKER)} 次）。",
+        )
+        return {"ok": True, "tunnel_id": tid}
 
     # ------------------------------------------------------------------
     # 快照

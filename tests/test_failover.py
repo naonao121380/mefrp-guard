@@ -118,10 +118,13 @@ class FakeCF:
 
 # ---------------- 假 Gotify ----------------
 class FakeNotifier:
-    def __init__(self): self.sent = []
+    # 引擎现在会给 send 传 key= / force=，并且读 last_reason 判断「这条算不算
+    # 已经被处理过」（见 engine._notify_once）。桩要如实模拟这两点。
+    def __init__(self): self.sent = []; self.last_reason = "sent"
     def configure(self, *a): pass
-    async def send(self, title, message, level="info"):
-        self.sent.append((level, title, message)); return True
+    def reset(self, *a): pass
+    async def send(self, title, message, level="info", *, key=None, force=False):
+        self.sent.append((level, title, message)); self.last_reason = "sent"; return True
 
 # ---------------- 假 Docker ----------------
 class FakeDocker:
@@ -478,33 +481,85 @@ PROBE["ok"] = True; PROBE["why"] = ""
 fake.created_online = True
 
 # ===========================================================================
-# [12] ★ 熔断：连续几次「切完依然不健康」之后不再自动切换
+# [12] ★ 自动切换次数上限：用完就停手，完全交给人工
 # ===========================================================================
 # 2026-11-13 事故的另一半：ikuai_ovpn 一直离线，引擎每过一个冷却期就搬一次，
 # 每次都是「搬成功、照样不通、再搬」。自动切换治不了「隧道本身没连上」，
 # 再换节点只会反复删/建 proxy。
-print("\n[12] ★ 连续切换后依然不健康 -> 熔断")
+#
+# 现在的语义：计数**存在库里**（tunnels.failover_attempts），到
+# `failover_max_attempts` 就彻底停手；重启引擎不清零 —— 否则「重启一下又有
+# 三次机会」等于上限不存在。
+print("\n[12] ★ 自动切换次数用完 -> 停手")
 eng.nodes = {n.node_id: n for n in asyncio.run(fake.node_list())}
 eng.proxies = {"nas-panel": Proxy(
     proxy_id=222, proxy_name="nas-panel", proxy_type="tcp", node_id=9,
     local_ip="127.0.0.1", local_port=5000, remote_port=41234, is_online=False)}
 eng.proxy_by_id = {222: eng.proxies["nas-panel"]}
-eng.failover_unhealthy_streak[tid] = 3
-store.update_tunnel(tid, {"fail_streak": 2})        # 这一轮刚好跨过阈值 3
+store.update_tunnel(tid, {"fail_streak": 5,        # ★ 刻意**高于**阈值：真实场景里
+                          #   次数用完时 streak 早就涨过 3 了，用 ==threshold 去门控
+                          #   会让「已停手」这条告警永远发不出来（静默停手）。
+                          "failover_attempts": 3,
+                          "last_failover_at": 0})
 store.set_setting("fail_threshold", 3)
 store.set_setting("auto_failover", True)
+store.set_setting("failover_max_attempts", 3)
 fake.created.clear(); fake.attempts.clear(); fake.deleted.clear(); nf.sent.clear()
 asyncio.run(eng._reconcile(store.get_tunnel(tid)))
-check("★ 熔断后不再自动切换（一个 create 请求都没发）",
+check("★ 到上限后不再自动切换（一个 create 请求都没发）",
       fake.created == [] and fake.attempts == [], (fake.created, fake.attempts))
-check("★ 记了一条「已暂停自动切换」的 error 事件",
-      any("已暂停自动切换" in e["message"]
+check("★ 记了一条「已停止自动重试」的 error 事件",
+      any("已停止自动重试" in e["message"]
           for e in store.list_events(tunnel_id=tid)),
       [e["message"] for e in store.list_events(tunnel_id=tid)][-3:])
-check("★ 推了一条「已暂停自动切换」的告警", bool(nf.sent)
-      and "已暂停自动切换" in nf.sent[-1][1], nf.sent[-1][:2] if nf.sent else None)
-check("★ 健康一次就能清零计数",
-      (eng.failover_unhealthy_streak.pop(tid, None), True)[1])
+check("★ 推了一条「已停止自动重试」的告警", bool(nf.sent)
+      and "已停止自动重试" in nf.sent[-1][1], nf.sent[-1][:2] if nf.sent else None)
+check("★ 同一条告警不会每轮都推（只有一条）",
+      sum(1 for s in nf.sent if "已停止自动重试" in s[1]) == 1,
+      [s[1] for s in nf.sent])
+
+# 上限是设置项：改成 5 之后，同一条隧道（已用 3 次）应重新获得机会
+store.set_setting("failover_max_attempts", 5)
+fake.created.clear(); fake.attempts.clear()
+asyncio.run(eng._reconcile(store.get_tunnel(tid)))
+check("★ 上限改成 5 后重新尝试（设置项真的生效）",
+      bool(fake.created or fake.attempts), (fake.created, fake.attempts))
+
+# ===========================================================================
+# [13] ★ failover_attempts：一次尝试 +1、健康清零、人工重置
+# ===========================================================================
+print("\n[13] ★ failover_attempts 的记账")
+store.update_tunnel(tid, {"failover_attempts": 0, "fail_streak": 0,
+                          "last_failover_at": 0})
+eng.failover_fail_streak = {}
+saved_nodes = eng.nodes
+eng.nodes = {}          # 没有可用节点 -> 必然走失败分支
+asyncio.run(eng._failover(store.get_tunnel(tid), "没有节点可用（测试）"))
+check("一次失败的自动切换也计数 +1",
+      store.get_tunnel(tid)["failover_attempts"] == 1,
+      store.get_tunnel(tid)["failover_attempts"])
+eng.nodes = saved_nodes
+
+store.update_tunnel(tid, {"failover_attempts": 2, "fail_streak": 1,
+                          "last_failover_at": 0})
+eng.proxies = {"nas-panel": Proxy(
+    proxy_id=222, proxy_name="nas-panel", proxy_type="tcp", node_id=9,
+    local_ip="127.0.0.1", local_port=5000, remote_port=41234, is_online=True)}
+eng.proxy_by_id = {222: eng.proxies["nas-panel"]}
+PROBE["ok"] = True; PROBE["why"] = ""
+asyncio.run(eng._reconcile(store.get_tunnel(tid)))
+check("★ 恢复健康 -> 计数清零（下一段故障重新有额度）",
+      store.get_tunnel(tid)["failover_attempts"] == 0,
+      store.get_tunnel(tid)["failover_attempts"])
+
+store.update_tunnel(tid, {"failover_attempts": 3, "last_failover_at": 12345})
+r = eng.reset_failover_attempts(tid)
+check("人工「恢复自动切换」：计数清零", store.get_tunnel(tid)["failover_attempts"] == 0,
+      store.get_tunnel(tid)["failover_attempts"])
+check("人工「恢复自动切换」：冷却起点也重置（否则按钮像没生效）",
+      int(store.get_tunnel(tid)["last_failover_at"]) == 0,
+      store.get_tunnel(tid)["last_failover_at"])
+check("人工「恢复自动切换」返回 ok", r.get("ok") is True, r)
 
 print(f"\n==> PASS {ok} / FAIL {bad}")
 sys.exit(1 if bad else 0)

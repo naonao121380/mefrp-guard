@@ -57,7 +57,7 @@ async def lifespan(_app: FastAPI):
         store.add_event("info", "system", "mefrp-guard 停止")
 
 
-app = FastAPI(title="mefrp-guard", version="1.0.4", lifespan=lifespan,
+app = FastAPI(title="mefrp-guard", version="1.0.5", lifespan=lifespan,
               docs_url=None, redoc_url=None)
 
 
@@ -701,6 +701,8 @@ async def overview(_: None = Auth) -> dict[str, Any]:
             "probe_skipped": bool(cached and cached[1] is None),
             "probe_reason": cached[2] if cached else "",
             "probe_at": int(cached[0]) if cached else 0,
+            # 自动切换次数已用完（见 engine.auto_failover_paused）
+            "auto_failover_paused": engine.auto_failover_paused(t, manual=mn is not None),
         })
 
     instances = store.list_frpc_instances()
@@ -769,6 +771,10 @@ async def list_tunnels(tag: str | None = None,
             **t,
             "frpc_instance_name": inst["name"] if inst else "",
             "frpc_bound": inst is not None,
+            # 自动切换次数已用完 -> 引擎停手，等人工处理。
+            # 前端据此画「⛔ 自动重试已停」+「恢复自动切换」按钮。
+            "auto_failover_paused": engine.auto_failover_paused(
+                t, manual=t.get("manual_node_id") is not None),
         })
     return out
 
@@ -1075,6 +1081,20 @@ async def manual_failover(tunnel_id: int, payload: FailoverIn,
     result = await engine.force_failover(tunnel_id, payload.node_id)
     if not result.get("ok"):
         raise HTTPException(400, result.get("error") or "切换失败")
+    return result
+
+
+@app.post("/api/tunnels/{tunnel_id}/reset-failover")
+async def reset_tunnel_failover(tunnel_id: int, _: None = Auth) -> dict[str, Any]:
+    """人工「恢复自动切换」：清零已用次数、解除告警静音、重置冷却起点。
+
+    对应设置项 `failover_max_attempts`：自动切换用完次数后会彻底停手，等人工
+    处理完再点这个按钮重新授权。**不这么做的话**，用户修好了问题也只能一直
+    手动切换，或者被迫去改数据库。
+    """
+    result = engine.reset_failover_attempts(tunnel_id)
+    if not result.get("ok"):
+        raise HTTPException(404, result.get("error") or "隧道不存在")
     return result
 
 
@@ -2375,8 +2395,11 @@ async def test_cloudflare(token: str | None = None, _: None = Auth) -> dict[str,
 @app.post("/api/test/gotify")
 async def test_gotify(send: bool = False, _: None = Auth) -> dict[str, Any]:
     if send:
+        # ⚠️ force=True：这是用户**点按钮主动要**的一条，不能被去重/限流吞掉
+        #    （否则连点两次测试，第二次静悄悄没反应，看起来像发送坏了）。
         ok = await engine.notifier.send(
-            "mefrp-guard 测试消息", "如果你看到这条，说明 Gotify 通道是通的。", "info"
+            "mefrp-guard 测试消息", "如果你看到这条，说明 Gotify 通道是通的。",
+            "info", force=True,
         )
         return {"ok": ok}
     return await engine.notifier.ping()

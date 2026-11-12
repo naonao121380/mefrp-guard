@@ -377,9 +377,10 @@ asyncio.run(n.send("⚠️ 隧道切换失败：ikuai_ovpn", "原因：[403] 端
 check("正文不同 -> 照常推", len(_FakeClient.posts) == 2, len(_FakeClient.posts))
 
 n2 = Notifier("http://gotify.local", "tk")
-n2._sent_at[("error", "t", "m")] = time.monotonic() - 1801
+# 去重账本现在按**字符串 key**存（支持调用方传稳定 key），不再用三元组。
+n2._sent_at["error|t|m"] = time.monotonic() - 1801
 check("窗口过期后允许再推",
-      not n2._is_duplicate("t", "m", "error"))
+      not n2._is_duplicate("error|t|m", "error"))
 
 N.httpx.AsyncClient = _orig_client  # type: ignore[assignment]
 
