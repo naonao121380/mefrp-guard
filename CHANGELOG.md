@@ -66,6 +66,24 @@
   上限改成 5 后重新获得机会、失败也计数、健康清零、人工重置。
 - 全量 `tests/run_all.sh`：**15 个文件全通过**（新增 1 个）。
 
+### 产物
+
+| 项 | 值 |
+|---|---|
+| 文件 | `out/mefrp-guard-v1.0.5.tar` |
+| 大小 | 62,958,080 B |
+| sha256 | `bce26d74f0f9027071afc584c86761ae1a990b073ba4ed9d83422989ef4e81af` |
+| image ID | `sha256:12a6a735bba84f5f5d37e8726eb7a8a4fb60298258d9af659dc03edeb1ba94ae` |
+| RepoTags | `mefrp-guard:1.0.5` |
+| 基础镜像 | `python:3.12-slim` |
+| 依赖 | fastapi 0.162.5 / httpx 0.28.1 / pydantic 2.14.3 / uvicorn 0.54.0 / docker 7.2.0 |
+| 构建机 | `ai-build-202`（LXC，2 vCPU），构建 **29s** |
+| 源码 | `0f70676` |
+
+镜像自检（`build-image.sh verify`）：`notify rate limit` / `notify once()` /
+`failover_max_att` / `reset-failover(API)` 全部命中；镜像内全量测试 15 个文件全过；
+起容器打 `/healthz` → `{"ok":true,...}`；save/load 往返镜像 ID 一致。
+
 ---
 
 ## 1.0.4 — 2026-11-13（mefrp 取消「自动分配端口」+ 告警刷屏）
