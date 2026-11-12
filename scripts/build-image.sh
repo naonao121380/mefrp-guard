@@ -85,6 +85,7 @@ do_verify() {
     echo -n "  PUSH_TO_REMOTE:     "; grep -c "PUSH_TO_REMOTE_FIELDS" /app/app/main.py
     echo -n "  _pushNotice(前端):  "; grep -c "_pushNotice" /app/app/web/index.html
     echo -n "  force_restart:      "; grep -c "force_restart" /app/app/engine.py
+    echo -n "  normalize_metadatas:"; grep -c "normalize_metadatas" /app/app/frpc.py
   ' || return 1
 
   hr "2.2) 依赖版本"

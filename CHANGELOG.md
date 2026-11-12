@@ -121,20 +121,26 @@
 | 项 | 值 |
 |---|---|
 | 文件 | `out/mefrp-guard-v1.0.3.tar` |
-| 大小 | 62,785,024 B（约 59.9 MiB） |
-| sha256 | `9a5f4e109bd2558f0881f1c8e19943c84f781dc72bf440a747962558d0497b63` |
-| image ID | `sha256:96c55f5f7eef56cb5e3f31989f6aaa08ab449f6292b8ce89961bc4871e498aea` |
+| 大小 | 62,942,208 B（约 60.0 MiB） |
+| sha256 | `6058615a583755ba3e1e32c3a75aaddbbd84567616672c657fc08c9cdae324fa` |
+| image ID | `sha256:7fd65b57608be2a994a8c8a467ee0e50fbd3dbe5225f2700c236975d837b71d3` |
 | RepoTags | `mefrp-guard:1.0.3` |
 | 基础镜像 | `python:3.12-slim` |
-| 构建机 | `10.215.170.201`（Debian 12，1 vCPU / 2G），耗时 **6m42.6s** |
+| 构建机 | `ai-build-202`（`10.215.170.202`，LXC / 2 vCPU / 4G），build **188s** |
 
-> ★ **构建环境已于 2026-10-19 迁到 `ai-build-202`（`10.215.170.202`）**，源码工作区在
-> `/root/build/mefrp-guard`，用 `./scripts/build-image.sh`（LXC 环境自动加 `--network host`）。
-> 202 上重建同一份源码实测 **241s**，但镜像 ID 与上表这份不同 —— `requirements.txt` 是
-> 范围约束，那次拉到 fastapi **0.146.0**（上表这份是 0.143.3）。
-> 202 的验证产物留档为 `out/mefrp-guard-v1.0.3.ai202.tar`（62,785,024 B /
-> `20dd7ebf292ea38a36ab5b3ff7f431fc0406a6953d1debe6149875a32465242d` /
-> 镜像 `5a8d44e0ef9c`），**只作链路验证，不是发版件**。
+> ★ **构建环境已于 2026-10-19 迁到 `ai-build-202`**，源码工作区在 `/root/build/mefrp-guard`，
+> 用 `./scripts/build-image.sh`（LXC 环境自动加 `--network host`）。本次从干净源码树
+> `/root/build/src-b5fa836` 构建（`git archive` 导出，不含 `.git`）。
+>
+> ★★ **202 上的一个网络坑（这次踩了 40 分钟）：eth0 的 MTU 是 1500，但链路上
+> 1428 以上的包全被丢** —— `ping 223.5.5.5` 正常（7ms），`curl` 却只有 **2.8 KB/s**，
+> `docker pull` 拉到 11 MB 就再也不动。用 `ping -M do -s 1472` 探出来 1472 失败、
+> 1400 通过，`ip link set eth0 mtu 1400` 之后同样的下载变成 **5.5 MB/s**。
+> `daemon.json` 也加了 `"mtu": 1400`（否则容器内 apt/pip 还会撞墙）。
+> 持久化写在 `/etc/network/interfaces` 的 `iface eth0` 下（见 `out/202-AI使用说明.md`）。
+>
+> 另外 `SMOKE_PORT` 默认的 18080 在 202 上被一个残留的 python3 进程占着，健康检查
+> 会误报「healthz 没起来」—— 用 `SMOKE_PORT=18081 bash scripts/build-image.sh verify`。
 
 国内构建时传两个 **构建期** ARG（Dockerfile 里默认留空 = 走官方源，对海外构建者零影响）：
 
@@ -151,15 +157,18 @@ docker build \
 镜像内验证：
 
 - 代码全在：`push_tunnel_config` 1 / `proxy_update` 1 / `proxy_kick` 1 /
-  `PUSH_TO_REMOTE` 2 / `_pushNotice`（前端）2 / `force_restart` 7，无 `1.0.4` 残留。
-- 依赖：fastapi 0.143.3 / httpx 0.28.1 / pydantic 2.14.1 / uvicorn 0.54.0 / docker 7.2.0。
-- 镜像内跑全量 `tests/run_all.sh`：**96 PASS / 0 FAIL**。
-- 起容器打 `/healthz` → `{"ok":true,...}`。
+  `PUSH_TO_REMOTE` 2 / `_pushNotice`（前端）2 / `force_restart` 7 /
+  `normalize_metadatas` 2，无 `1.0.4` 残留。
+- 依赖：fastapi 0.162.5 / httpx 0.28.1 / pydantic 2.14.3 / uvicorn 0.54.0 / docker 7.2.0。
+- 镜像内跑全量 `tests/run_all.sh`：**13 个文件全通过**。
+- 起容器打 `/healthz` → `{"ok":true,"ts":1794493348}`。
 - `docker save` → `rmi` → 重新 `load`，**image ID 逐字节一致**。
 
-> ⚠️ 版本号按需求**沿用 1.0.3**，但它与上一版 1.0.3（62,769,664 B / `a4fbb0bd…` /
-> image ID `40af1fa3a140`）**不是同一个镜像**。**认 sha256，别认 tag。**
-> 旧文件已就地备份为 `mefrp-guard-v1.0.3.tar.bak-a4fbb0b`。
+> ⚠️ 版本号按需求**继续沿用 1.0.3**，这已经是第三个同号的 1.0.3 了：
+> 上上版 62,769,664 B / `a4fbb0bd…` / 镜像 `40af1fa3a140`，
+> 上一版 62,785,024 B / `9a5f4e10…` / 镜像 `96c55f5f7eef`，
+> 本次 62,942,208 B / `6058615a…` / 镜像 `7fd65b57608b`。
+> **认 sha256，别认 tag。** 旧文件已就地备份为 `mefrp-guard-v1.0.3.tar.bak-442f3f6`。
 
 ---
 
