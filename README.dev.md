@@ -743,8 +743,23 @@ mefrp-guard/
 
    | 字段 | TCP / UDP | HTTP / HTTPS |
    |---|---|---|
-   | `remotePort` | `8000`（必填） | **`null`** —— 必须**显式传 null**，不是「省略这个键」 |
+   | `remotePort` | `8000`（必填，**必须是具体端口**） | **`null`** —— 必须**显式传 null**，不是「省略这个键」 |
    | `domain` | `''` | **`'["example.com"]'`** —— 一个「**文本化的 JSON 数组**」**字符串** |
+
+   ⚠️ **2026-11-13：TCP/UDP 的 `remotePort` 不能再传 null 了。** mefrp 去掉了
+   「服务端自动分配」，实测（tcp/udp 都一样）：
+
+   | 请求里的 `remotePort` | 返回 |
+   |---|---|
+   | `null` | `[400] 远程端口无效` |
+   | 合法且空闲的端口 | 成功 |
+   | 已被占用的端口 | `[403] 端口已被占用, 请重新选择端口` |
+   | HTTP/HTTPS 的 null | 正常（这条路要的就是 null） |
+
+   所以「没填期望端口」这件事必须由本地兜：`engine.port_candidates()` 按节点
+   `allowPort` 随机挑一个该节点上没被占用的端口，被 403 就换下一个，最多 8 个。
+   `proxy_create` / `proxy_update` 入口也加了硬校验，空端口直接抛错，不会把
+   null 发给 mefrp。
 
    `domain` 这个形状是最大的坑：它是 `str` 类型，内容是 JSON 数组的**文本**。官方 schema
    的原话是「列表被文本化，需要额外处理，如 `["mefrp.com"]`」。**官方自己的 Python SDK

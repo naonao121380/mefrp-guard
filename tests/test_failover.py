@@ -219,15 +219,23 @@ check("新节点进了冷却", ("port", 9) in eng.node_cooldown, list(eng.node_c
 check("last_failover_at 已写", store.get_tunnel(tid)["last_failover_at"] > 0)
 check("fail_streak 已清零", store.get_tunnel(tid)["fail_streak"] == 0)
 
-print("[10] ★ 端口被占用时自动降级为「服务端分配」并提示下游")
+print("[10] ★ 端口被占用时自动换一个（mefrp 已不支持「服务端自动分配」）")
 store.update_tunnel(tid, {"current_node_id": 9, "current_remote_port": 41234})
 fake.fail_first_port = True
 fake.created.clear(); fake.attempts.clear(); fake.deleted.clear(); cf.upserts.clear(); nf.sent.clear()
 eng.nodes = {n.node_id: n for n in asyncio.run(fake.node_list())}
 eng.node_cooldown = {}
 res2 = asyncio.run(run())
-check("先试 41234（被占用失败），再退回自动分配", [a[1] for a in fake.attempts] == [41234, None], fake.attempts)
-check("端口未变（服务端恰好又给了 41234）", res2.get("port_changed") is False, res2)
+attempts = [a[1] for a in fake.attempts]
+check("先试 41234（被占用失败），再换一个**具体端口**（不是 None）",
+      len(attempts) == 2 and attempts[0] == 41234 and attempts[1] is not None,
+      attempts)
+check("换的端口落在新节点 allowPort（40000-65535）内",
+      len(attempts) == 2 and attempts[1] is not None
+      and 40000 <= int(attempts[1]) <= 65535, attempts)
+check("端口变了 -> port_changed=True 且标记下游待办",
+      res2.get("port_changed") is True
+      and store.get_tunnel(tid)["needs_downstream_review"] == 1, res2)
 
 print("[11] ★ 端口真的变了 -> 必须提示检查下游")
 store.update_tunnel(tid, {"current_remote_port": 40000})
@@ -468,6 +476,35 @@ check("★ 但事件里明确告诉用户「手动切换」是可用的",
       [e["message"] for e in store.list_events(tunnel_id=un_id)][:3])
 PROBE["ok"] = True; PROBE["why"] = ""
 fake.created_online = True
+
+# ===========================================================================
+# [12] ★ 熔断：连续几次「切完依然不健康」之后不再自动切换
+# ===========================================================================
+# 2026-11-13 事故的另一半：ikuai_ovpn 一直离线，引擎每过一个冷却期就搬一次，
+# 每次都是「搬成功、照样不通、再搬」。自动切换治不了「隧道本身没连上」，
+# 再换节点只会反复删/建 proxy。
+print("\n[12] ★ 连续切换后依然不健康 -> 熔断")
+eng.nodes = {n.node_id: n for n in asyncio.run(fake.node_list())}
+eng.proxies = {"nas-panel": Proxy(
+    proxy_id=222, proxy_name="nas-panel", proxy_type="tcp", node_id=9,
+    local_ip="127.0.0.1", local_port=5000, remote_port=41234, is_online=False)}
+eng.proxy_by_id = {222: eng.proxies["nas-panel"]}
+eng.failover_unhealthy_streak[tid] = 3
+store.update_tunnel(tid, {"fail_streak": 2})        # 这一轮刚好跨过阈值 3
+store.set_setting("fail_threshold", 3)
+store.set_setting("auto_failover", True)
+fake.created.clear(); fake.attempts.clear(); fake.deleted.clear(); nf.sent.clear()
+asyncio.run(eng._reconcile(store.get_tunnel(tid)))
+check("★ 熔断后不再自动切换（一个 create 请求都没发）",
+      fake.created == [] and fake.attempts == [], (fake.created, fake.attempts))
+check("★ 记了一条「已暂停自动切换」的 error 事件",
+      any("已暂停自动切换" in e["message"]
+          for e in store.list_events(tunnel_id=tid)),
+      [e["message"] for e in store.list_events(tunnel_id=tid)][-3:])
+check("★ 推了一条「已暂停自动切换」的告警", bool(nf.sent)
+      and "已暂停自动切换" in nf.sent[-1][1], nf.sent[-1][:2] if nf.sent else None)
+check("★ 健康一次就能清零计数",
+      (eng.failover_unhealthy_streak.pop(tid, None), True)[1])
 
 print(f"\n==> PASS {ok} / FAIL {bad}")
 sys.exit(1 if bad else 0)

@@ -182,10 +182,18 @@ check("TCP: remotePort 用传入值", b["remotePort"] == 40022, b["remotePort"])
 check("★ TCP: domain 被强制清空（传了也不发）", b["domain"] == "", b["domain"])
 check("TCP: locations 被强制清空", b["locations"] == "", b["locations"])
 
-asyncio.run(cap.proxy_create(node_id=9, proxy_name="auto", local_ip="127.0.0.1",
-                             local_port=22, proxy_type="tcp"))
-check("TCP: 不给端口时 remotePort 为 None（让服务端分配）",
-      cap.bodies[-1]["body"]["remotePort"] is None)
+# ★ 2026-11-13：mefrp 去掉了「服务端自动分配端口」，TCP/UDP 不给端口时
+#   客户端直接拒绝（否则发出去就是 400 远程端口无效）。见 tests/test_port_alloc.py。
+_n = len(cap.bodies)
+_raised = ""
+try:
+    asyncio.run(cap.proxy_create(node_id=9, proxy_name="auto", local_ip="127.0.0.1",
+                                 local_port=22, proxy_type="tcp"))
+except Exception as exc:      # noqa: BLE001
+    _raised = str(exc)
+check("TCP: 不给端口时客户端直接报错（不再发 null 给 mefrp）",
+      "必须显式指定远程端口" in _raised, _raised)
+check("TCP: 而且没有发出任何请求", len(cap.bodies) == _n, len(cap.bodies))
 
 asyncio.run(cap.proxy_create(node_id=9, proxy_name="h2", local_ip="127.0.0.1",
                              local_port=8443, proxy_type="http",

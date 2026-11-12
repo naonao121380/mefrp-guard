@@ -20,11 +20,12 @@
 from __future__ import annotations
 
 import asyncio
+import random
 import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from . import frpc, frpcparse, store
 from .cloudflare import CloudflareClient, CloudflareError
@@ -234,6 +235,13 @@ PROBE_HTTP = "http"
 # 那个管的是「连续探测失败几次才触发切换」，捆在一起以后调一个必然误伤另一个。
 ALERT_AFTER_SECONDS = 1800
 
+# ★ 连续多少次「切换成功、但切完依然不健康」就停止自动切换（熔断）。
+#
+# 自动切换能治的只有「这个节点坏了」。如果换了三个节点依然不通，问题就不在
+# 节点上（frpc 没连、容器配置里没这条隧道、本地服务没起）—— 再换也只是反复
+# 删/建 proxy，把「还能手动救」变成「越折腾越乱」。
+AUTO_FAILOVER_BREAKER = 3
+
 
 def alert_after_seconds() -> float:
     """读「连续失败多久才告警」。设置页可改；脏值/缺值一律回落到默认。
@@ -272,6 +280,90 @@ def _fmt_span(seconds: float) -> str:
         m, r = divmod(s, 60)
         return f"{m} 分 {r} 秒" if r else f"{m} 分"
     return f"{s} 秒"
+
+
+# ---------------------------------------------------------------------------
+# 远程端口分配
+# ---------------------------------------------------------------------------
+#
+# ★ 2026-11-13：mefrp 后端改了 —— **`remotePort: null`（让节点自动分配）不再被
+#   接受**，直接返回 `[400] 远程端口无效`。实测（tcp/udp、多个节点都一样）：
+#
+#       远端实际发生的事                                 返回
+#       ---------------------------------------------  ---------------------------
+#       remotePort 传 null                             [400] 远程端口无效
+#       remotePort 传一个合法且空闲的端口               成功，端口就是这个值
+#       remotePort 传一个已被占用的端口                  [403] 端口已被占用, 请重新…
+#       HTTP/HTTPS（remotePort 恒为 null）             正常（这条路不受影响）
+#
+#   所以「没指定端口 → 让服务端随便给一个」这条老路**已经不存在了**，必须由我们
+#   自己兜：在节点 `allowPort` 范围内随机挑一个当前没被占用的端口。
+#
+#   这也正是最初的设计语义 —— 「端口被占用就随机一个新的，然后告诉我」。
+#   以前靠传 null 把这件事甩给服务端，现在得自己算。
+
+# 节点没给 allowPort 时用的兜底区间（mefrp 节点绝大多数落在这个范围里）。
+DEFAULT_PORT_RANGE = (10000, 60000)
+
+# 一次创建最多试多少个端口。8 个足够把「随机撞上已占用端口」的概率压到可以
+# 忽略，又不至于在节点端口池真的耗尽时死循环打 API。
+MAX_PORT_TRIES = 8
+
+
+def parse_port_ranges(raw: str) -> list[tuple[int, int]]:
+    """把节点的 `allowPort` 解析成 [(lo, hi), ...]。
+
+    形如 `'40000-65535'`、`'10000-20000;30000-31000'`、`'8080'`。
+    空串 / 全是垃圾 → 返回空列表，由调用方决定用什么兜底。
+    """
+    out: list[tuple[int, int]] = []
+    for chunk in re.split(r"[;,|\s]+", (raw or "").strip()):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        if "-" in chunk:
+            lo_s, hi_s = chunk.split("-", 1)
+            try:
+                lo, hi = int(lo_s), int(hi_s)
+            except ValueError:
+                continue
+            if 1 <= lo <= hi <= 65535:
+                out.append((lo, hi))
+        elif chunk.isdigit():
+            p = int(chunk)
+            if 1 <= p <= 65535:
+                out.append((p, p))
+    return out
+
+
+def pick_free_port(ranges: list[tuple[int, int]], busy: set[int], *,
+                   rng: random.Random | None = None) -> int | None:
+    """在 `ranges` 里随机挑一个不在 `busy` 里的端口。池子空/占满则返回 None。
+
+    ★ 随机起点 + 线性探测，不是「洗牌整个池子」：一个 40000-60000 的节点有
+      2 万个端口，洗牌要建 2 万元素的列表，而线性探测平均几次就命中。
+      随机起点的意义是**不要每次都从 lo 开始试** —— 否则同一个池子里的多条
+      隧道会挤在 lo 附近，也容易被别的用户先占掉。
+    """
+    rng = rng or random
+    ranges = [(lo, hi) for lo, hi in ranges if hi >= lo]
+    total = sum(hi - lo + 1 for lo, hi in ranges)
+    if total <= 0:
+        return None
+
+    start = rng.randrange(total)
+    for step in range(min(total, 65536)):
+        idx = (start + step) % total
+        for lo, hi in ranges:
+            span = hi - lo + 1
+            if idx < span:
+                port = lo + idx
+                if port not in busy:
+                    return port
+                break
+            idx -= span
+    return None
+
 
 
 def probe_plan(proxy_type: str, mode: str) -> tuple[str, str]:
@@ -436,6 +528,19 @@ class GuardEngine:
         self.dns_fail_tunnels: set[int] = set()
         self.mefrp_fail_since: float | None = None
         self.mefrp_alert_count: int = 0
+
+        # ★ 故障转移**连续失败**计数（tid -> 次数）。冷却期按它指数退避：
+        #   第 1 次失败后等 base，第 2 次 2×base，第 3 次 4×base，封顶 8×base。
+        #   为什么需要它：2026-11-13 的「[400] 远程端口无效」事故里，切换每次都
+        #   在同一个地方失败，而 `last_failover_at` 只在**成功**时才写 —— 于是
+        #   冷却形同虚设，每 20 秒一轮巡检都重试一次、每次都推一条 Gotify，
+        #   一晚上刷了几百条一模一样的告警。现在失败也进冷却，且越失败越久。
+        #   内存态即可：重启后重新从 1 开始，最多多推两三条。
+        self.failover_fail_streak: dict[int, int] = {}
+
+        # ★ 「切换成功但切完不健康」的连续次数（tid -> 次数），到
+        #   AUTO_FAILOVER_BREAKER 就熔断，不再自动切换。见 _reconcile 里的说明。
+        self.failover_unhealthy_streak: dict[int, int] = {}
 
         self.last_error: str = ""
         self.tick_count: int = 0
@@ -1139,7 +1244,42 @@ class GuardEngine:
                 )
             return
 
-        await self._failover(tunnel, verdict.reason)
+        # ★ 熔断：连续几次「切换动作成功、但切完依然不健康」就停止自动切换。
+        #
+        # 为什么需要：2026-11-13 的事故里，ikuai_ovpn（udp）一直显示离线，
+        # 引擎每过一个冷却期就把它搬一次 —— 每次都是「搬成功、照样不通、再搬」。
+        # 这类问题的根因**不在节点上**（frpc 没连上 / 隧道没在容器配置里），
+        # 换多少个节点都一样，而每搬一次都要删掉旧 proxy 再新建，等于持续破坏。
+        # 冷却退避只能让它变慢，不能让它停。
+        #
+        # 停在这里、把话说明白，比「看起来在自愈」负责得多。健康一次就清零。
+        unhealthy = int(self.failover_unhealthy_streak.get(tid, 0))
+        if unhealthy >= AUTO_FAILOVER_BREAKER:
+            if streak == threshold:
+                store.add_event(
+                    "error", "failover",
+                    f"隧道「{tunnel['name']}」连续 {unhealthy} 次切换后依然不健康，"
+                    "已暂停自动切换",
+                    tunnel_id=tid,
+                    detail="自动切换只能解决「节点坏了」，解决不了「隧道本身没连上」。\n"
+                           "请人工确认：承载它的 frpc 容器是否在跑、容器配置里是否真的有"
+                           "这条隧道、本地服务端口是否通。\n"
+                           "处理完点一次「切换节点」或重启引擎，计数会自动归零。",
+                )
+                await self._notify(
+                    f"⛔ 已暂停自动切换：{tunnel['name']}",
+                    f"连续 {unhealthy} 次切换后依然不健康，继续换节点没有意义。\n"
+                    "请检查 frpc 容器与本地服务，处理完手动切换一次即可恢复。",
+                    "error",
+                )
+            return
+
+        res = await self._failover(tunnel, verdict.reason)
+        if res.get("healthy"):
+            self.failover_unhealthy_streak.pop(tid, None)
+        elif res.get("ok"):
+            # 切换动作本身成功了，但隧道没上线 / 探测没通过 —— 记一笔。
+            self.failover_unhealthy_streak[tid] = unhealthy + 1
 
     async def _reconcile_manual(self, tunnel: dict) -> None:
         """外部节点上的隧道：**只探测、只报告，永不自动切换**。
@@ -1317,6 +1457,53 @@ class GuardEngine:
 
         self.probe_cache[tunnel_id] = (now, ok, why)
         return ok, why
+
+    # ------------------------------------------------------------------
+    # 远程端口分配
+    # ------------------------------------------------------------------
+
+    def busy_ports_on(self, node_id: int) -> set[int]:
+        """这个节点上「已经名花有主」的端口。
+
+        端口是**节点级**的：同一个 40000 在两个节点上互不影响，所以必须按
+        node_id 过滤。拿全账号的端口去排重会把两个节点上都能用的端口白白排除掉。
+        """
+        out: set[int] = set()
+        nid = int(node_id or 0)
+        if not nid:
+            return out
+        for p in self.proxies.values():
+            if p.node_id == nid and p.remote_port:
+                out.add(int(p.remote_port))
+        return out
+
+    def port_candidates(self, node: Node, tunnel: dict) -> Iterator[int]:
+        """按优先级吐出可以尝试的远程端口：期望端口 → 现有端口 → 随机空闲端口。
+
+        ★ 这里**不再有 `None`**。mefrp 已经不接受 `remotePort: null`（见
+          `parse_port_ranges` 上面的实测表），传 null 必然 400。
+        """
+        seen: set[int] = set()
+        for cand in (tunnel.get("desired_remote_port"),
+                     tunnel.get("current_remote_port")):
+            try:
+                port = int(cand or 0)
+            except (TypeError, ValueError):
+                continue
+            # 节点端口范围是硬约束：不在范围内的端口连试都不用试，白打一次 API。
+            if port and port not in seen and node.port_allowed(port):
+                seen.add(port)
+                yield port
+
+        ranges = parse_port_ranges(node.allow_port) or [DEFAULT_PORT_RANGE]
+        busy = self.busy_ports_on(node.node_id) | seen
+        for _ in range(MAX_PORT_TRIES):
+            port = pick_free_port(ranges, busy)
+            if port is None:
+                return
+            # 同一轮里已经试过的端口别再吐一遍（pick 只看 busy，不看已 yield 的）
+            busy.add(port)
+            yield port
 
     # ------------------------------------------------------------------
     # 节点择优
@@ -1587,6 +1774,26 @@ class GuardEngine:
     # 故障转移
     # ------------------------------------------------------------------
 
+    def _mark_failover_failed(self, group: list[dict], now: float) -> int:
+        """记一次「切换尝试失败」，返回这条隧道累计失败次数。
+
+        ⚠️ 必须写 `last_failover_at`：这个字段在 `_failover` 里就是**冷却起点**。
+        以前只有成功才写，于是「每次都在同一处失败」的场景（比如 mefrp 接口
+        改版导致创建必失败）会退化成「每轮巡检都重试并推一条 Gotify」——
+        2026-11-13 那晚刷了几百条一模一样的告警，就是这么来的。
+
+        字段名沿用 `last_failover_at` 不再改成 `last_attempt_at`：它是 SQLite 表
+        里已有的列，改名要迁移；语义从「上次成功切换」放宽成「上次尝试切换」，
+        前端只拿它算冷却，不影响展示。
+        """
+        streak = 0
+        for t in group:
+            sid = int(t["id"])
+            streak = self.failover_fail_streak.get(sid, 0) + 1
+            self.failover_fail_streak[sid] = streak
+            store.update_tunnel(sid, {"last_failover_at": int(now)})
+        return streak
+
     async def _failover(self, tunnel: dict, reason: str,
                         prefer_node_id: int | None = None,
                         ignore_cooldown: bool = False) -> dict:
@@ -1628,14 +1835,31 @@ class GuardEngine:
 
         assert self.client is not None
         now = time.time()
-        cooldown = float(store.get_setting("failover_cooldown", 300) or 300)
+        base_cooldown = float(store.get_setting("failover_cooldown", 300) or 300)
+        cooldown = base_cooldown
+
+        # ★ 手动切换（ignore_cooldown=True）是用户明确介入 —— 把两个「连续失败」
+        #   计数一起清零，重新给一次完整的机会。否则一次熔断之后，用户手动修好
+        #   了问题，引擎还会因为历史计数不肯再自动切换。
+        if ignore_cooldown:
+            self.failover_fail_streak.pop(tid, None)
+            self.failover_unhealthy_streak.pop(tid, None)
+
+        # ★ 连续失败 → 指数退避（base、2×、4×、8×，封顶 8 倍）。
+        #   对「失败原因根本不在节点上」的情况（mefrp 接口改了、账号没权限、
+        #   端口池耗尽）尤其重要：以前失败不写 last_failover_at，冷却等于没有，
+        #   每轮巡检都重试 + 推一条 Gotify，刷屏就是这么来的。
+        fails = int(self.failover_fail_streak.get(tid, 0))
+        if fails > 0:
+            cooldown *= min(2 ** fails, 8)
 
         if not ignore_cooldown and \
                 now - float(tunnel["last_failover_at"] or 0) < cooldown:
             left = int(cooldown - (now - float(tunnel["last_failover_at"] or 0)))
             store.add_event(
                 "warn", "failover",
-                f"隧道「{tunnel['name']}」需要切换，但仍在冷却期（{left}s）",
+                f"隧道「{tunnel['name']}」需要切换，但仍在冷却期（{left}s"
+                + (f"，已连续失败 {fails} 次，冷却已退避" if fails else "") + "）",
                 tunnel_id=tid,
             )
             return {"ok": False, "error": f"仍在冷却期，还需等待 {left} 秒"}
@@ -1710,12 +1934,16 @@ class GuardEngine:
             # 注意：切换失败时**不要**置 needs_downstream_review。
             # 那个标志在页面上对应「远程端口变过，去改下游」，而这里什么都没变，
             # 置了就是误报。失败原因走 last_error + 事件 + Gotify 三条路。
+            fails = self._mark_failover_failed(group, now)
             store.update_tunnel(tid, {"last_error": why})
             store.add_event("error", "failover",
                             f"隧道「{tunnel['name']}」切换失败：{why}", tunnel_id=tid)
             await self._notify(
                 f"⚠️ 隧道切换失败：{tunnel['name']}",
-                f"{why}\n\n请到 mefrp-guard 页面手动指定节点。",
+                f"{why}\n\n"
+                f"已进入冷却（第 {fails} 次连续失败，下次重试前等 "
+                f"{_fmt_span(base_cooldown * min(2 ** fails, 8))}），不会立刻重试。\n"
+                "请到 mefrp-guard 页面手动指定节点。",
                 "error",
             )
             return {"ok": False, "error": why}
@@ -1771,6 +1999,9 @@ class GuardEngine:
 
             bad = failed[0]
             err = bad.get("error") or "创建失败"
+            fails = self._mark_failover_failed(group, now)
+            cool_note = (f"\n\n已进入冷却（第 {fails} 次连续失败，下次重试前等 "
+                         f"{_fmt_span(base_cooldown * min(2 ** fails, 8))}）。")
             if rollback_errs:
                 store.add_event(
                     "error", "failover",
@@ -1782,7 +2013,8 @@ class GuardEngine:
                     f"⚠️ 隧道切换失败：{tunnel['name']}",
                     f"节点：{node.name}\n原因：{err}\n\n"
                     "⚠️ 回滚未完全成功，以下隧道需要人工检查：\n"
-                    + "\n".join(f"  · {e}" for e in rollback_errs),
+                    + "\n".join(f"  · {e}" for e in rollback_errs)
+                    + cool_note,
                     "error",
                 )
                 return {"ok": False,
@@ -1797,7 +2029,8 @@ class GuardEngine:
             await self._notify(
                 f"⚠️ 隧道切换失败：{tunnel['name']}",
                 f"节点：{node.name}\n原因：{err}\n"
-                f"（本次共 {len(group)} 条隧道要一起切换，已全部建回原节点）",
+                f"（本次共 {len(group)} 条隧道要一起切换，已全部建回原节点）"
+                + cool_note,
                 "error",
             )
             return {"ok": False,
@@ -1822,6 +2055,8 @@ class GuardEngine:
                 upd["current_domain"] = r.get("new_domain") or ""
             store.update_tunnel(mtid, upd)
             self.probe_cache.pop(mtid, None)
+            # 这次切换成了 —— 连续失败计数清零，冷却退回基准值。
+            self.failover_fail_streak.pop(mtid, None)
 
         # 冷却按 (隧道类型组, 节点) 记 —— 见 node_cooldown 字段的注释。
         ckind = kind_of(tunnel.get("proxy_type", "tcp"))
@@ -2070,10 +2305,13 @@ class GuardEngine:
         # ---- 2. 再建新的 ----
         # ⚠️ 这里按隧道类型分成两条完全不同的路：
         #
-        #   · TCP/UDP —— 争端口。优先级：期望端口 → 当前端口 → 让服务端分配。
-        #     用户显式写了「期望远程端口」时以它为准（这是他的意图），否则尽量
-        #     保住现有端口，因为端口一变就得去改下游配置。端口被占用时靠
-        #     proxy_create 报错自然落到下一档。
+        #   · TCP/UDP —— 争端口。优先级：期望端口 → 当前端口 → **随机空闲端口**
+        #     （见 `port_candidates`）。用户显式写了「期望远程端口」时以它为准
+        #     （这是他的意图），否则尽量保住现有端口，因为端口一变就得去改下游
+        #     配置。端口被占用时靠 proxy_create 的 403 自然落到下一档。
+        #
+        #     ⚠️ 最后一档**不再是「让服务端分配」** —— mefrp 已经不接受
+        #        `remotePort: null`（400 远程端口无效），必须自己挑一个。
         #
         #   · HTTP/HTTPS —— **没有端口这回事**（mefrp 侧 remotePort 恒为 null），
         #     要保住的是**绑定域名**。域名对用户来说更稳定：换节点后域名不变，
@@ -2114,13 +2352,13 @@ class GuardEngine:
                     tunnel_id=tid,
                 )
         else:
-            want_ports: list[int | None] = []
-            for cand in (tunnel.get("desired_remote_port"), old_port):
-                if cand and int(cand) not in want_ports and node.port_allowed(int(cand)):
-                    want_ports.append(int(cand))
-            want_ports.append(None)
-
-            for rp in want_ports:
+            # ★ 端口只能显式给（mefrp 不再接受 null，见 parse_port_ranges 的实测表）。
+            #   顺序：期望端口 → 现有端口 → 随机空闲端口（最多 MAX_PORT_TRIES 个）。
+            #   任何一步「端口被占用 / 无效」都自动落到下一个，这正是用户要的
+            #   「占用了就随机一个新的告诉我」。
+            tried = 0
+            for rp in self.port_candidates(node, tunnel):
+                tried += 1
                 try:
                     await self.client.proxy_create(
                         node_id=node.node_id,
@@ -2134,7 +2372,7 @@ class GuardEngine:
                     store.add_event(
                         "info", "failover",
                         f"已在节点「{node.name}」创建隧道「{tunnel['name']}」"
-                        f"（请求端口 {rp or '自动'}）",
+                        f"（端口 {rp}）",
                         tunnel_id=tid,
                     )
                     break
@@ -2142,7 +2380,7 @@ class GuardEngine:
                     last_err = str(exc)
                     store.add_event(
                         "warn", "failover",
-                        f"在节点「{node.name}」用端口 {rp or '自动'} 创建"
+                        f"在节点「{node.name}」用端口 {rp} 创建"
                         f"「{tunnel['name']}」失败：{exc}",
                         tunnel_id=tid,
                     )
@@ -2150,6 +2388,13 @@ class GuardEngine:
                 except MefrpError as exc:
                     last_err = str(exc)
                     break
+
+            if not tried:
+                last_err = (
+                    f"节点「{node.name}」没有可用远程端口"
+                    f"（允许范围 {node.allow_port or '未知'}，可能已被占满；"
+                    "mefrp 已不再支持「让服务端自动分配」）"
+                )
 
         if not created:
             return {"ok": False, "tunnel": tunnel, "error": last_err or "创建失败"}
@@ -2269,8 +2514,32 @@ class GuardEngine:
         ptype = str(tunnel.get("proxy_type") or "tcp")
         http_like = is_http_type(ptype)
         # 期望端口：优先用户写的，其次**保住当前端口**（端口一变下游就得改）。
-        want_port = (tunnel.get("desired_remote_port")
-                     or tunnel.get("current_remote_port") or None)
+        #
+        # ★ port 组必须有具体端口 —— mefrp 不再接受 `remotePort: null`
+        #   （400 远程端口无效）。用户没填期望端口时，这里按节点 allowPort
+        #   随机挑一个空闲的，而不是把 null 甩给服务端。
+        port_iter: Iterator[int] | None = None
+        want_port: int | None = None
+        if not http_like:
+            node = self.nodes.get(node_id)
+            if node is None:
+                out = {
+                    "applicable": False, "reason": "unknown_node",
+                    "proxy_id": pid, "node_id": node_id,
+                    "note": f"节点 #{node_id} 已不在节点列表里，无法挑端口。",
+                }
+                return out
+            port_iter = self.port_candidates(node, tunnel)
+            want_port = next(port_iter, None)
+            if want_port is None:
+                return {
+                    "applicable": False, "reason": "no_free_port",
+                    "proxy_id": pid, "node_id": node_id,
+                    "error": f"节点「{node.name}」没有可用远程端口"
+                             f"（允许范围 {node.allow_port or '未知'}）；"
+                             "mefrp 已不再支持「让服务端自动分配」，"
+                             "请换一个节点或手动指定端口。",
+                }
 
         out: dict[str, Any] = {
             "applicable": True, "proxy_id": pid, "node_id": node_id,
@@ -2301,7 +2570,12 @@ class GuardEngine:
                 tunnel_id=tunnel_id)
 
         # ---- 2) 改远端 proxy ----
-        for attempt in range(3):
+        # 两个独立的失败原因要分开重试，别互相吃掉次数：
+        #   · kick 之后 frpc 又重连上来 → 400「隧道在线」，再踢一次就好（最多 2 次）
+        #   · 端口被占用 / 无效 → 换下一个候选端口（最多 MAX_PORT_TRIES 个）
+        kick_retry = 0
+        port_retry = 0
+        while True:
             try:
                 await self.client.proxy_update(
                     pid,
@@ -2323,7 +2597,8 @@ class GuardEngine:
             except MefrpApiError as exc:
                 # 竞态：kick 之后 frpc 可能已经重连，隧道又在线了 → 再踢一次重试。
                 # 这个窗口是真实存在的：frpc 重连不需要我们做什么。
-                if "在线" in exc.message and attempt < 2:
+                if "在线" in exc.message and kick_retry < 2:
+                    kick_retry += 1
                     await asyncio.sleep(0.8)
                     try:
                         await self.client.proxy_kick(pid)
@@ -2331,6 +2606,19 @@ class GuardEngine:
                     except MefrpError:
                         pass
                     continue
+                # 端口被别人抢了 / 不在节点范围内 → 换下一个候选端口。
+                if (not http_like and "端口" in exc.message
+                        and port_iter is not None and port_retry < MAX_PORT_TRIES):
+                    nxt = next(port_iter, None)
+                    port_retry += 1
+                    if nxt is not None:
+                        store.add_event(
+                            "warn", "mefrp",
+                            f"隧道「{tunnel['name']}」端口 {want_port} 不可用"
+                            f"（{exc.message}），改用 {nxt} 重试",
+                            tunnel_id=tunnel_id)
+                        want_port = nxt
+                        continue
                 out["error"] = f"更新 mefrp 隧道失败：{exc.message}"
                 break
             except MefrpError as exc:
@@ -2346,23 +2634,46 @@ class GuardEngine:
             except MefrpError:
                 pass
             fresh = self.proxies.get(str(tunnel.get("proxy_name") or ""))
+            old_port = int(tunnel.get("current_remote_port") or 0)
+            new_port = int(fresh.remote_port or 0) if fresh is not None else 0
+            upd: dict[str, Any] = {}
             if fresh is not None:
-                store.update_tunnel(tunnel_id, {
+                upd = {
                     "current_proxy_id": fresh.proxy_id,
                     "current_node_id": fresh.node_id,
                     "current_remote_port": fresh.remote_port or None,
                     "current_domain": fresh.domain or "",
-                })
+                }
+            # 端口真的变了 → 留一个「去改下游」的待办，并在事件里说清楚。
+            # 这条路径以前只在「切换节点」时才有，但「端口被占 → 换一个」同样
+            # 会让下游（防火墙 / 客户端配置 / 端口转发）失效，必须一样提醒。
+            port_changed = bool(old_port and new_port and old_port != new_port)
+            if port_changed:
+                upd["needs_downstream_review"] = 1
+            if upd:
+                store.update_tunnel(tunnel_id, upd)
             store.add_event(
                 "info", "mefrp",
-                f"隧道「{tunnel['name']}」的配置已更新到 mefrp",
+                f"隧道「{tunnel['name']}」的配置已更新到 mefrp"
+                + (f"（远程端口 {old_port} → {new_port}）" if port_changed else ""),
                 tunnel_id=tunnel_id,
                 detail=(f"proxyId：{pid}\n"
                         f"本地端口：{tunnel.get('local_ip')}:{tunnel.get('local_port')}\n"
                         + (f"绑定域名：{tunnel.get('desired_domain')}\n"
                            if http_like else
-                           f"远程端口：{want_port or '自动'}\n")),
+                           f"远程端口：{want_port}\n")),
             )
+            if port_changed:
+                await self._notify(
+                    f"⚠️ 隧道远程端口已变更：{tunnel['name']}",
+                    f"原端口：{old_port}\n新端口：{new_port}\n\n"
+                    "原端口在目标节点上不可用（被占用或不在节点允许范围内），"
+                    "已自动换用新端口。请检查依赖这个端口的客户端 / 防火墙 / DNAT 配置。",
+                    "warn",
+                )
+                out["port_changed"] = True
+                out["old_port"] = old_port
+                out["new_port"] = new_port
 
         # ---- 4) 重建 frpc 配置 + 重启容器（无条件、强制）----
         # ⚠️ 一定要 force_restart：kick 把隧道踢下线了，配置没变的话

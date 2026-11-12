@@ -330,8 +330,11 @@ def _proxy_body(*, node_id: int, proxy_name: str, local_ip: str, local_port: int
         "localIp": local_ip,
         "localPort": int(local_port),
         "proxyType": pt,
-        # ★ HTTP/HTTPS 恒为 null；TCP/UDP 没指定期望端口时也传 null
-        #   （让节点自己分配），而不是把这个键省掉 —— spec 里它是必填项。
+        # ★ HTTP/HTTPS 恒为 null。TCP/UDP **必须**是具体端口 —— mefrp 从
+        #   2026-11-13 起不再接受 null（400 远程端口无效），所以这里不再有
+        #   「没指定就传 null 让节点分配」这回事；调用方必须自己挑好（见
+        #   engine.port_candidates）。proxy_create / proxy_update 入口也加了
+        #   兜底校验，防止哪个新调用点又漏传。
         "remotePort": None if http_like else (int(remote_port) if remote_port else None),
         # ★ 只有 http 组才带域名相关的这些字段，port 组一律清空，
         #   免得把上一次的残留带进一条 TCP 隧道。
@@ -536,7 +539,17 @@ class MefrpClient:
         ⚠️ `https` 的证书路径是**节点侧**的路径（官方示例 `/etc/crt/example.com.crt`），
         对免费用户基本用不上 —— 想给站点上 TLS，实用做法是用 `http` 隧道
         再让 Cloudflare 在前面终结 TLS（DNS 记录 proxied=on）。
+
+        ⚠️ **2026-11-13：TCP/UDP 的 `remote_port` 不能为空了。** mefrp 去掉了
+        「服务端自动分配」，`remotePort: null` 直接 `400 远程端口无效`；端口被
+        占用是 `403 端口已被占用, 请重新选择端口`。端口由 `engine.port_candidates()`
+        按节点 `allowPort` 挑。
         """
+        if not is_http_type(proxy_type) and not remote_port:
+            raise MefrpError(
+                "TCP/UDP 隧道必须显式指定远程端口：mefrp 已不再接受"
+                "「让节点自动分配」（remotePort=null → [400] 远程端口无效）"
+            )
         body = _proxy_body(
             node_id=node_id, proxy_name=proxy_name, local_ip=local_ip,
             local_port=local_port, proxy_type=proxy_type, remote_port=remote_port,
@@ -581,7 +594,18 @@ class MefrpClient:
 
         ✅ 实测能改的：`localIp` / `localPort` / `domain` / `locations` /
         `httpPlugin` / `remotePort`（TCP 组）。proxyId 保持不变，端口和域名都不丢。
+
+        ⚠️ **2026-11-13：`remotePort` 传 null 已经不行了。** mefrp 后端改成
+        必须显式指定端口，传 null 一律 `400 远程端口无效`（端口被占用则是
+        `403 端口已被占用, 请重新选择端口`）。TCP/UDP 的端口由调用方负责挑，
+        见 `engine.port_candidates()`。
         """
+        if not is_http_type(proxy_type) and not remote_port:
+            # 与其把 null 发出去换一个看不懂的「远程端口无效」，不如在这里就说清楚。
+            raise MefrpError(
+                "TCP/UDP 隧道必须显式指定远程端口：mefrp 已不再接受"
+                "「让节点自动分配」（remotePort=null → [400] 远程端口无效）"
+            )
         body = _proxy_body(
             node_id=node_id, proxy_name=proxy_name, local_ip=local_ip,
             local_port=local_port, proxy_type=proxy_type, remote_port=remote_port,
