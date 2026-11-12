@@ -62,6 +62,107 @@ def _unquote(value: str) -> str:
     return v
 
 
+# ---------------------------------------------------------------------------
+# [proxies.metadatas] 值类型规范化
+# ---------------------------------------------------------------------------
+#
+# ⚠️ mefrp 面板给 HTTP 隧道生成的配置里带这样一段：
+#
+#     [proxies.metadatas]
+#     mefrpRedirectHTTPS = true          # ← 布尔，不是字符串
+#
+# 而 frp 里 `metadatas` 的 Go 类型是 `map[string]string`，布尔值会让 **frpc
+# 直接启动失败**（实测 frpc 0.72.0）：
+#
+#     decode proxy at index 0: unmarshal ProxyConfig error:
+#     json: cannot unmarshal bool into Go struct field
+#     HTTPProxyConfig.ProxyBaseConfig.metadatas of type string
+#
+# 整段删掉也能跑，但会丢掉「HTTP 自动跳 HTTPS」这个语义（那是 mefrp 服务端
+# 读 meta 做的）。metas 在 frp 协议里本来就是字符串表，所以**引号化**才是
+# 正解：既让 frpc 认，又保留原意。数字同理（`foo = 123` 一样报
+# `cannot unmarshal number`），所以裸标量统一转成字符串。
+#
+# 只在文本层面改写 `[proxies.metadatas]` 段里的值 —— 不改注释、不改顺序、
+# 不动其它段，产出的 TOML 仍由 `merge_configs` 用 tomllib 回读校验。
+
+_META_HEADER_RE = re.compile(r"^\s*\[proxies\.metadatas\]\s*(?:#.*)?$")
+_ANY_HEADER_RE = re.compile(r"^\s*\[")
+_KV_LINE_RE = re.compile(r"^(\s*)([^=\s]+)(\s*=\s*)(.+?)(\s*)$")
+_BOOL_RE = re.compile(r"(?i:true|false)")
+_NUM_RE = re.compile(r"[+-]?(?:\d+(?:\.\d+)?)(?:[eE][+-]?\d+)?")
+
+
+def _quote_scalar(raw: str) -> str:
+    """把裸标量（true/false/数字）转成 TOML 字符串；其它值原样返回。
+
+    已经是字符串（`'x'` / `"x"`）、数组、内联表的都不动 —— 只处理会把
+    frpc 弄崩的那几种类型。
+    """
+    body, hash_sign, comment = raw.partition("#")
+    val = body.strip()
+    if not val or val[0] in "\"'[{":
+        return raw
+    if not (_BOOL_RE.fullmatch(val) or _NUM_RE.fullmatch(val)):
+        return raw
+    if hash_sign:
+        return f'"{val}" {hash_sign}{comment}'.rstrip()
+    return f'"{val}"'
+
+
+def _bracket_delta(line: str) -> int:
+    """未闭合的多行数组/内联表深度变化（粗略，够用就行）。"""
+    body = line.partition("#")[0]
+    return sum(body.count(c) for c in "[{") - sum(body.count(c) for c in "]}")
+
+
+def normalize_metadatas(text: str) -> str:
+    """把 `[proxies.metadatas]` 段里的裸标量转成字符串。
+
+    见上面那段注释：mefrp 生成的 `mefrpRedirectHTTPS = true` 会让 frpc 启动失败。
+    没有任何 metadatas 段时原样返回（绝大多数 TCP/UDP 配置走这条快路）。
+    """
+    if "proxies.metadatas" not in text:
+        return text
+
+    out: list[str] = []
+    in_meta = False
+    depth = 0  # 多行数组/内联表还没闭合时的括号深度
+
+    for line in text.splitlines():
+        if depth == 0 and _ANY_HEADER_RE.match(line):
+            in_meta = bool(_META_HEADER_RE.match(line))
+            out.append(line)
+            continue
+
+        if not in_meta:
+            out.append(line)
+            continue
+
+        if depth > 0:
+            depth += _bracket_delta(line)
+            out.append(line)
+            continue
+
+        m = _KV_LINE_RE.match(line)
+        if not m:
+            out.append(line)          # 空行或注释
+            continue
+
+        raw = m.group(4)
+        if raw.strip()[:1] in ("[", "{"):
+            # 容器值跨行时别去动里面的内容，只记深度
+            depth = max(0, _bracket_delta(raw))
+            out.append(line)
+            continue
+
+        out.append(f"{m.group(1)}{m.group(2)}{m.group(3)}"
+                   f"{_quote_scalar(raw)}{m.group(5)}")
+
+    fixed = "\n".join(out)
+    return fixed + "\n" if text.endswith("\n") else fixed
+
+
 def _global_of(text: str) -> dict[str, str]:
     """粗略提取全局段里的 serverAddr / serverPort，用于一致性校验。
 
@@ -99,7 +200,7 @@ def merge_configs(texts: list[str], *, label: str = "") -> tuple[str, dict[str, 
     `label` 只用于把报错说清楚是哪个 frpc 实例出的问题 —— 多实例之后
     「受管隧道不在同一个节点上」这句话单独看已经不够定位了。
     """
-    usable = [t for t in texts if t and t.strip()]
+    usable = [normalize_metadatas(t) for t in texts if t and t.strip()]
     if not usable:
         raise FrpcError("没有任何可用的隧道配置，无法生成 frpc 配置")
 

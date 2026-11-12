@@ -307,6 +307,52 @@ def _to_int(v: Any, default: int = 0) -> int:
         return default
 
 
+def _proxy_body(*, node_id: int, proxy_name: str, local_ip: str, local_port: int,
+                proxy_type: str = "tcp", remote_port: int | None = None,
+                domain: Any = "", locations: str = "",
+                http_plugin: str = "", crt_path: str = "", key_path: str = "",
+                request_headers: dict | None = None,
+                response_headers: dict | None = None,
+                proxy_protocol_version: str = "",
+                transport_protocol: str = "",
+                use_encryption: bool = False,
+                use_compression: bool = False) -> dict[str, Any]:
+    """组装 `proxy/create` 与 `proxy/update` **共用**的请求体。
+
+    两个端点的字段完全一致（update 只多一个 `proxyId`，由调用方补），
+    所以这里抽成一处 —— 免得以后改字段时只改了一边，变成「建得出来、改不了」。
+    """
+    pt = str(proxy_type or "tcp").strip().lower()
+    http_like = is_http_type(pt)
+    return {
+        "nodeId": int(node_id),
+        "proxyName": proxy_name,
+        "localIp": local_ip,
+        "localPort": int(local_port),
+        "proxyType": pt,
+        # ★ HTTP/HTTPS 恒为 null；TCP/UDP 没指定期望端口时也传 null
+        #   （让节点自己分配），而不是把这个键省掉 —— spec 里它是必填项。
+        "remotePort": None if http_like else (int(remote_port) if remote_port else None),
+        # ★ 只有 http 组才带域名相关的这些字段，port 组一律清空，
+        #   免得把上一次的残留带进一条 TCP 隧道。
+        "domain": join_domains(domain) if http_like else "",
+        "locations": (locations or "").strip() if http_like else "",
+        "httpPlugin": (http_plugin or "").strip() if http_like else "",
+        "crtPath": (crt_path or "").strip() if http_like else "",
+        "keyPath": (key_path or "").strip() if http_like else "",
+        "accessKey": "",
+        "hostHeaderRewrite": "",
+        "requestHeaders": dict(request_headers or {}),
+        "responseHeaders": dict(response_headers or {}),
+        "httpUser": "",
+        "httpPassword": "",
+        "proxyProtocolVersion": proxy_protocol_version or "",
+        "transportProtocol": transport_protocol or "",
+        "useEncryption": bool(use_encryption),
+        "useCompression": bool(use_compression),
+    }
+
+
 class MefrpClient:
     def __init__(self, token: str, base: str = DEFAULT_BASE,
                  user_agent: str = DEFAULT_UA, timeout: float = 15.0):
@@ -491,37 +537,79 @@ class MefrpClient:
         对免费用户基本用不上 —— 想给站点上 TLS，实用做法是用 `http` 隧道
         再让 Cloudflare 在前面终结 TLS（DNS 记录 proxied=on）。
         """
-        pt = str(proxy_type or "tcp").strip().lower()
-        http_like = is_http_type(pt)
-
-        body: dict[str, Any] = {
-            "nodeId": int(node_id),
-            "proxyName": proxy_name,
-            "localIp": local_ip,
-            "localPort": int(local_port),
-            "proxyType": pt,
-            # ★ HTTP/HTTPS 恒为 null；TCP/UDP 没指定期望端口时也传 null
-            #   （让节点自己分配），而不是把这个键省掉 —— spec 里它是必填项。
-            "remotePort": None if http_like else (int(remote_port) if remote_port else None),
-            # ★ 只有 http 组才带域名相关的这些字段，port 组一律清空，
-            #   免得把上一次的残留带进一条 TCP 隧道。
-            "domain": join_domains(domain) if http_like else "",
-            "locations": (locations or "").strip() if http_like else "",
-            "httpPlugin": (http_plugin or "").strip() if http_like else "",
-            "crtPath": (crt_path or "").strip() if http_like else "",
-            "keyPath": (key_path or "").strip() if http_like else "",
-            "accessKey": "",
-            "hostHeaderRewrite": "",
-            "requestHeaders": dict(request_headers or {}),
-            "responseHeaders": dict(response_headers or {}),
-            "httpUser": "",
-            "httpPassword": "",
-            "proxyProtocolVersion": proxy_protocol_version or "",
-            "transportProtocol": transport_protocol or "",
-            "useEncryption": bool(use_encryption),
-            "useCompression": bool(use_compression),
-        }
+        body = _proxy_body(
+            node_id=node_id, proxy_name=proxy_name, local_ip=local_ip,
+            local_port=local_port, proxy_type=proxy_type, remote_port=remote_port,
+            domain=domain, locations=locations, http_plugin=http_plugin,
+            crt_path=crt_path, key_path=key_path,
+            request_headers=request_headers, response_headers=response_headers,
+            proxy_protocol_version=proxy_protocol_version,
+            transport_protocol=transport_protocol,
+            use_encryption=use_encryption, use_compression=use_compression,
+        )
         await self._request("POST", "/auth/proxy/create", body)
+
+    async def proxy_update(self, proxy_id: int, *, node_id: int, proxy_name: str,
+                           local_ip: str, local_port: int,
+                           proxy_type: str = "tcp",
+                           remote_port: int | None = None,
+                           domain: Any = "",
+                           locations: str = "",
+                           http_plugin: str = "",
+                           crt_path: str = "",
+                           key_path: str = "",
+                           request_headers: dict | None = None,
+                           response_headers: dict | None = None,
+                           proxy_protocol_version: str = "",
+                           transport_protocol: str = "",
+                           use_encryption: bool = False,
+                           use_compression: bool = False) -> None:
+        """**原地**更新一条隧道（`POST /auth/proxy/update`）。
+
+        ⚠️ 这个端点官方文档里是「TODO 待编写」，但实测可用（2026-10-17 实测
+        mefrp 5.21）。请求体与 `proxy_create` **完全一致**，只多一个 `proxyId`：
+
+          · `proxyId` 必填；`proxyName` 也必填（只给 proxyId 会报「隧道名不能为空」）
+          · `proxyId` 不存在 → `500 获取隧道失败`
+          · 字段名用 create 那套驼峰（`localIp` / `remotePort` / `httpPlugin` …）
+
+        ⚠️ **在线隧道会被拒**：`403 隧道在线，请先强制下线隧道`。调用方必须先
+        `proxy_kick()`，否则永远是 403。见 engine.push_tunnel_config 的顺序说明。
+
+        ⚠️ **不能改 `proxyType`**。实测 http → tcp 会被按 http 校验挡回来
+        （`400 绑定域名列表不能为空`）—— 类型是隧道的身份，改类型只能删了重建。
+
+        ✅ 实测能改的：`localIp` / `localPort` / `domain` / `locations` /
+        `httpPlugin` / `remotePort`（TCP 组）。proxyId 保持不变，端口和域名都不丢。
+        """
+        body = _proxy_body(
+            node_id=node_id, proxy_name=proxy_name, local_ip=local_ip,
+            local_port=local_port, proxy_type=proxy_type, remote_port=remote_port,
+            domain=domain, locations=locations, http_plugin=http_plugin,
+            crt_path=crt_path, key_path=key_path,
+            request_headers=request_headers, response_headers=response_headers,
+            proxy_protocol_version=proxy_protocol_version,
+            transport_protocol=transport_protocol,
+            use_encryption=use_encryption, use_compression=use_compression,
+        )
+        body["proxyId"] = int(proxy_id)
+        await self._request("POST", "/auth/proxy/update", body)
+
+    async def proxy_kick(self, proxy_id: int) -> None:
+        """强制下线一条隧道（`POST /auth/proxy/kick`）。
+
+        update 的前置动作：`/auth/proxy/update` 对**在线**隧道一律返回
+        `403 隧道在线，请先强制下线隧道`。
+
+        实测语义（2026-10-17）：
+          · body 只认 `{"proxyId": N}`；传 `proxyName` 会当不存在 → `404 隧道不存在`
+          · 隧道本来就离线 → `400 隧道不在线`（**不是错误**，调用方要当成功处理）
+          · proxyId 不存在 → `404 隧道不存在`
+
+        ⚠️ kick 之后隧道会一直离线，**直到 frpc 重新注册**。所以调用方必须保证
+        后面会重建配置并重启容器 —— 否则等于把用户的隧道踢下线不管了。
+        """
+        await self._request("POST", "/auth/proxy/kick", {"proxyId": int(proxy_id)})
 
     async def proxy_delete(self, proxy_id: int) -> None:
         await self._request("POST", "/auth/proxy/delete", {"proxyId": int(proxy_id)})

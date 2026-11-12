@@ -870,6 +870,30 @@ async def create_tunnel(payload: TunnelIn, _: None = Auth) -> dict[str, Any]:
     return {"ok": True, "id": tid}
 
 
+# 这几个字段是 **mefrp 侧 proxy 的属性**，不是本地展示信息 —— 改了必须推到远端，
+# 否则用户看到页面上数字变了、实际什么都没发生（1.0.0~1.0.3 的老毛病）。
+# 其余字段（name / tag / enabled / auto_failover / dns_* / frpc_instance_id /
+# pin_node_id / manual_node_id）都只影响本地行为，不用碰远端。
+PUSH_TO_REMOTE_FIELDS = (
+    "local_ip", "local_port", "desired_remote_port",
+    "desired_domain", "http_plugin", "route_locations", "crt_path", "key_path",
+)
+
+
+def _field_equal(key: str, old: Any, new: Any) -> bool:
+    """比较「旧值 vs 这次要写的新值」是否等价。
+
+    不能直接 `==`：域名存的是文本化 JSON 数组，`'["a.com"]'` 与
+    `'["a.com", "b.com"]'` 的空格、顺序都可能不同，但语义一样；
+    端口有 None / 0 / "" 三种「空」的写法。
+    """
+    if key == "desired_domain":
+        return parse_domains(old) == parse_domains(new)
+    if key in ("desired_remote_port", "local_port"):
+        return int(old or 0) == int(new or 0)
+    return str(old or "") == str(new or "")
+
+
 @app.patch("/api/tunnels/{tunnel_id}")
 async def patch_tunnel(tunnel_id: int, payload: TunnelPatch,
                        _: None = Auth) -> dict[str, Any]:
@@ -945,6 +969,24 @@ async def patch_tunnel(tunnel_id: int, payload: TunnelPatch,
     #   ⚠️ 记录名变了还要把缓存的 zone/record id 一起清掉：新名字可能落在**别的
     #   zone** 里，留着旧的 zone_id 会拿错误的 zone 去改记录。
     old = store.get_tunnel(tunnel_id) or {}
+
+    # ★ 隧道类型不能原地改。实测（2026-10-17）：`/auth/proxy/update` 会按
+    #   **原类型**校验字段 —— http 改 tcp 直接报「绑定域名列表不能为空」。
+    #   类型就是隧道的身份，只能删了重建。这里提前拦，别让用户以为保存成功了。
+    if "proxy_type" in data:
+        ot = str(old.get("proxy_type") or "tcp").strip().lower()
+        nt = str(data["proxy_type"] or "tcp").strip().lower()
+        if nt != ot:
+            raise HTTPException(
+                400,
+                f"隧道类型不能原地修改（{ot} → {nt}）。"
+                "mefrp 的隧道以「类型」为身份，改类型等于换一条隧道 —— "
+                "请删掉这条后重新创建。")
+
+    # 只有这些字段**真的变了**才值得推到远端。改个标签、开个开关不该重启容器。
+    changed_remote = [k for k in PUSH_TO_REMOTE_FIELDS
+                      if k in data and not _field_equal(k, old.get(k), data.get(k))]
+
     name_changed = ("dns_record_name" in data
                     and str(old.get("dns_record_name") or "")
                         != str(data.get("dns_record_name") or ""))
@@ -956,6 +998,18 @@ async def patch_tunnel(tunnel_id: int, payload: TunnelPatch,
         data["dns_record_id"] = None
 
     store.update_tunnel(tunnel_id, data)
+
+    # ★★ 把改动推到 mefrp，并重建 frpc 配置 + 重启容器（2026-10-17 修）。
+    #   这一步以前完全没有 —— 于是「编辑隧道」只改了本地库：页面上的数字变了，
+    #   mefrp 上的 proxy 一个字没动，而 frpc 配置又是 mefrp 按远端 proxy 生成的，
+    #   所以实际行为一点没变。详见 engine.push_tunnel_config。
+    push: dict[str, Any] | None = None
+    if changed_remote:
+        try:
+            push = await engine.push_tunnel_config(tunnel_id)
+        except Exception as exc:  # noqa: BLE001 - 推送失败不该让「保存」这一步失败
+            push = {"applicable": False, "reason": "error",
+                    "note": f"推送到 mefrp 时出错：{type(exc).__name__}: {exc}"}
 
     if name_changed or proxied_changed:
         cur = store.get_tunnel(tunnel_id) or {}
@@ -971,7 +1025,7 @@ async def patch_tunnel(tunnel_id: int, payload: TunnelPatch,
                     force=True)
         except Exception:  # noqa: BLE001 - DNS 同步失败不该让「保存」这一步失败
             pass
-    return {"ok": True}
+    return {"ok": True, "push": push}
 
 
 @app.delete("/api/tunnels/{tunnel_id}")

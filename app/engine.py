@@ -2210,10 +2210,173 @@ class GuardEngine:
         return False
 
     # ------------------------------------------------------------------
+    # 把「本地期望配置」推到 mefrp（编辑隧道之后）
+    # ------------------------------------------------------------------
+
+    async def push_tunnel_config(self, tunnel_id: int) -> dict:
+        """把本地记录的**期望配置**推到 mefrp，再重建 frpc 配置 + 重启容器。
+
+        ★ 为什么必须有这一步（2026-10-17 修「编辑隧道不生效」）：
+
+          frpc 配置的唯一来源是 mefrp 的 `/auth/proxy/config`，而那是**按远端
+          proxy 生成的**。所以「编辑隧道」如果只改本地库，远端 proxy 一个字没变，
+          拉回来的配置就还是旧的 —— 用户看到页面上数字变了，实际什么都没发生。
+          这正是 1.0.0~1.0.3 的行为：`PATCH /api/tunnels/{id}` 只
+          `store.update_tunnel()`，既不推远端、也不重建配置。
+
+        ★ 顺序不能换：
+
+          1. **kick**  —— `/auth/proxy/update` 对**在线**隧道一律
+             `403 隧道在线，请先强制下线隧道`（实测 2026-10-17）
+          2. **update** —— 趁离线窗口改远端 proxy（proxyId 不变，端口域名都不丢）
+          3. **rebuild + restart** —— 拉新配置、重启容器，让 frpc 按新配置注册
+
+        ⚠️ 第 3 步**无论第 2 步成败都要做，而且要强制重启**：kick 已经把隧道
+        踢下线了，而 frpc **不会**因为配置没变就自己重连。不重启容器 = 把用户
+        的隧道踢下线不管了。这就是 `force_restart` 参数存在的唯一理由。
+
+        ⚠️ 改不了的：`proxy_type`（http↔tcp）。实测 update 会按**原类型**校验
+        （http 改 tcp 报「绑定域名列表不能为空」），类型是隧道的身份，只能删了重建。
+        所以 `main.patch_tunnel` 在更早的地方就把类型变更拦掉了。
+        """
+        tunnel = store.get_tunnel(tunnel_id)
+        if tunnel is None:
+            return {"applicable": False, "reason": "not_found",
+                    "note": "隧道不存在"}
+
+        # 外部节点（自建 frps / 别家服务商）：没有 API，远端改不了。
+        if self.tunnel_is_manual(tunnel):
+            return {"applicable": False, "reason": "external_node",
+                    "note": "这条隧道跑在外部节点上，那台 frps 没有 API —— "
+                            "远端配置只能到它自己的配置文件里改。"
+                            "本次只更新了本地记录。"}
+
+        pid = int(tunnel.get("current_proxy_id") or 0)
+        if not pid:
+            return {"applicable": False, "reason": "not_adopted",
+                    "note": "这条隧道在 mefrp 上还没有对应的 proxy（尚未纳管），"
+                            "本次只更新了本地记录。纳管之后（或切换一次节点）"
+                            "改动才会落到远端。"}
+
+        proxy = self.proxy_by_id.get(pid) or self.proxies.get(
+            str(tunnel.get("proxy_name") or ""))
+        node_id = int(tunnel.get("current_node_id")
+                      or (proxy.node_id if proxy else 0) or 0)
+        if not node_id:
+            return {"applicable": False, "reason": "unknown_node",
+                    "note": "拿不到这条隧道所在的节点，没法推到远端。"}
+
+        ptype = str(tunnel.get("proxy_type") or "tcp")
+        http_like = is_http_type(ptype)
+        # 期望端口：优先用户写的，其次**保住当前端口**（端口一变下游就得改）。
+        want_port = (tunnel.get("desired_remote_port")
+                     or tunnel.get("current_remote_port") or None)
+
+        out: dict[str, Any] = {
+            "applicable": True, "proxy_id": pid, "node_id": node_id,
+            "kicked": False, "updated": False, "error": "",
+        }
+
+        # ---- 1) 踢下线 ----
+        # 在线 → kick 成功；本来就离线 → `400 隧道不在线`，那不是失败。
+        try:
+            await self.client.proxy_kick(pid)
+            out["kicked"] = True
+        except MefrpApiError as exc:
+            if "不在线" in exc.message:
+                pass                      # 正好已经离线
+            elif "不存在" in exc.message:
+                out["error"] = f"mefrp 上找不到 proxy #{pid}（可能已被删）"
+                out["frpc"] = await self._rebuild_and_restart(tunnel)
+                return out
+            else:
+                store.add_event(
+                    "warn", "mefrp",
+                    f"隧道「{tunnel['name']}」强制下线失败：{exc.message}",
+                    tunnel_id=tunnel_id)
+        except MefrpError as exc:
+            store.add_event(
+                "warn", "mefrp",
+                f"隧道「{tunnel['name']}」强制下线失败：{exc}",
+                tunnel_id=tunnel_id)
+
+        # ---- 2) 改远端 proxy ----
+        for attempt in range(3):
+            try:
+                await self.client.proxy_update(
+                    pid,
+                    node_id=node_id,
+                    proxy_name=str(tunnel.get("proxy_name") or ""),
+                    local_ip=str(tunnel.get("local_ip") or "127.0.0.1"),
+                    local_port=int(tunnel.get("local_port") or 0),
+                    proxy_type=ptype,
+                    remote_port=None if http_like else want_port,
+                    domain=(tunnel.get("desired_domain")
+                            or tunnel.get("current_domain") or ""),
+                    locations=str(tunnel.get("route_locations") or ""),
+                    http_plugin=str(tunnel.get("http_plugin") or ""),
+                    crt_path=str(tunnel.get("crt_path") or ""),
+                    key_path=str(tunnel.get("key_path") or ""),
+                )
+                out["updated"] = True
+                break
+            except MefrpApiError as exc:
+                # 竞态：kick 之后 frpc 可能已经重连，隧道又在线了 → 再踢一次重试。
+                # 这个窗口是真实存在的：frpc 重连不需要我们做什么。
+                if "在线" in exc.message and attempt < 2:
+                    await asyncio.sleep(0.8)
+                    try:
+                        await self.client.proxy_kick(pid)
+                        out["kicked"] = True
+                    except MefrpError:
+                        pass
+                    continue
+                out["error"] = f"更新 mefrp 隧道失败：{exc.message}"
+                break
+            except MefrpError as exc:
+                out["error"] = f"更新 mefrp 隧道失败：{exc}"
+                break
+
+        # ---- 3) 远端改成功后，把「实际值」同步回本地 ----
+        # 不自己算 current_*（比如 TCP 端口到底给了多少，只有 mefrp 知道），
+        # 一律以刚拉回来的远端快照为准。
+        if out["updated"]:
+            try:
+                await self._refresh_remote()
+            except MefrpError:
+                pass
+            fresh = self.proxies.get(str(tunnel.get("proxy_name") or ""))
+            if fresh is not None:
+                store.update_tunnel(tunnel_id, {
+                    "current_proxy_id": fresh.proxy_id,
+                    "current_node_id": fresh.node_id,
+                    "current_remote_port": fresh.remote_port or None,
+                    "current_domain": fresh.domain or "",
+                })
+            store.add_event(
+                "info", "mefrp",
+                f"隧道「{tunnel['name']}」的配置已更新到 mefrp",
+                tunnel_id=tunnel_id,
+                detail=(f"proxyId：{pid}\n"
+                        f"本地端口：{tunnel.get('local_ip')}:{tunnel.get('local_port')}\n"
+                        + (f"绑定域名：{tunnel.get('desired_domain')}\n"
+                           if http_like else
+                           f"远程端口：{want_port or '自动'}\n")),
+            )
+
+        # ---- 4) 重建 frpc 配置 + 重启容器（无条件、强制）----
+        # ⚠️ 一定要 force_restart：kick 把隧道踢下线了，配置没变的话
+        #    _rebuild_and_restart 会「配置无变化，跳过重启」，隧道就一直离线。
+        out["frpc"] = await self._rebuild_and_restart(
+            store.get_tunnel(tunnel_id) or tunnel, force_restart=True)
+        return out
+
+    # ------------------------------------------------------------------
     # frpc 重建
     # ------------------------------------------------------------------
 
-    async def _rebuild_and_restart(self, tunnel: dict) -> dict:
+    async def _rebuild_and_restart(self, tunnel: dict,
+                                   force_restart: bool = False) -> dict:
         """重建这条隧道所属 frpc 实例的配置并按需重启。
 
         返回结果 dict —— **每一步失败都要如实回传**，不能只回一个 bool：
@@ -2252,18 +2415,27 @@ class GuardEngine:
             return {**base, "changed": False, "restart_ok": True, "manual": True,
                     "summary": summary, "note": summary.get("note", "")}
 
-        if not changed:
+        if not changed and not force_restart:
             store.add_event("info", "frpc",
                             f"frpc 实例「{label}」配置无变化，跳过重启", tunnel_id=tid)
             return {**base, "changed": False, "restart_ok": True,
                     "summary": summary}
+
+        # ★ force_restart：配置没变也得重启。唯一的使用场景是「编辑隧道」——
+        #   那边先 `proxy_kick` 把隧道踢下线了，而 frpc 不会因为配置没变就自己
+        #   重连，不重启容器隧道就永远离线。见 push_tunnel_config 的说明。
+        if not changed:
+            store.add_event(
+                "info", "frpc",
+                f"frpc 实例「{label}」配置无变化，但隧道刚被强制下线，"
+                "重启容器让它重新注册", tunnel_id=tid)
 
         if str(inst.get("restart_mode") or "docker") == "none":
             store.add_event("warn", "frpc",
                             f"frpc 实例「{label}」配置已更新，"
                             "但重启方式设为「不自动重启」，需要手动重启",
                             tunnel_id=tid)
-            return {**base, "changed": True, "restart_ok": False,
+            return {**base, "changed": changed, "restart_ok": False,
                     "summary": summary,
                     "note": "该实例的 restart_mode=none，需要手动重启"}
 
@@ -2271,7 +2443,7 @@ class GuardEngine:
             store.add_event("warn", "frpc",
                             f"配置已更新，但「自动重启」总开关已关闭，"
                             f"需要手动重启 frpc 实例「{label}」", tunnel_id=tid)
-            return {**base, "changed": True, "restart_ok": False,
+            return {**base, "changed": changed, "restart_ok": False,
                     "summary": summary,
                     "note": "auto_restart_frpc 已关闭，需要手动重启"}
 
@@ -2280,18 +2452,22 @@ class GuardEngine:
             msg = (f"frpc 实例「{label}」没有可用的容器控制器"
                    "（未填容器名，或 Docker 不可达）")
             store.add_event("error", "frpc", msg, tunnel_id=tid)
-            return {**base, "changed": True, "restart_ok": False,
+            return {**base, "changed": changed, "restart_ok": False,
                     "summary": summary, "error": msg}
 
         try:
             dk.restart()
             store.add_event("success", "frpc",
                             f"frpc 实例「{label}」容器已重启", tunnel_id=tid)
-            return {**base, "changed": True, "restart_ok": True, "summary": summary}
+            # ⚠️ 这里必须回**实际的** changed，不能写死 True ——
+            #    force_restart 那条路上配置可能一个字都没变（只是踢下线后重连），
+            #    写死 True 会让前端说「配置已更新并重启」，是假话。
+            return {**base, "changed": changed, "restart_ok": True,
+                    "summary": summary}
         except frpc.FrpcError as exc:
             store.add_event("error", "frpc",
                             f"重启 frpc 实例「{label}」失败：{exc}", tunnel_id=tid)
-            return {**base, "changed": True, "restart_ok": False,
+            return {**base, "changed": changed, "restart_ok": False,
                     "summary": summary, "error": str(exc)}
 
     async def rebuild_frpc(self, instance_id: int | None = None) -> tuple[bool, dict]:

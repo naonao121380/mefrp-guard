@@ -6,6 +6,163 @@
 
 ---
 
+## 1.0.3 — 2026-10-17 重建（编辑隧道推远端 + metadatas 类型修复）
+
+### 修复
+
+- **HTTP 隧道配了 `[proxies.metadatas]` 时 frpc 直接起不来。** 用户实测报的第二个问题。
+
+  mefrp 面板给 HTTP 隧道生成的配置里带这一段：
+
+  ```toml
+  [proxies.metadatas]
+  mefrpRedirectHTTPS = true      # ← 布尔值
+  ```
+
+  而 frp 里 `metadatas` 的 Go 类型是 `map[string]string`，布尔塞不进去，frpc（实测
+  0.72.0）**在配置解析阶段就退出**：
+
+  ```
+  decode proxy at index 0: unmarshal ProxyConfig error:
+  json: cannot unmarshal bool into Go struct field
+  HTTPProxyConfig.ProxyBaseConfig.metadatas of type string
+  ```
+
+  数字一样会炸（`foo = 123` → `cannot unmarshal number`）。把整段删掉确实能跑，
+  但会丢掉 mefrp 服务端靠这个 meta 做的「HTTP 自动跳 HTTPS」。
+
+  **修法是引号化，不是删段**：`frpc.normalize_metadatas()` 在合并配置前，把
+  `[proxies.metadatas]` 段里的裸标量（bool / 整数 / 浮点 / 科学计数）统一写成
+  TOML 字符串 —— 服务端 metas 本来就是字符串表，`"true"` 与它期望的完全一致。
+
+  > 只动这一段：其它段里的 `useEncryption = false`、字符串、数组、注释、空行、
+  > 行尾注释、多行数组一律原样；没有 metadatas 段的配置（TCP/UDP 全部）走的
+  > 是直接返回的快路，一个字节都不改。文本层面改写而不用「解析→重排→序列化」，
+  > 是为了保住 mefrp 原始配置的顺序和格式；产出仍由 `merge_configs` 用 tomllib
+  > 回读校验。
+
+  > 磁盘上已有那份坏配置不用手动改：引擎下一轮重建会发现内容不一致，重写并重启
+  > 容器，自动修好。
+
+- **编辑隧道后「保存成功」但实际一点没变。** 这是用户报的问题，根因是两层叠加：
+
+  1. `PATCH /api/tunnels/{id}` 只做了 `store.update_tunnel()` —— **从头到尾没有
+     调过一次 mefrp**。远端 proxy 的 `localIp` / `localPort` / `domain` /
+     `locations` / `httpPlugin` 全是旧值，页面上那些数字只是本地库。
+  2. frpc 配置的唯一来源是 mefrp 的 `/auth/proxy/config`，而那是**按远端 proxy
+     生成的**。远端不动 → 配置不动 → 行为不变。所以连「重启一下容器试试」都救不了。
+
+  现在编辑时会走 `engine.push_tunnel_config()`：**kick → update → 重建配置 → 重启容器**。
+
+  - `kick`：`/auth/proxy/update` 对**在线**隧道一律回 `403 隧道在线，请先强制下线隧道`
+    （实测 mefrp 5.21），必须先踢下线。隧道本来就离线时 kick 会回 `400 隧道不在线`
+    —— 那不是失败，照常往下走。
+  - `update`：`POST /auth/proxy/update`（官方文档里标着「TODO 待编写」，实测可用）。
+    请求体与 `proxy_create` **完全一致**，只多一个 `proxyId`；**proxyId 不变**，
+    端口和域名都不会丢。kick 之后 frpc 可能已经重连导致又 403，所以会**再踢一次重试**
+    （最多 3 轮）。
+  - 重建 + 重启：**无条件执行，且强制重启**。kick 已经把隧道踢下线了，而 frpc 不会
+    因为配置没变就自己重连 —— 不重启容器 = 把用户的隧道踢下线不管了。为此给
+    `_rebuild_and_restart()` 加了 `force_restart` 参数。
+
+  > 只有**真的改了**远端字段才推（`local_ip` / `local_port` / `desired_remote_port` /
+  > `desired_domain` / `http_plugin` / `route_locations` / `crt_path` / `key_path`）。
+  > 改个标签、开个开关不该白重启一次容器。比较走 `_field_equal()`，因为域名存的是
+  > 「文本化 JSON 数组」、端口有 `None` / `0` / `""` 三种「空」的写法。
+
+  > 推不了时会**如实说明**，不再假装成功：外部节点（那台 frps 没有 API）、
+  > 尚未纳管到 proxy 的本地记录、拿不到节点地址。这三种情况前端会明确告诉用户
+  > 「本次只更新了本地记录」。
+
+- **隧道类型（`proxy_type`）不再允许原地修改，改成 400 明确拒绝。** 实测
+  `/auth/proxy/update` 会按**原类型**校验字段 —— http 改 tcp 直接报
+  「绑定域名列表不能为空」。类型就是隧道的身份，改类型等于换一条隧道，只能删了重建。
+  以前这个字段能改，但改了只是写进本地库（远端纹丝不动），属于同一个坑的另一半。
+  前端编辑框也把类型下拉禁用了，免得用户白填一遍表单。
+
+- **`_rebuild_and_restart()` 的返回值不再硬编码 `changed: True`。** 加了
+  `force_restart` 之后，会出现「配置一个字没变、只是重启」的情况，原来那几处
+  `"changed": True` 会让前端说「配置已更新并重启」—— 是假话。现在一律回实际值。
+
+### 新增
+
+- `frpc.normalize_metadatas()`：`[proxies.metadatas]` 裸标量 → 字符串（幂等）。
+- `MefrpClient.proxy_update()` / `MefrpClient.proxy_kick()`。
+- 抽了模块级的 `mefrp._proxy_body()`，create 与 update 共用一份请求体 ——
+  免得以后加字段时只改一边，变成「建得出来、改不了」。
+- `tests/test_frpc_metadata.py`（**41 条断言**）：布尔/数字/科学计数转字符串、
+  字符串与数组不被二次引号化、注释与空行保留、多行数组不被破坏、
+  只改 `[proxies.metadatas]` 段（transport 段与相邻隧道不受影响）、幂等、
+  以及 `merge_configs` 入口自动生效。
+- `tests/test_tunnel_push.py`（**48 条断言**）：归一化比较、两个新端点的请求体、
+  `push_tunnel_config` 的四条「推不了」分支与正常路径（kick 必须早于 update、
+  kick 的 400 当成功、403 重试、update 失败也要把隧道拉回来）、
+  `PATCH` 的接线（改远端字段才推 / 改标签不推 / 改类型 400 / 原样回写不推）、
+  以及 `force_restart` 真的会重启容器。
+
+### 验证
+
+- 全量 `tests/run_all.sh`：**13 个文件全通过**（含新增 `test_frpc_metadata`，41 条）。
+- **真实 frpc 校验**（`frpc 0.72.0 verify -c`）：用户那份原始配置 → 报
+  `cannot unmarshal bool ... of type string`；经 `normalize_metadatas()` 处理后
+  同一份文件 → `the configuration file syntax is ok`。整段删除同样能过，但会丢
+  HTTPS 跳转语义，所以没采用。
+- 真实 mefrp 端到端（`out/probe/e2e_push.py`，**12/12**）：现建一条临时 HTTP 隧道 →
+  改本地端口与域名 → `push_tunnel_config` → **从 mefrp 读回确认 localPort 与 domain
+  都变了、proxyId 没变** → 重复推送幂等 → 删掉临时隧道。全程不碰账号里已有的
+  3 条真实隧道。
+
+> ⚠️ **编辑在线隧道会让它短暂离线**：kick 之后要等容器重启完才重新注册。这是 mefrp
+> 的限制（在线不许改），不是本程序的取舍。如果 frpc 容器重启失败，隧道会一直离线
+> 直到手动重启 —— 这种情况会记一条 error 事件。
+
+### 产物
+
+| 项 | 值 |
+|---|---|
+| 文件 | `out/mefrp-guard-v1.0.3.tar` |
+| 大小 | 62,785,024 B（约 59.9 MiB） |
+| sha256 | `9a5f4e109bd2558f0881f1c8e19943c84f781dc72bf440a747962558d0497b63` |
+| image ID | `sha256:96c55f5f7eef56cb5e3f31989f6aaa08ab449f6292b8ce89961bc4871e498aea` |
+| RepoTags | `mefrp-guard:1.0.3` |
+| 基础镜像 | `python:3.12-slim` |
+| 构建机 | `10.215.170.201`（Debian 12，1 vCPU / 2G），耗时 **6m42.6s** |
+
+> ★ **构建环境已于 2026-10-19 迁到 `ai-build-202`（`10.215.170.202`）**，源码工作区在
+> `/root/build/mefrp-guard`，用 `./scripts/build-image.sh`（LXC 环境自动加 `--network host`）。
+> 202 上重建同一份源码实测 **241s**，但镜像 ID 与上表这份不同 —— `requirements.txt` 是
+> 范围约束，那次拉到 fastapi **0.146.0**（上表这份是 0.143.3）。
+> 202 的验证产物留档为 `out/mefrp-guard-v1.0.3.ai202.tar`（62,785,024 B /
+> `20dd7ebf292ea38a36ab5b3ff7f431fc0406a6953d1debe6149875a32465242d` /
+> 镜像 `5a8d44e0ef9c`），**只作链路验证，不是发版件**。
+
+国内构建时传两个 **构建期** ARG（Dockerfile 里默认留空 = 走官方源，对海外构建者零影响）：
+
+```bash
+docker build \
+  --build-arg APT_MIRROR=mirrors.tuna.tsinghua.edu.cn \
+  --build-arg PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple \
+  -t mefrp-guard:1.0.3 .
+```
+
+> 不加 `--build-arg` 时行为与以前完全一致，镜像里也不留任何镜像源配置 ——
+> 这两个变量只在构建期用一次，不进 `ENV`。
+
+镜像内验证：
+
+- 代码全在：`push_tunnel_config` 1 / `proxy_update` 1 / `proxy_kick` 1 /
+  `PUSH_TO_REMOTE` 2 / `_pushNotice`（前端）2 / `force_restart` 7，无 `1.0.4` 残留。
+- 依赖：fastapi 0.143.3 / httpx 0.28.1 / pydantic 2.14.1 / uvicorn 0.54.0 / docker 7.2.0。
+- 镜像内跑全量 `tests/run_all.sh`：**96 PASS / 0 FAIL**。
+- 起容器打 `/healthz` → `{"ok":true,...}`。
+- `docker save` → `rmi` → 重新 `load`，**image ID 逐字节一致**。
+
+> ⚠️ 版本号按需求**沿用 1.0.3**，但它与上一版 1.0.3（62,769,664 B / `a4fbb0bd…` /
+> image ID `40af1fa3a140`）**不是同一个镜像**。**认 sha256，别认 tag。**
+> 旧文件已就地备份为 `mefrp-guard-v1.0.3.tar.bak-a4fbb0b`。
+
+---
+
 ## 1.0.3
 
 ### 修复

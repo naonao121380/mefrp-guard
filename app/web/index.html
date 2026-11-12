@@ -865,6 +865,8 @@ async function openTunnelDialog(){
   $('f_pin_node_id').disabled=false;
   $('f_frpc_instance_id').value='0';
   $('f_proxy_name').disabled=false;
+  // 新建时类型可选；编辑时禁用（见 editTunnel —— mefrp 的隧道不能改类型）
+  $('f_proxy_type').disabled=false;
   syncTunTypeFields(); $('tunDlg').showModal();
 }
 
@@ -879,6 +881,11 @@ async function editTunnel(id){
   $('f_id').value=t.id; $('f_name').value=t.name; $('f_proxy_name').value=t.proxy_name;
   $('f_proxy_name').disabled=true;
   $('f_proxy_type').value=t.proxy_type; $('f_local_ip').value=t.local_ip; $('f_local_port').value=t.local_port;
+  // ★ 类型**不能改**：mefrp 的隧道以「类型」为身份，`/auth/proxy/update` 会按
+  //   原类型校验字段（http 改 tcp 直接报「绑定域名列表不能为空」），只能删了重建。
+  //   后端 PATCH 也会 400 拦一次；这里禁用是为了别让用户白填一遍表单。
+  $('f_proxy_type').disabled=true;
+  $('f_proxy_type').title='隧道类型不能原地修改 —— 要换类型请删掉这条后重新创建';
   $('f_desired_remote_port').value=t.desired_remote_port||'';
   // desired_domain 库里存的是「文本化 JSON 数组」，这里显示成人看得懂的逗号分隔。
   $('f_desired_domain').value=_domainText(t.desired_domain||t.current_domain||'');
@@ -919,6 +926,33 @@ function _domainText(raw){
   return s.replace(/[;\s]+/g,',');
 }
 
+// 把「保存之后到底有没有落到 mefrp」如实说清楚。
+// 这一句不能省：以前保存成功 = **只写了本地库**，用户以为改完了、实际一点没变
+// （frpc 配置是 mefrp 按远端 proxy 生成的，远端不动，配置就还是旧的）。
+function _pushNotice(p){
+  if(!p) return '';
+  if(p.applicable === false){
+    if(p.reason === 'not_adopted')
+      return '本地记录已保存。\n\n⚠️ 这条隧道在 mefrp 上还没有对应的 proxy（尚未纳管），'
+           + '所以改动只写进了本地记录 —— 远端没有任何变化。';
+    if(p.reason === 'external_node')
+      return '本地记录已保存。\n\n⚠️ 这条隧道跑在外部节点上（那台 frps 没有 API），'
+           + '远端配置得你到它的配置文件里改。';
+    if(p.reason === 'unknown_node')
+      return '本地记录已保存。\n\n⚠️ 拿不到隧道所在节点，改动没有推到 mefrp。';
+    return '本地记录已保存。\n\n⚠️ ' + (p.note || '改动没有推到 mefrp。');
+  }
+  const f = p.frpc || {};
+  let s = p.updated ? '✅ 已同步到 mefrp（proxyId ' + p.proxy_id + ' 保持不变）'
+                    : '⚠️ 同步到 mefrp 失败：' + (p.error || '未知原因');
+  if(p.kicked && !p.updated) s += '\n　隧道已被强制下线，正在重启 frpc 让它恢复。';
+  if(f.skipped) s += '\nfrpc：' + (f.note || '还没挂接容器，配置未更新');
+  else if(f.error) s += '\nfrpc：' + f.error;
+  else if(f.changed) s += '\nfrpc：配置已更新' + (f.restart_ok ? '并重启' : '，但重启失败');
+  else s += '\nfrpc：配置无变化' + (f.restart_ok ? '（已重启容器让它重新注册）' : '');
+  return s;
+}
+
 async function saveTunnel(){
   const id = $('f_id').value;
   const ptype = $('f_proxy_type').value;
@@ -948,9 +982,13 @@ async function saveTunnel(){
   if(!body.name||!body.proxy_name||!body.local_port){ alert('显示名、隧道名、本地端口都是必填'); return; }
   if(isHttp && !body.desired_domain){ alert('HTTP/HTTPS 隧道必须填写「绑定域名」'); return; }
   try{
-    if(id){ const {name,proxy_name,...rest}=body; await api('/api/tunnels/'+id,{method:'PATCH',body:JSON.stringify(rest)}); }
+    let r = null;
+    if(id){ const {name,proxy_name,...rest}=body; r = await api('/api/tunnels/'+id,{method:'PATCH',body:JSON.stringify(rest)}); }
     else { await api('/api/tunnels',{method:'POST',body:JSON.stringify(body)}); }
     $('tunDlg').close(); await loadOverview(); loadTunnels();
+    // 编辑要告诉用户「有没有真的推到 mefrp」—— 只关掉弹窗等于骗人。
+    const msg = _pushNotice(r && r.push);
+    if(msg) alert(msg);
   }catch(e){ alert('保存失败：'+e.message); }
 }
 

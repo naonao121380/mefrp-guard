@@ -334,6 +334,33 @@ WireGuard 的握手包）。那属于业务侧的事，不是这个工具该做�
 
 程序**不会自动把隧道认领到某个容器上**，必须手动挂接。
 
+## 构建
+
+```bash
+./scripts/build-image.sh                     # build + verify + pack 一条龙
+./scripts/build-image.sh build --mirror      # 只构建，走国内镜像源
+./scripts/build-image.sh verify              # 只验证已有镜像
+./scripts/build-image.sh pack                # 只打 tar
+```
+
+脚本做了四件手工容易漏的事：
+
+| 做的事 | 为什么 |
+|---|---|
+| 从 `app/main.py` 读版本号 | 版本号只有一处，不会出现「脚本写 1.0.3、代码写 1.0.4」 |
+| 检测到 LXC 自动加 `--network host` | 容器里 `docker build` / `run` 新建 netns 会被宿主 AppArmor 拦，报 `reopen fd 8: permission denied`（CVE-2025-52881 补丁副作用）。**手敲命令时别忘了加** |
+| `verify` 在镜像内跑全量测试 + 起容器打 `/healthz` | 「构建成功」不等于「能跑」，依赖漏装只有跑起来才知道 |
+| `pack` 里 `rmi` 后重新 `load` 比对 image ID | 证明 tar 是完整的、能还原成同一个镜像 |
+
+`--mirror` 走清华的 apt + pip 源，**只是构建期参数**（`APT_MIRROR` / `PIP_INDEX_URL` 两个
+`ARG`），不进镜像、不影响运行时。不加就走官方源 —— 国内不加会慢到无法接受
+（实测 `deb.debian.org` 拉索引 13 分钟没下完，换源后 apt 11 秒）。
+
+> ⚠️ Debian 12+ 的 apt 源是 **deb822 格式**（`/etc/apt/sources.list.d/debian.sources`），
+> 不是老的 `/etc/apt/sources.list`。Dockerfile 里两个都 sed，只改一个等于没改。
+
+---
+
 ## 部署
 
 所有跟宿主机有关的取值都集中在 `.env` 里，`docker-compose.yml` 本身不用改：
@@ -752,6 +779,28 @@ mefrp-guard/
    在 `proxy_create` 里还做了一层强制（TCP 组的 `domain`/`locations`/证书路径一律清空），
    防止调用方漏改。
 
+8. **`/auth/proxy/config` 给 HTTP 隧道生成的 `[proxies.metadatas]` 是布尔值，frpc 不认。**
+
+   ```toml
+   [proxies.metadatas]
+   mefrpRedirectHTTPS = true
+   ```
+
+   frp 里 `metadatas` 是 `map[string]string`，布尔塞不进去，frpc（0.72.0 实测）
+   **在解析配置阶段就退出**，容器起不来：
+
+   ```
+   decode proxy at index 0: unmarshal ProxyConfig error:
+   json: cannot unmarshal bool into Go struct field
+   HTTPProxyConfig.ProxyBaseConfig.metadatas of type string
+   ```
+
+   数字同样炸（`foo = 123` → `cannot unmarshal number`）。所以
+   `frpc.normalize_metadatas()` 在合并前把这一段里的裸标量统一引号化成
+   `mefrpRedirectHTTPS = "true"` —— **别改成「删掉整段」**：mefrp 服务端就是靠
+   这个 meta 做 HTTP→HTTPS 跳转的，删了功能就没了，而 metas 在协议里本来就是
+   字符串表，引号化后服务端读到的仍是 `"true"`。
+
 用到的端点：
 
 | 用途 | 端点 | 方法 | 备注 |
@@ -760,14 +809,31 @@ mefrp-guard/
 | 节点状态 | `/auth/node/status` | GET | |
 | 隧道列表 | `/auth/proxy/list` | GET | **`nodes` 子数组带真实 hostname** |
 | 创建隧道 | `/auth/proxy/create` | POST | **HTTP/S 的 `domain` 是文本化 JSON 数组、`remotePort` 必须显式 null** |
+| **更新隧道** | **`/auth/proxy/update`** | POST | **body = create 的全部字段 + `proxyId`**；`proxyName` 也必填；**在线隧道 403，必须先 kick**；**不能改 `proxyType`** |
+| **强制下线** | **`/auth/proxy/kick`** | POST | **只认 `{"proxyId": N}`**（传 proxyName 当不存在）；离线回 `400 隧道不在线`（不是错误） |
 | 删除隧道 | `/auth/proxy/delete` | POST | |
 | 生成单隧道配置 | `/auth/proxy/config` | POST | 里面的 `serverAddr` 是节点地址 |
 | **当前用户信息 / 用户组** | **`/auth/user/info`** | GET | 用 `group` + `friendlyGroup` |
 | ~~当前用户组~~ | ~~`/auth/user/group`~~ | — | **不存在，404** |
 
+> ★ **`/auth/proxy/update` 是官方文档里标着「TODO 待编写」的接口，但实测可用**
+> （2026-10-17，mefrp 5.21）。三条实测结论：
+>
+> 1. 请求体与 `proxy/create` **完全一致**，只多一个 `proxyId`。`proxyId` 不存在回
+>    `500 获取隧道失败`；只给 proxyId 不给名字回 `400 隧道名不能为空`。
+> 2. **在线隧道一律 `403 隧道在线，请先强制下线隧道`**。所以「编辑隧道」的固定顺序是
+>    `kick → update → 重建配置 → 重启容器`。kick 之后 frpc 可能已经重连导致又 403，
+>    要再踢一次重试。
+> 3. **改不了 `proxyType`**：update 会按**原类型**校验字段，http 改 tcp 直接报
+>    `400 绑定域名列表不能为空`。类型是隧道的身份，只能删了重建。
+>
+> ✅ 实测能改的：`localIp` / `localPort` / `domain` / `locations` / `httpPlugin` /
+> `remotePort`（TCP 组）。**`proxyId` 保持不变**，端口和域名都不会丢 —— 比
+> 「删了重建」安全得多（后者还会撞 proxyName 唯一、端口可能被别人抢）。
+
 官方 Python SDK 里还有几个本程序**没用**的端点，将来可能有用：
-`POST /auth/proxy/update`（改隧道）、`/auth/proxy/toggle`（启用禁用）、
-`/auth/proxy/kick`（强制下线）、`POST /auth/node/freePort`（`{nodeId, protocol}`
+`/auth/proxy/toggle`（启用禁用）、
+`/auth/proxy/kick`（强制下线，见上）、`POST /auth/node/freePort`（`{nodeId, protocol}`
 让节点给个空闲端口）、`POST /auth/easyStartup`（`{proxyId}` → `nodeAddr`/`nodePort`/`nodeToken`）、
 `GET /auth/node/nameList`、`GET /auth/user/groups`。
 
