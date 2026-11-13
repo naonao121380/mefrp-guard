@@ -282,10 +282,10 @@ dialog h3{margin-top:0;color:var(--text);font-size:15px}
       <div><label>切换后冷却（秒）</label><input id="s_failover_cooldown" type="number" min="0"></div>
       <div><label>连续失败多久才告警（秒）</label><input id="s_alert_after_seconds" type="number" min="0"></div>
     </div>
+    <div class="note">网络抖一下不该惊动你。<b>连续失败满这个时长</b>，才把「拉取 mefrp 状态失败 / DNS 同步失败」升成红色告警；在那之前只在事件里留一条黄色 warn。<b>恢复</b>则要<b>连续正常满 10 分钟</b>才算数（抖动源下「一轮正常」不算恢复，否则告警永远攒不满）。默认 1800（30 分钟）。填 0 = 一失败就告警。</div>
     <label>同一条隧道最多自动切换几次</label>
     <input id="s_failover_max_attempts" type="number" min="0">
     <div class="note">自动切换只能解决「这个节点坏了」。如果问题不在节点上（frpc 没连上、容器配置里没这条隧道、本地服务没起、mefrp 接口改版），换多少次都一样 —— 而每换一次都要先在旧节点删掉隧道、再去新节点重建，等于持续破坏一个还能人工救回来的状态。所以<b>用完这个次数就彻底停手</b>，只推一条告警，之后完全交给人工。计数<b>存在库里</b>，重启引擎不会清零；隧道恢复健康、或人工点一次「手动切换 / 恢复自动切换」才归零。<b>默认 3，填 0 = 不限</b>（不建议）。</div>
-    <div class="note">网络抖一下不该惊动你。<b>连续失败满这个时长</b>，才把「拉取 mefrp 状态失败 / DNS 同步失败」升成红色告警；在那之前只在事件里留一条黄色 warn。<b>恢复</b>则要<b>连续正常满 10 分钟</b>才算数（抖动源下「一轮正常」不算恢复，否则告警永远攒不满）。默认 1800（30 分钟）。填 0 = 一失败就告警。</div>
     <label>DNS 记录核对间隔（秒）</label>
     <input id="s_dns_check_interval" type="number" min="0">
     <div class="note">DNS 记录只在<b>节点地址变了</b>的时候需要改，而地址很少变 —— 所以平时按这个间隔核对一次就够（默认 900 = 15 分钟），<b>地址一变立刻同步、不等间隔</b>。原来的「每轮都核对」（20 秒一次）会为每条隧道持续打 Cloudflare API，纯属白费；填 0 = 退回那个行为。</div>
